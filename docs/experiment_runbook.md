@@ -193,12 +193,12 @@ This calls the real pyramid skill endpoint:
 ./start.sh --real-api
 ```
 
-`start.sh` passes `api_timeout_s=180` to `plan_executor_node` by default because
+`start.sh` passes `api_timeout_s=180.0` to `plan_executor_node` by default because
 real robot pyramid moves can take longer than the node's code default of 15
 seconds. Override only when needed:
 
 ```bash
-API_TIMEOUT_S=240 ./start.sh --real-api
+API_TIMEOUT_S=240.0 ./start.sh --real-api
 ```
 
 Expected physical sequence:
