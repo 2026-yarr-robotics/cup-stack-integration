@@ -109,6 +109,54 @@ def normalize_robot_state(robot_state: dict | None) -> dict[str, Any]:
     return {'gripper': {'holding': holding, 'force_n': force_n}}
 
 
+def stack_slot_color(world_state: dict | None, slot: str | None) -> str | None:
+    if not world_state or not slot:
+        return None
+    stack = world_state.get('stack') or {}
+    val = stack.get(slot)
+    if isinstance(val, str):
+        return val
+    if isinstance(val, dict):
+        color = val.get('color')
+        return color if isinstance(color, str) else None
+    return None
+
+
+def action_result_reflected(
+    result: dict | None,
+    before: dict | None,
+    current: dict | None,
+) -> bool:
+    """Whether world state reflects a successful atomic pyramid action.
+
+    For this experiment a successful pyramid action must fill the target slot
+    and decrement the table count for that color by one. This lets GSP publish
+    only after the fake aggregator's real topics have caught up.
+    """
+    if not result:
+        return False
+    if result.get('result') != 'success':
+        return True
+    if result.get('action') != 'pyramid':
+        return True
+    color = result.get('color')
+    target_slot = result.get('target_slot')
+    if not isinstance(color, str) or not isinstance(target_slot, str):
+        return False
+    if not before or not current:
+        return False
+    if stack_slot_color(current, target_slot) != color:
+        return False
+    before_cups = before.get('cups_on_table') or {}
+    current_cups = current.get('cups_on_table') or {}
+    try:
+        before_count = int(before_cups.get(color, 0))
+        current_count = int(current_cups.get(color, 0))
+    except (TypeError, ValueError):
+        return False
+    return current_count == max(before_count - 1, 0)
+
+
 class GoalStateBuilder:
     """Holds the GSP state and assembles the LLM input payload on demand."""
 
@@ -152,21 +200,30 @@ class GoalStateBuilder:
     def set_plan(self, plan: dict | None) -> None:
         """Adopt a plan produced downstream (future LLM cold-start/replan output).
 
-        Accepts either ``{"steps": [...], "target": {...}}`` (cold-start) or
-        ``{"target": {...}, "steps": [...]}`` (in-flight replan) and stores it
-        as a Plan with a fresh plan_id and remaining_steps. Clearing the command
-        here flips subsequent payloads into in-flight mode.
+        Accepts either a bare plan (``{"steps": [...], "target": {...}}``) or
+        the full LLM output. Cold-start puts ``target`` next to ``plan`` at the
+        top level, while in-flight replan may put ``target`` inside ``plan``.
+        Clearing the command here flips subsequent payloads into in-flight mode.
         """
         if plan is None:
             self._current_plan = None
             return
-        steps = list(plan.get('steps') or [])
+        plan_obj = plan.get('plan') if isinstance(plan.get('plan'), dict) else plan
+        steps = list((plan_obj or {}).get('steps') or [])
+        target = (plan_obj or {}).get('target')
+        if target is None:
+            target = plan.get('target')
+        target_pattern = (plan_obj or {}).get('target_pattern')
+        if target_pattern is None:
+            target_pattern = plan.get('target_pattern')
         self._plan_counter += 1
         self._current_plan = {
             'plan_id': f'plan_{self._plan_counter:03d}',
-            'target': plan.get('target'),
+            'target': target,
             'remaining_steps': steps,
         }
+        if target_pattern is not None:
+            self._current_plan['target_pattern'] = target_pattern
         self._user_command = None  # task is now planned → in-flight from here
 
     def on_action_result(self, result: dict | None) -> None:

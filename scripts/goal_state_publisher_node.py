@@ -33,7 +33,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from payload_builder import GoalStateBuilder
+from payload_builder import GoalStateBuilder, action_result_reflected
 
 
 class GoalStatePublisher(Node):
@@ -59,6 +59,8 @@ class GoalStatePublisher(Node):
         out_topic = str(self.get_parameter('llm_input_topic').value)
 
         self._builder = GoalStateBuilder()
+        self._pending_action_result = None
+        self._pending_action_before_world = None
 
         self._pub = self.create_publisher(String, out_topic, 10)
         self.create_subscription(
@@ -91,6 +93,8 @@ class GoalStatePublisher(Node):
         if obj is None:
             return
         self._builder.set_world(obj, None)
+        if self._maybe_publish_pending_action():
+            return
         if self._on_world_change:
             self._publish()  # in-flight: perception-detected change while idle
 
@@ -99,6 +103,8 @@ class GoalStatePublisher(Node):
         if obj is None:
             return
         self._builder.set_world(None, obj)
+        if self._maybe_publish_pending_action():
+            return
         if self._on_world_change:
             self._publish()  # in-flight: perception-detected change while idle
 
@@ -111,6 +117,8 @@ class GoalStatePublisher(Node):
         # Plain text, not JSON. Empty string clears the command.
         cmd = msg.data.strip() or None
         self.get_logger().info(f'/user_command received: {cmd!r}')
+        self._pending_action_result = None
+        self._pending_action_before_world = None
         self._builder.set_user_command(cmd)
         self._publish()  # cold-start trigger
 
@@ -118,14 +126,46 @@ class GoalStatePublisher(Node):
         obj = self._parse(msg.data, '/action_result')
         if obj is None:
             return
+        before = self._builder.current_world_state()
         self._builder.on_action_result(obj)
-        self._publish()  # in-flight trigger (skill finished)
+        if obj.get('result') == 'success' and obj.get('action') == 'pyramid':
+            self._pending_action_result = obj
+            self._pending_action_before_world = before
+            if not self._maybe_publish_pending_action():
+                self.get_logger().info(
+                    f'/action_result pending world update: {obj}')
+            return
+        self._publish()  # failures do not require a world-state delta
 
     def _on_llm_output(self, msg: String) -> None:
         # The future LLM node feeds its plan back so we can track goal/steps.
         obj = self._parse(msg.data, '/llm_output')
-        if obj is not None:
+        if obj is None:
+            return
+        if obj.get('status') == 'ok':
+            self._builder.set_plan(obj)
+        elif obj.get('decision') == 'replan' and obj.get('plan') is not None:
             self._builder.set_plan(obj.get('plan'))
+        elif obj.get('decision') == 'done':
+            self._builder.set_plan(None)
+
+    def _maybe_publish_pending_action(self) -> bool:
+        if self._pending_action_result is None:
+            return False
+        current = self._builder.current_world_state()
+        if not action_result_reflected(
+            self._pending_action_result,
+            self._pending_action_before_world,
+            current,
+        ):
+            return False
+        result = self._pending_action_result
+        self._pending_action_result = None
+        self._pending_action_before_world = None
+        self.get_logger().info(
+            f'/action_result reflected in world state: {result}')
+        self._publish()
+        return True
 
     def _parse(self, raw: str, src: str) -> dict | None:
         try:
