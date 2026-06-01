@@ -30,6 +30,23 @@ Ollama LLM을 통해 플랜을 받고, FastAPI 서버의 `/api/robot/skill/pyram
 
 ---
 
+## 고정 실험값 (`config.py`)
+
+```python
+COMMAND = "3단 피라미드에서 1단만 쌓아줘"
+
+FAKE_XY = {
+    "L1_left":  (0.280, -0.15),
+    "L1_mid":   (0.280,  0.00),
+    "L1_right": (0.280,  0.15),
+}
+```
+
+`fake_aggregator_node` / `fake_digital_twin_node`의 측정 좌표와 동일한 값.  
+실험 조건이 바뀔 때는 `config.py`만 수정한다.
+
+---
+
 ## 전제 조건
 
 | 컴포넌트 | 확인 방법 |
@@ -42,81 +59,33 @@ Ollama LLM을 통해 플랜을 받고, FastAPI 서버의 `/api/robot/skill/pyram
 
 ---
 
-## 빠른 시작
+## 실행
 
 ```bash
 # test_v1.0/ 루트에서 실행
-cd test_v1.0
 
-# dry-run (API 실제 호출 없음, 기본값)
-python3 http_client/client.py \
-  --command "1단만 쌓아줘" \
-  --fake-xy '{"L1_left":[0.28,-0.15],"L1_mid":[0.28,0.0],"L1_right":[0.28,0.15]}'
+# dry-run (기본값, API 미호출)
+python3 http_client/client.py
 
 # 실제 로봇 API 호출
-python3 http_client/client.py \
-  --command "1단만 쌓아줘" \
-  --fake-xy '{"L1_left":[0.28,-0.15],"L1_mid":[0.28,0.0],"L1_right":[0.28,0.15]}' \
-  --real-api
-```
-
----
-
-## 인자 레퍼런스
-
-| 인자 | 기본값 | 설명 |
-|------|--------|------|
-| `--command` | *(필수)* | LLM에 전달할 자연어 명령 |
-| `--fake-xy` | *(필수)* | 슬롯별 픽 좌표 JSON. 아래 형식 참고 |
-| `--server` | `http://localhost:8000` | FastAPI 서버 base URL |
-| `--ollama-url` | `http://localhost:11434/api/chat` | Ollama 엔드포인트 |
-| `--model` | `gemma4:26b` | Ollama 모델명 |
-| `--llm-timeout` | `120` | LLM 호출 타임아웃 (초) |
-| `--dry-run` | on | API 호출 없이 로그만 출력 |
-| `--real-api` | — | `--dry-run` 해제, 실제 API 호출 |
-| `--prompt-dir` | `prompts/` | 프롬프트 디렉토리 경로 (기본: 이 레포의 `prompts/`) |
-
-### --fake-xy 형식
-
-```json
-{
-  "L1_left":  [x, y],
-  "L1_mid":   [x, y],
-  "L1_right": [x, y],
-  "L2_left":  [x, y],
-  "L2_right": [x, y],
-  "L3_top":   [x, y]
-}
-```
-
-- 키는 `L1_left`, `L1_mid`, `L1_right`, `L2_left`, `L2_right`, `L3_top` 중 하나
-- 플랜에 포함된 슬롯의 좌표만 있으면 됨 (전체 6개 불필요)
-- 실험 측정값 (1단 쌓기 기준):
-
-```bash
---fake-xy '{"L1_left":[0.280,-0.15],"L1_mid":[0.280,0.0],"L1_right":[0.280,0.15]}'
+DRY_RUN=0 python3 http_client/client.py
 ```
 
 ---
 
 ## 환경 변수
 
-인자 대신 환경 변수로 기본값을 오버라이드할 수 있다.
-
-| 변수 | 대응 인자 | 기본값 |
-|------|----------|--------|
-| `SERVER_URL` | `--server` | `http://localhost:8000` |
-| `OLLAMA_URL` | `--ollama-url` | `http://localhost:11434/api/chat` |
-| `LLM_MODEL` | `--model` | `gemma4:26b` |
-| `DRY_RUN` | `--dry-run` / `--real-api` | `1` (dry-run on) |
-| `GRIPPER_CLOSED_MM` | — | `100.0` mm (이 값 미만이면 그리퍼가 컵을 잡은 것으로 판단) |
+| 변수 | 기본값 | 설명 |
+|------|--------|------|
+| `SERVER_URL` | `http://localhost:8000` | FastAPI 서버 base URL |
+| `OLLAMA_URL` | `http://localhost:11434/api/chat` | Ollama 엔드포인트 |
+| `LLM_MODEL` | `gemma4:26b` | Ollama 모델명 |
+| `DRY_RUN` | `1` | `0`으로 설정 시 실제 API 호출 |
+| `GRIPPER_CLOSED_MM` | `100.0` | 이 값 미만이면 그리퍼가 컵을 잡은 것으로 판단 |
 
 ```bash
-SERVER_URL=http://192.168.1.31:8000 LLM_MODEL=qwen3.6:35b \
-  python3 http_client/client.py \
-  --command "1단만 쌓아줘" \
-  --fake-xy '{"L1_left":[0.28,-0.15],"L1_mid":[0.28,0.0],"L1_right":[0.28,0.15]}' \
-  --real-api
+SERVER_URL=http://192.168.1.31:8000 LLM_MODEL=qwen3.6:35b DRY_RUN=0 \
+  python3 http_client/client.py
 ```
 
 ---
@@ -126,9 +95,9 @@ SERVER_URL=http://192.168.1.31:8000 LLM_MODEL=qwen3.6:35b \
 ### 1. cold_start
 
 1. `GET /api/robot/status` → `gripper.width_mm` 조회
-   - `width_mm < GRIPPER_CLOSED_MM` → `holding=True` (이전 픽 색상을 GoalStateBuilder가 채움)
+   - `width_mm < GRIPPER_CLOSED_MM` → `holding=True`
    - `width_mm`가 None이거나 임계값 이상 → `holding=None`
-2. `GoalStateBuilder`로 cold_start 페이로드 조립 (`mode="cold_start"`)
+2. `GoalStateBuilder`로 cold_start 페이로드 조립
 3. Ollama 호출 → `status=ok` + `plan.steps[]` 수신
 4. 플랜 채택
 
@@ -137,15 +106,12 @@ SERVER_URL=http://192.168.1.31:8000 LLM_MODEL=qwen3.6:35b \
 스텝마다 다음을 반복한다.
 
 ```
-execute_step()   # POST /api/robot/skill/pyramid {x, y, slot}
-                 # timeout=None — 로봇 동작 완료까지 blocking
-                 # 서버에 큐 없음: 응답 받은 뒤 다음 요청 전송 필수
+execute_step()        # POST /api/robot/skill/pyramid {x, y, slot}
+                      # timeout=None — 로봇 동작 완료까지 blocking
 ↓
 fetch_robot_state()   # GET /api/robot/status
 ↓
-GoalStateBuilder.build_payload()  # mode="in_flight"
-↓
-Ollama 호출
+_llm_call()           # in_flight payload → Ollama
 ↓
 decision:
   continue → 다음 스텝
@@ -169,8 +135,7 @@ decision:
 ## 서버 큐 동작 주의
 
 FastAPI `POST /api/robot/skill/pyramid`는 내부적으로 skill_api_node에 직접 HTTP를 쏘며 **요청 큐가 없다**.  
-동시 요청이 오면 skill_api_node에 동시 도달하므로, 이 클라이언트는 **반드시 응답을 받은 뒤 다음 요청을 보내야 한다**.  
-`execute_step(timeout=None)`의 blocking HTTP 호출이 이를 자동으로 보장한다.
+`execute_step(timeout=None)`의 blocking HTTP 호출이 자연스러운 순차 실행을 보장한다.
 
 ---
 
@@ -179,7 +144,7 @@ FastAPI `POST /api/robot/skill/pyramid`는 내부적으로 skill_api_node에 직
 | 항목 | 현황 |
 |------|------|
 | `cups_on_table` / `stack` 갱신 | `fake_aggregator_node`가 담당. 이 클라이언트는 항상 `{}` |
-| 컵 색상 → 실제 좌표 해석 | `fake_xy` (슬롯 기반 고정 좌표). 실제 환경은 `plan_executor_node` + digital twin |
+| 컵 색상 → 실제 좌표 해석 | `FAKE_XY` (슬롯 기반 고정 좌표). 실제 환경은 `plan_executor_node` + digital twin |
 | stacked ID 추적 | `fake_digital_twin_node` + `plan_executor_node`가 담당 |
 
 ---

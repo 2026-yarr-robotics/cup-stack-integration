@@ -4,7 +4,6 @@ No actual HTTP calls are made. LLM responses and execute_step are mocked.
 """
 from __future__ import annotations
 
-import argparse
 import sys
 import unittest
 from pathlib import Path
@@ -14,8 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "http_client"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import client  # noqa: E402
-
-FAKE_XY = '{"L1_left":[0.28,-0.15],"L1_mid":[0.28,0.0],"L1_right":[0.28,0.15]}'
 
 _COLD_START_RESPONSE = {
     "status": "ok",
@@ -38,22 +35,6 @@ _INFLIGHT_CONTINUE = {"decision": "continue", "plan": None}
 _INFLIGHT_DONE     = {"decision": "done",     "plan": None}
 
 _EMPTY_ROBOT_STATE = {"gripper": {"holding": None, "force_n": 0.0}}
-
-
-def _make_args(**overrides) -> argparse.Namespace:
-    base = argparse.Namespace(
-        command="1단만 쌓아줘",
-        fake_xy=FAKE_XY,
-        server="http://localhost:8000",
-        ollama_url="http://localhost:11434/api/chat",
-        model="gemma4:26b",
-        llm_timeout=120,
-        dry_run=True,
-        prompt_dir=str(Path(__file__).resolve().parents[1] / "prompts"),
-    )
-    for k, v in overrides.items():
-        setattr(base, k, v)
-    return base
 
 
 def _success_action_result(step: dict) -> dict:
@@ -79,7 +60,7 @@ class TestSequentialPyramid(unittest.TestCase):
         ])
         executed_slots: list[str] = []
 
-        def fake_llm_call(model, prompt, payload, ollama_url, timeout, mode):
+        def fake_llm_call(prompt, payload, mode):
             return next(llm_responses)
 
         def fake_execute_step(step, fake_xy, api_url, timeout, dry_run):
@@ -92,7 +73,7 @@ class TestSequentialPyramid(unittest.TestCase):
             patch("client.execute_step", side_effect=fake_execute_step),
             patch("client.fetch_robot_state", return_value=_EMPTY_ROBOT_STATE),
         ):
-            exit_code = client.run(_make_args())
+            exit_code = client.run()
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(executed_slots, ["L1_left", "L1_mid", "L1_right"])
@@ -107,7 +88,7 @@ class TestSequentialPyramid(unittest.TestCase):
         ])
         call_count = 0
 
-        def fake_llm_call(model, prompt, payload, ollama_url, timeout, mode):
+        def fake_llm_call(prompt, payload, mode):
             return next(llm_responses)
 
         def fake_execute_step(step, fake_xy, api_url, timeout, dry_run):
@@ -121,7 +102,7 @@ class TestSequentialPyramid(unittest.TestCase):
             patch("client.execute_step", side_effect=fake_execute_step),
             patch("client.fetch_robot_state", return_value=_EMPTY_ROBOT_STATE),
         ):
-            client.run(_make_args())
+            client.run()
 
         self.assertEqual(call_count, 3)
 
@@ -135,7 +116,7 @@ class TestSequentialPyramid(unittest.TestCase):
         ])
         fetch_count = 0
 
-        def fake_llm_call(model, prompt, payload, ollama_url, timeout, mode):
+        def fake_llm_call(prompt, payload, mode):
             return next(llm_responses)
 
         def fake_execute_step(step, fake_xy, api_url, timeout, dry_run):
@@ -152,7 +133,7 @@ class TestSequentialPyramid(unittest.TestCase):
             patch("client.execute_step", side_effect=fake_execute_step),
             patch("client.fetch_robot_state", side_effect=fake_fetch),
         ):
-            client.run(_make_args())
+            client.run()
 
         self.assertEqual(fetch_count, 4)
 

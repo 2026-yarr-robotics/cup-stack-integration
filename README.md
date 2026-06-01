@@ -255,12 +255,24 @@ OLLAMA_URL  default http://localhost:11434/api/chat
 
 ## HTTP Client Path
 
-`http_client/` is a separate non-ROS helper path. It does not preserve the ROS
-topic I/O contract because it accepts `--fake-xy` directly and calls the server
-sequentially from one Python process.
+`http_client/` is a separate non-ROS helper path for quick HTTP sequencing
+checks. It calls the server directly without going through ROS topics.
 
-Use `http_client/` only for quick HTTP sequencing checks. Do not treat it as the
-primary experiment path described above.
+Fixed values are defined in `http_client/config.py`:
+
+```text
+COMMAND  = "3단 피라미드에서 1단만 쌓아줘"
+FAKE_XY  = {L1_left: (0.280, -0.15), L1_mid: (0.280, 0.00), L1_right: (0.280, 0.15)}
+```
+
+Run:
+
+```bash
+python3 http_client/client.py          # dry-run (DRY_RUN=1)
+DRY_RUN=0 python3 http_client/client.py  # real API
+```
+
+Do not treat it as the primary experiment path described above.
 
 ## Do Not Do
 
