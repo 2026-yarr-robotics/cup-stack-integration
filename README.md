@@ -323,27 +323,6 @@ MODEL       default qwen3.6:35b
 OLLAMA_URL  default http://localhost:11434/api/chat
 ```
 
-## HTTP Client Path
-
-`http_client/` is a separate non-ROS helper path for quick HTTP sequencing
-checks. It calls the server directly without going through ROS topics.
-
-Fixed values are defined in `http_client/config.py`:
-
-```text
-COMMAND  = "3단 피라미드에서 1단만 쌓아줘"
-FAKE_XY  = {L1_left: (0.280, -0.15), L1_mid: (0.280, 0.00), L1_right: (0.280, 0.15)}
-```
-
-Run:
-
-```bash
-python3 http_client/client.py          # dry-run (DRY_RUN=1)
-DRY_RUN=0 python3 http_client/client.py  # real API
-```
-
-Do not treat it as the primary experiment path described above.
-
 ## Do Not Do
 
 - Do not add `/raw_action_result` for this experiment.
@@ -352,11 +331,14 @@ Do not treat it as the primary experiment path described above.
 - Do not rename the real topics.
 - Do not make `llm_node.py` choose the mode itself; mode is supplied in
   `/llm_input` by GSP.
+- Do not add a separate non-ROS orchestration client that directly calls both
+  Ollama and the robot skill API. This experiment should run through the ROS
+  nodes one by one.
 
 ## Test
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile scripts/*.py http_client/*.py
+python3 -m py_compile scripts/*.py
 bash -n start.sh
 ```
