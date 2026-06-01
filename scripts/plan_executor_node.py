@@ -332,7 +332,8 @@ class PlanExecutorNode(Node):
             req = urllib.request.Request(
                 url, data=data, method='POST',
                 headers={'Content-Type': 'application/json',
-                         'Accept': 'application/json'})
+                         'Accept': 'application/json',
+                         'User-Agent': 'curl/7.81.0'})
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 body = resp.read().decode('utf-8', 'replace')
         except urllib.error.HTTPError as e:
