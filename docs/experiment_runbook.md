@@ -252,11 +252,15 @@ Likely cause:
 fake_digital_twin_node did not add the used track id after /action_result.
 ```
 
-### LLM reports replan after success
+### LLM reports replan
+
+The current experiment prompt is a no-replan baseline. This should not happen
+unless the prompt file was changed or the model ignored the prompt.
 
 Inspect:
 
 ```bash
+tail -f logs/YYYYmmdd_HHMMSS/llm_output.jsonl
 ros2 topic echo /stack
 ros2 topic echo /cups_on_table
 ros2 topic echo /action_result

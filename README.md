@@ -187,6 +187,9 @@ prompts/cold_start_planner.md
 prompts/inflight_decider.md
 ```
 
+`prompts/inflight_decider.md` is currently a no-replan baseline for this
+experiment. In-flight decisions should be only `continue` or `done`.
+
 ### plan_executor_node.py
 
 Use the real-compatible executor contract.
@@ -216,7 +219,7 @@ It should not accept fake coordinates directly in the ROS experiment.
 6. fake_aggregator_node updates /cups_on_table and /stack.
 7. fake_digital_twin_node updates /stack_track_ids.
 8. goal_state_publisher_node publishes in_flight /llm_input.
-9. llm_node publishes continue/replan/done.
+9. llm_node publishes continue/done.
 10. plan_executor_node executes the next step on continue.
 ```
 
