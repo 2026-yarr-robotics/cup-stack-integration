@@ -43,12 +43,12 @@ Expected cold-start target:
 Expected robot skill API bodies:
 
 ```json
-{"x": 0.20, "y": -0.20, "slot": "1l"}
-{"x": 0.20, "y": 0.00, "slot": "1m"}
-{"x": 0.20, "y": 0.20, "slot": "1r"}
-{"x": 0.32, "y": -0.20, "slot": "2l"}
-{"x": 0.32, "y": 0.00, "slot": "2r"}
-{"x": 0.32, "y": 0.20, "slot": "3m"}
+{"x": 0.250, "y": -0.20, "slot": "1l"}
+{"x": 0.250, "y": 0.00, "slot": "1m"}
+{"x": 0.250, "y": 0.20, "slot": "1r"}
+{"x": 0.350, "y": -0.20, "slot": "2l"}
+{"x": 0.350, "y": 0.00, "slot": "2r"}
+{"x": 0.350, "y": 0.20, "slot": "3m"}
 ```
 
 ## 0. Sync Repo
@@ -214,12 +214,12 @@ API_TIMEOUT_S=240.0 ./start.sh --real-api
 Expected physical sequence:
 
 ```text
-1. Pick measured cup at x=0.20, y=-0.20 and place slot 1l.
-2. Pick measured cup at x=0.20, y=0.00 and place slot 1m.
-3. Pick measured cup at x=0.20, y=0.20 and place slot 1r.
-4. Pick measured cup at x=0.32, y=-0.20 and place slot 2l.
-5. Pick measured cup at x=0.32, y=0.00 and place slot 2r.
-6. Pick measured cup at x=0.32, y=0.20 and place slot 3m.
+1. Pick measured cup at x=0.250, y=-0.20 and place slot 1l.
+2. Pick measured cup at x=0.250, y=0.00 and place slot 1m.
+3. Pick measured cup at x=0.250, y=0.20 and place slot 1r.
+4. Pick measured cup at x=0.350, y=-0.20 and place slot 2l.
+5. Pick measured cup at x=0.350, y=0.00 and place slot 2r.
+6. Pick measured cup at x=0.350, y=0.20 and place slot 3m.
 ```
 
 ## Failure Triage

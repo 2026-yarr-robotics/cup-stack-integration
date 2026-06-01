@@ -8,12 +8,12 @@ for the fixed experiment while keeping plan_executor_node unchanged:
   subscribe /action_result       std_msgs/String JSON
 
 Measured blue cup pick positions for the experiment:
-  L1_left  -> track id 1, x=0.20, y=-0.20
-  L1_mid   -> track id 2, x=0.20, y=0.00
-  L1_right -> track id 3, x=0.20, y=0.20
-  L2_left  -> track id 4, x=0.32, y=-0.20
-  L2_right -> track id 5, x=0.32, y=0.00
-  L3_top   -> track id 6, x=0.32, y=0.20
+  L1_left  -> track id 1, x=0.250, y=-0.20
+  L1_mid   -> track id 2, x=0.250, y=0.00
+  L1_right -> track id 3, x=0.250, y=0.20
+  L2_left  -> track id 4, x=0.350, y=-0.20
+  L2_right -> track id 5, x=0.350, y=0.00
+  L3_top   -> track id 6, x=0.350, y=0.20
 """
 from __future__ import annotations
 
@@ -26,12 +26,12 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 
 MEASURED_CUPS: dict[str, tuple[int, float, float]] = {
-    'L1_left': (1, 0.20, -0.20),
-    'L1_mid': (2, 0.20, 0.00),
-    'L1_right': (3, 0.20, 0.20),
-    'L2_left': (4, 0.32, -0.20),
-    'L2_right': (5, 0.32, 0.00),
-    'L3_top': (6, 0.32, 0.20),
+    'L1_left': (1, 0.250, -0.20),
+    'L1_mid': (2, 0.250, 0.00),
+    'L1_right': (3, 0.250, 0.20),
+    'L2_left': (4, 0.350, -0.20),
+    'L2_right': (5, 0.350, 0.00),
+    'L3_top': (6, 0.350, 0.20),
 }
 
 
