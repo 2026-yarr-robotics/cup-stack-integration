@@ -137,7 +137,7 @@ Only continue after dry-run is correct.
 Required external services:
 
 ```text
-server FastAPI on :8000
+robot skill API at https://yarr-api-31.simplyimg.com
 skill_api_node on :8765
 Doosan bringup / MoveIt ready
 pyramid geometry config set on server
@@ -146,7 +146,7 @@ pyramid geometry config set on server
 Check server status:
 
 ```bash
-curl http://localhost:8000/api/robot/status
+curl https://yarr-api-31.simplyimg.com/api/robot/status
 ```
 
 ## 5. Run Real API Experiment

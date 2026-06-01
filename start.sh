@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DRY_RUN=true
-API_URL="${API_URL:-http://localhost:8000/api/robot/skill/pyramid}"
+API_URL="${API_URL:-https://yarr-api-31.simplyimg.com/api/robot/skill/pyramid}"
 MODEL="${MODEL:-qwen3.6:35b}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
 

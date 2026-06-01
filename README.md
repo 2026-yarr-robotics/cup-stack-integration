@@ -318,7 +318,7 @@ To call the real pyramid API:
 Useful environment variables:
 
 ```text
-API_URL     default http://localhost:8000/api/robot/skill/pyramid
+API_URL     default https://yarr-api-31.simplyimg.com/api/robot/skill/pyramid
 MODEL       default qwen3.6:35b
 OLLAMA_URL  default http://localhost:11434/api/chat
 ```

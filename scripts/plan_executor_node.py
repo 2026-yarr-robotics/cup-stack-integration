@@ -3,7 +3,7 @@
 Canonical source (lives in LLM-prompting; copied into the integration package
 `system_state_aggregator`). Closes the planner→skill loop:
 
-    llm_node --/llm_output--> plan_executor_node --POST /api/robot/skill/pyramid--> server (FastAPI :8000)
+    llm_node --/llm_output--> plan_executor_node --POST /api/robot/skill/pyramid--> robot skill API
                                     │
                                     +--/action_result--> goal_state_publisher
 
@@ -159,7 +159,7 @@ class PlanExecutorNode(Node):
         # = one cup. {x, y, slot} only.
         self.declare_parameter(
             'api_url_pyramid',
-            'http://localhost:8000/api/robot/skill/pyramid')
+            'https://yarr-api-31.simplyimg.com/api/robot/skill/pyramid')
         self.declare_parameter('api_timeout_s', 15.0)
         self.declare_parameter('dry_run', True)
 
