@@ -126,7 +126,8 @@ class GoalStatePublisher(Node):
         obj = self._parse(msg.data, '/action_result')
         if obj is None:
             return
-        before = self._builder.current_world_state()
+        before = (self._builder.previous_world_state()
+                  or self._builder.current_world_state())
         self._builder.on_action_result(obj)
         if obj.get('result') == 'success' and obj.get('action') == 'pyramid':
             self._pending_action_result = obj

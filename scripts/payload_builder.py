@@ -260,6 +260,10 @@ class GoalStateBuilder:
             'total_slots': len(STACK_SLOTS),
         }
 
+    def previous_world_state(self) -> dict | None:
+        """WorldState snapshot used in the last published LLM payload."""
+        return self._prev_world_state
+
     def current_goal(self) -> dict | None:
         """The next step to execute = remaining_steps[0], or null when done."""
         if not self._current_plan:

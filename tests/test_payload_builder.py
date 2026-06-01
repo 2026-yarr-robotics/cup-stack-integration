@@ -95,6 +95,22 @@ class GoalStateBuilderTest(unittest.TestCase):
         self.assertFalse(action_result_reflected(result, before, stale))
         self.assertTrue(action_result_reflected(result, before, reflected))
 
+    def test_previous_world_state_is_last_published_snapshot(self):
+        builder = GoalStateBuilder()
+        builder.set_world({'blue': 6}, {'L1_left': None})
+        payload = builder.build_payload()
+        builder.commit(payload)
+        builder.set_world({'blue': 5}, {'L1_left': 'blue'})
+
+        self.assertEqual(
+            builder.previous_world_state()['cups_on_table'],
+            {'blue': 6},
+        )
+        self.assertEqual(
+            builder.current_world_state()['cups_on_table'],
+            {'blue': 5},
+        )
+
 
 if __name__ == '__main__':
     unittest.main()
