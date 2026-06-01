@@ -230,6 +230,11 @@ publish /action_result
 
 It should not accept fake coordinates directly in the ROS experiment.
 
+The robot server returns from `POST /api/robot/skill/pyramid` at cup release
+time while the final lift can still be running. `plan_executor_node.py` starts
+the LLM loop from that early success, but before sending the next POST it waits
+for `skill_api_node` status to report `busy=false`.
+
 ## LLM Call Sequence
 
 ```text
@@ -237,12 +242,13 @@ It should not accept fake coordinates directly in the ROS experiment.
 2. goal_state_publisher_node publishes cold_start /llm_input.
 3. llm_node publishes cold-start /llm_output with plan.
 4. plan_executor_node executes the first pyramid step.
-5. plan_executor_node publishes /action_result.
+5. plan_executor_node publishes /action_result at cup release/place time.
 6. fake_aggregator_node updates /cups_on_table and /stack.
 7. fake_digital_twin_node updates /stack_track_ids.
 8. goal_state_publisher_node publishes in_flight /llm_input.
 9. llm_node publishes continue/replan/done.
-10. plan_executor_node executes the next step on continue.
+10. plan_executor_node waits for skill_api_node busy=false.
+11. plan_executor_node executes the next step on continue.
 ```
 
 ## Expected API Bodies
@@ -288,7 +294,8 @@ The server is expected to:
 2. translate API slot keys such as 1l, 1m, 1r into internal place poses using
    its own pyramid geometry config;
 3. call the lower-level robot/skill implementation;
-4. return success or failure after the motion attempt.
+4. return success after cup release/place while final lift continues;
+5. keep skill_api_node busy=true until the final lift finishes.
 ```
 
 The server is not expected to:
@@ -348,6 +355,10 @@ Useful environment variables:
 ```text
 API_URL     default https://yarr-api-31.simplyimg.com/api/robot/skill/pyramid
 API_TIMEOUT_S default 180.0
+SKILL_STATUS_URL default http://localhost:8765/status
+SKILL_IDLE_TIMEOUT_S default 10.0
+SKILL_IDLE_POLL_S default 0.2
+SKILL_STATUS_TIMEOUT_S default 1.0
 MODEL       default qwen3.6:35b
 OLLAMA_URL  default http://localhost:11434/api/chat
 ```

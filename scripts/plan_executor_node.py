@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -161,6 +162,10 @@ class PlanExecutorNode(Node):
             'api_url_pyramid',
             'https://yarr-api-31.simplyimg.com/api/robot/skill/pyramid')
         self.declare_parameter('api_timeout_s', 15.0)
+        self.declare_parameter('skill_status_url', 'http://localhost:8765/status')
+        self.declare_parameter('skill_idle_timeout_s', 10.0)
+        self.declare_parameter('skill_idle_poll_s', 0.2)
+        self.declare_parameter('skill_status_timeout_s', 1.0)
         self.declare_parameter('dry_run', True)
 
         llm_out = str(self.get_parameter('llm_output_topic').value)
@@ -169,6 +174,14 @@ class PlanExecutorNode(Node):
         stacked_topic = str(self.get_parameter('stack_track_ids_topic').value)
         self._api_url = str(self.get_parameter('api_url_pyramid').value)
         self._timeout = float(self.get_parameter('api_timeout_s').value)
+        self._skill_status_url = str(
+            self.get_parameter('skill_status_url').value)
+        self._idle_timeout_s = float(
+            self.get_parameter('skill_idle_timeout_s').value)
+        self._idle_poll_s = float(
+            self.get_parameter('skill_idle_poll_s').value)
+        self._status_timeout_s = float(
+            self.get_parameter('skill_status_timeout_s').value)
         self._dry_run = bool(self.get_parameter('dry_run').value)
 
         self._state_lock = threading.Lock()
@@ -187,7 +200,9 @@ class PlanExecutorNode(Node):
 
         self.get_logger().info(
             f'plan_executor_node: api={self._api_url} '
-            f'timeout={self._timeout}s dry_run={self._dry_run}')
+            f'timeout={self._timeout}s dry_run={self._dry_run} '
+            f'skill_status={self._skill_status_url} '
+            f'idle_timeout={self._idle_timeout_s}s')
 
     # ── Perception tracking ────────────────────────────────────────────────
 
@@ -322,9 +337,48 @@ class PlanExecutorNode(Node):
             self.get_logger().info(
                 f'[dry-run] POST {self._api_url} {body}  ({log})')
             return 'success', None
+        idle, reason = self._wait_for_skill_idle()
+        if not idle:
+            return 'fail', reason
         self.get_logger().info(f'POST {self._api_url} {body}  ({log})')
         result = self._http_post_json(self._api_url, body)
         return ('success', None) if result.ok else ('fail', result.detail)
+
+    def _wait_for_skill_idle(self) -> tuple[bool, str | None]:
+        """Wait until skill_api_node's final lift clears its busy flag.
+
+        The server now returns /skill/pyramid_step as soon as the cup is
+        released at the place pose. That is intentionally early so GSP/LLM can
+        infer during the final lift, but the next physical skill must not be
+        submitted until skill_api_node reports busy=false.
+        """
+        if not self._skill_status_url:
+            return True, None
+        deadline = time.monotonic() + self._idle_timeout_s
+        logged_wait = False
+        while True:
+            status = self._http_get_json(
+                self._skill_status_url,
+                timeout=self._status_timeout_s,
+            )
+            if not status.ok:
+                return False, f'skill status unavailable: {status.detail}'
+            data = status.data if isinstance(status.data, dict) else {}
+            ready = bool(data.get('ready', True))
+            busy = bool(data.get('busy', False))
+            if ready and not busy:
+                if logged_wait:
+                    self.get_logger().info('skill_api_node idle; next POST allowed')
+                return True, None
+            if not logged_wait:
+                self.get_logger().info(
+                    'skill_api_node busy; waiting for final lift before next POST')
+                logged_wait = True
+            if time.monotonic() >= deadline:
+                return False, (
+                    f'skill_api_node busy after {self._idle_timeout_s:.1f}s '
+                    f'at {self._skill_status_url}')
+            time.sleep(self._idle_poll_s)
 
     def _http_post_json(self, url: str, payload: dict) -> _HTTPResult:
         try:
@@ -357,6 +411,29 @@ class PlanExecutorNode(Node):
                            or 'success=false'),
                 data=parsed)
         return _HTTPResult(ok=True, data=parsed)
+
+    def _http_get_json(self, url: str, *, timeout: float) -> _HTTPResult:
+        try:
+            req = urllib.request.Request(
+                url, method='GET',
+                headers={'Accept': 'application/json',
+                         'User-Agent': 'curl/7.81.0'})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode('utf-8', 'replace')
+        except urllib.error.HTTPError as e:
+            return _HTTPResult(
+                ok=False,
+                detail=f'HTTP {e.code}: '
+                       f'{e.read().decode("utf-8", "replace")[:200]}')
+        except urllib.error.URLError as e:
+            return _HTTPResult(ok=False, detail=f'network: {e.reason}')
+        except Exception as e:  # noqa: BLE001
+            return _HTTPResult(ok=False, detail=f'transport: {e}')
+        try:
+            return _HTTPResult(ok=True, data=json.loads(body))
+        except ValueError:
+            return _HTTPResult(
+                ok=False, detail=f'non-JSON response: {body[:200]}')
 
     # ── /action_result publish ───────────────────────────────────────────────
 

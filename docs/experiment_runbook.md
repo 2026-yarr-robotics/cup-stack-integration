@@ -211,6 +211,17 @@ seconds. Override only when needed:
 API_TIMEOUT_S=240.0 ./start.sh --real-api
 ```
 
+The server now responds to each pyramid call at cup release/place time while
+the final lift continues. This lets GSP and LLM infer during the lift. The
+executor still gates the next physical POST by polling skill_api_node status:
+
+```text
+SKILL_STATUS_URL=http://localhost:8765/status
+SKILL_IDLE_TIMEOUT_S=10.0
+wait until busy=false, up to 10 seconds
+then submit the next pyramid POST
+```
+
 Expected physical sequence:
 
 ```text

@@ -4,6 +4,10 @@ set -euo pipefail
 DRY_RUN=true
 API_URL="${API_URL:-https://yarr-api-31.simplyimg.com/api/robot/skill/pyramid}"
 API_TIMEOUT_S="${API_TIMEOUT_S:-180.0}"
+SKILL_STATUS_URL="${SKILL_STATUS_URL:-http://localhost:8765/status}"
+SKILL_IDLE_TIMEOUT_S="${SKILL_IDLE_TIMEOUT_S:-10.0}"
+SKILL_IDLE_POLL_S="${SKILL_IDLE_POLL_S:-0.2}"
+SKILL_STATUS_TIMEOUT_S="${SKILL_STATUS_TIMEOUT_S:-1.0}"
 MODEL="${MODEL:-qwen3.6:35b}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
 DISTURBANCE_ENABLED="${DISTURBANCE_ENABLED:-true}"
@@ -57,6 +61,10 @@ launch plan_executor python3 scripts/plan_executor_node.py \
   --ros-args \
   -p api_url_pyramid:="${API_URL}" \
   -p api_timeout_s:="${API_TIMEOUT_S}" \
+  -p skill_status_url:="${SKILL_STATUS_URL}" \
+  -p skill_idle_timeout_s:="${SKILL_IDLE_TIMEOUT_S}" \
+  -p skill_idle_poll_s:="${SKILL_IDLE_POLL_S}" \
+  -p skill_status_timeout_s:="${SKILL_STATUS_TIMEOUT_S}" \
   -p dry_run:="${DRY_RUN}"
 
 wait
