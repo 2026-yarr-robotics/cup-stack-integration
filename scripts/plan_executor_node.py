@@ -190,6 +190,7 @@ class PlanExecutorNode(Node):
         self._plan: list[dict] = []
         self._step_idx: int = 0
         self._busy: bool = False
+        self._sent_real_skill_request: bool = False
 
         self._action_pub = self.create_publisher(String, action_topic, 10)
         self.create_subscription(String, llm_out, self._on_llm_output, 10)
@@ -337,11 +338,13 @@ class PlanExecutorNode(Node):
             self.get_logger().info(
                 f'[dry-run] POST {self._api_url} {body}  ({log})')
             return 'success', None
-        idle, reason = self._wait_for_skill_idle()
-        if not idle:
-            return 'fail', reason
+        if self._sent_real_skill_request:
+            idle, reason = self._wait_for_skill_idle()
+            if not idle:
+                return 'fail', reason
         self.get_logger().info(f'POST {self._api_url} {body}  ({log})')
         result = self._http_post_json(self._api_url, body)
+        self._sent_real_skill_request = True
         return ('success', None) if result.ok else ('fail', result.detail)
 
     def _wait_for_skill_idle(self) -> tuple[bool, str | None]:

@@ -233,7 +233,9 @@ It should not accept fake coordinates directly in the ROS experiment.
 The robot server returns from `POST /api/robot/skill/pyramid` at cup release
 time while the final lift can still be running. `plan_executor_node.py` starts
 the LLM loop from that early success, but before sending the next POST it waits
-for `skill_api_node` status to report `busy=false`.
+for `skill_api_node` status to report `busy=false`. The first POST is allowed
+without the status gate because the server starts `skill_api_node` lazily on
+the first skill request.
 
 ## LLM Call Sequence
 

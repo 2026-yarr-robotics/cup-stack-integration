@@ -216,9 +216,10 @@ the final lift continues. This lets GSP and LLM infer during the lift. The
 executor still gates the next physical POST by polling skill_api_node status:
 
 ```text
+first POST starts skill_api_node lazily through the server
 SKILL_STATUS_URL=http://localhost:8765/status
 SKILL_IDLE_TIMEOUT_S=10.0
-wait until busy=false, up to 10 seconds
+from the second POST onward, wait until busy=false, up to 10 seconds
 then submit the next pyramid POST
 ```
 
