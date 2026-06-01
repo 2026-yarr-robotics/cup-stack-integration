@@ -1,17 +1,20 @@
 # test_v1.0
 
-Temporary integration experiment for the YARR LLM closed loop.
+Temporary YARR integration experiment for validating the LLM closed loop with
+fake perception inputs but the same ROS topic contract as the real pipeline.
 
-This repo keeps the real topic/message contract but replaces perception inputs
-with fake nodes for one fixed integration experiment.
+This README is written as the source of truth for future AI/code agents. Follow
+this plan before modifying implementation.
 
-Target scenario:
+## Experiment Goal
+
+Run one fixed scenario:
 
 ```text
 3단 피라미드에서 1단만 쌓아줘
 ```
 
-Expected cold-start target:
+Expected cold-start normalization:
 
 ```json
 {
@@ -21,26 +24,210 @@ Expected cold-start target:
 }
 ```
 
-## Nodes
+The robot should execute three pyramid API calls for the bottom row only:
 
-- `fake_aggregator_node.py`: publishes `/cups_on_table`, `/stack`, `/user_command`
-  and updates fake world state from `/action_result`.
-- `fake_digital_twin_node.py`: publishes `/digital_twin/boxes` and
-  `/stack_track_ids` using measured red cup positions.
-- `goal_state_publisher_node.py`: builds `/llm_input`.
-- `llm_node.py`: calls Ollama and publishes `/llm_output`.
-- `plan_executor_node.py`: unchanged executor contract; consumes
-  `/llm_output`, `/digital_twin/boxes`, `/stack_track_ids`, calls the pyramid API,
-  and publishes `/action_result`.
+```text
+L1_left  -> API slot 1l
+L1_mid   -> API slot 1m
+L1_right -> API slot 1r
+```
 
-## Measured Cup Poses
+## Core Rule
 
-The fake digital twin publishes these measured red cup positions:
+The experiment is fake, but the I/O must match the real ROS pipeline.
+
+Do not introduce alternate topic names, alternate message paths, or direct
+coordinate parameters for the ROS experiment. Fake data should be injected
+through the same topics the real nodes use.
+
+## Primary ROS Experiment Path
+
+Use this path as the main experiment.
+
+```text
+fake_aggregator_node
+  -> /cups_on_table
+  -> /stack
+  -> /user_command
+  <- /action_result
+
+fake_digital_twin_node
+  -> /digital_twin/boxes
+  -> /stack_track_ids
+  <- /action_result
+
+goal_state_publisher_node
+  <- /cups_on_table
+  <- /stack
+  <- /robot_state       (optional; default empty gripper if absent)
+  <- /user_command
+  <- /action_result
+  <- /llm_output
+  -> /llm_input
+
+llm_node
+  <- /llm_input
+  -> /llm_output
+
+plan_executor_node
+  <- /llm_output
+  <- /digital_twin/boxes
+  <- /stack_track_ids
+  -> POST /api/robot/skill/pyramid {"x": ..., "y": ..., "slot": ...}
+  -> /action_result
+```
+
+## Node Responsibilities
+
+### fake_aggregator_node.py
+
+Fake replacement for perception/world aggregation.
+
+Publishes:
+
+```text
+/cups_on_table
+/stack
+/user_command
+```
+
+Subscribes:
+
+```text
+/action_result
+```
+
+Initial state:
+
+```json
+{
+  "cups_on_table": {"red": 3},
+  "stack": {
+    "L1_left": null,
+    "L1_mid": null,
+    "L1_right": null,
+    "L2_left": null,
+    "L2_right": null,
+    "L3_top": null
+  }
+}
+```
+
+After a successful `/action_result`, it updates fake perception state:
+
+```text
+cups_on_table[color] -= 1
+stack[target_slot] = color
+```
+
+### fake_digital_twin_node.py
+
+Fake replacement for the digital twin cup pose output.
+
+Publishes:
+
+```text
+/digital_twin/boxes
+/stack_track_ids
+```
+
+Subscribes:
+
+```text
+/action_result
+```
+
+Measured red cup poses:
 
 ```text
 L1_left  -> track id 1, x=0.280, y=-0.15
 L1_mid   -> track id 2, x=0.280, y=0.00
 L1_right -> track id 3, x=0.280, y=0.15
+```
+
+These poses must be emitted as `visualization_msgs/MarkerArray`, matching what
+`plan_executor_node.py` already consumes. Do not pass these coordinates through
+CLI JSON or custom topics in the ROS experiment.
+
+### goal_state_publisher_node.py
+
+Builds `/llm_input`.
+
+It exists because the LLM input is not just user text. It combines:
+
+```text
+user_command
+current_world_state
+previous_world_state
+robot_state
+current_plan
+current_goal
+last_action_result
+mode
+```
+
+LLM is called when GSP publishes `/llm_input`, which happens on:
+
+```text
+/user_command    -> cold_start
+/action_result   -> in_flight
+```
+
+By default, world-state updates alone do not call the LLM.
+
+### llm_node.py
+
+Consumes `/llm_input`, routes by `payload["mode"]`, calls Ollama, and publishes
+`/llm_output`.
+
+Prompts are local:
+
+```text
+prompts/cold_start_planner.md
+prompts/inflight_decider.md
+```
+
+### plan_executor_node.py
+
+Use the real-compatible executor contract.
+
+It must:
+
+```text
+read /llm_output
+read /digital_twin/boxes
+read /stack_track_ids
+select a cup by color
+map LLM target_slot to API slot
+POST /api/robot/skill/pyramid {"x", "y", "slot"}
+publish /action_result
+```
+
+It should not accept fake coordinates directly in the ROS experiment.
+
+## LLM Call Sequence
+
+```text
+1. fake_aggregator_node publishes /user_command.
+2. goal_state_publisher_node publishes cold_start /llm_input.
+3. llm_node publishes cold-start /llm_output with plan.
+4. plan_executor_node executes the first pyramid step.
+5. plan_executor_node publishes /action_result.
+6. fake_aggregator_node updates /cups_on_table and /stack.
+7. fake_digital_twin_node updates /stack_track_ids.
+8. goal_state_publisher_node publishes in_flight /llm_input.
+9. llm_node publishes continue/replan/done.
+10. plan_executor_node executes the next step on continue.
+```
+
+## Expected API Bodies
+
+With the measured fake digital twin poses, the executor should produce:
+
+```json
+{"x": 0.280, "y": -0.15, "slot": "1l"}
+{"x": 0.280, "y": 0.0, "slot": "1m"}
+{"x": 0.280, "y": 0.15, "slot": "1r"}
 ```
 
 ## Run
@@ -58,27 +245,36 @@ To call the real pyramid API:
 ./start.sh --real-api
 ```
 
-## Run Individual Nodes
+Useful environment variables:
 
-In separate terminals:
-
-```bash
-python3 scripts/goal_state_publisher_node.py
-python3 scripts/llm_node.py --ros-args -p model:=qwen3.6:35b -p ollama_url:=http://localhost:11434/api/chat
-python3 scripts/fake_aggregator_node.py
-python3 scripts/fake_digital_twin_node.py
-python3 scripts/plan_executor_node.py --ros-args -p dry_run:=false
+```text
+API_URL     default http://localhost:8000/api/robot/skill/pyramid
+MODEL       default qwen3.6:35b
+OLLAMA_URL  default http://localhost:11434/api/chat
 ```
 
-## Parameters
+## HTTP Client Path
 
-- `api_url_pyramid`: default `http://localhost:8000/api/robot/skill/pyramid`
-- `dry_run`: default `true`
-- `initial_command_delay_s`: fake aggregator waits before publishing
-  `/user_command` once, default `2.0`
+`http_client/` is a separate non-ROS helper path. It does not preserve the ROS
+topic I/O contract because it accepts `--fake-xy` directly and calls the server
+sequentially from one Python process.
+
+Use `http_client/` only for quick HTTP sequencing checks. Do not treat it as the
+primary experiment path described above.
+
+## Do Not Do
+
+- Do not add `/raw_action_result` for this experiment.
+- Do not pass fake XY to `plan_executor_node.py` through parameters.
+- Do not bypass `goal_state_publisher_node.py` in the ROS experiment.
+- Do not rename the real topics.
+- Do not make `llm_node.py` choose the mode itself; mode is supplied in
+  `/llm_input` by GSP.
 
 ## Test
 
 ```bash
-python3 -m unittest discover -s tests
+python3 -m unittest discover -s tests -v
+python3 -m py_compile scripts/*.py http_client/*.py
+bash -n start.sh
 ```
