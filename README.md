@@ -150,12 +150,12 @@ Subscribes:
 Measured blue cup poses:
 
 ```text
-L1_left  -> track id 1, x=0.20, y=0.195
-L1_mid   -> track id 2, x=0.20, y=0.350
-L1_right -> track id 3, x=0.20, y=-0.160
-L2_left  -> track id 4, x=0.35, y=0.195
-L2_right -> track id 5, x=0.35, y=0.350
-L3_top   -> track id 6, x=0.35, y=-0.160
+L1_left  -> track id 1, x=0.20, y=-0.20
+L1_mid   -> track id 2, x=0.20, y=0.00
+L1_right -> track id 3, x=0.20, y=0.20
+L2_left  -> track id 4, x=0.32, y=-0.20
+L2_right -> track id 5, x=0.32, y=0.00
+L3_top   -> track id 6, x=0.32, y=0.20
 ```
 
 These poses must be emitted as `visualization_msgs/MarkerArray`, matching what
@@ -238,12 +238,12 @@ It should not accept fake coordinates directly in the ROS experiment.
 With the measured fake digital twin poses, the executor should produce:
 
 ```json
-{"x": 0.20, "y": 0.195, "slot": "1l"}
-{"x": 0.20, "y": 0.350, "slot": "1m"}
-{"x": 0.20, "y": -0.160, "slot": "1r"}
-{"x": 0.35, "y": 0.195, "slot": "2l"}
-{"x": 0.35, "y": 0.350, "slot": "2r"}
-{"x": 0.35, "y": -0.160, "slot": "3m"}
+{"x": 0.20, "y": -0.20, "slot": "1l"}
+{"x": 0.20, "y": 0.00, "slot": "1m"}
+{"x": 0.20, "y": 0.20, "slot": "1r"}
+{"x": 0.32, "y": -0.20, "slot": "2l"}
+{"x": 0.32, "y": 0.00, "slot": "2r"}
+{"x": 0.32, "y": 0.20, "slot": "3m"}
 ```
 
 ## HTTP API / Server Role
@@ -259,7 +259,7 @@ POST /api/robot/skill/pyramid
 Request body:
 
 ```json
-{"x": 0.20, "y": 0.195, "slot": "1l"}
+{"x": 0.20, "y": -0.20, "slot": "1l"}
 ```
 
 Meaning:
