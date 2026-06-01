@@ -230,6 +230,76 @@ With the measured fake digital twin poses, the executor should produce:
 {"x": 0.280, "y": 0.15, "slot": "1r"}
 ```
 
+## HTTP API / Server Role
+
+The FastAPI server endpoint is an execution layer, not a planner or verifier.
+
+Endpoint:
+
+```text
+POST /api/robot/skill/pyramid
+```
+
+Request body:
+
+```json
+{"x": 0.280, "y": -0.15, "slot": "1l"}
+```
+
+Meaning:
+
+```text
+Pick the cup at measured table position (x, y).
+Place it into the pyramid slot identified by the API slot key.
+```
+
+The server is expected to:
+
+```text
+1. trust the provided x,y as the pick target;
+2. translate API slot keys such as 1l, 1m, 1r into internal place poses using
+   its own pyramid geometry config;
+3. call the lower-level robot/skill implementation;
+4. return success or failure after the motion attempt.
+```
+
+The server is not expected to:
+
+```text
+validate whether the LLM plan is correct;
+decide which cup color should be used;
+interpret LLM slot names such as L1_left;
+inspect /cups_on_table or /stack;
+run perception;
+decide whether the task is done.
+```
+
+Responsibility split:
+
+```text
+LLM / GSP:
+  decide and track what should happen next.
+
+fake_aggregator_node:
+  provide fake world state through the same topics as perception/aggregation.
+
+fake_digital_twin_node:
+  provide fake measured cup poses through /digital_twin/boxes.
+
+plan_executor_node:
+  select a cup pose from /digital_twin/boxes,
+  convert LLM target_slot to API slot,
+  call the HTTP API.
+
+HTTP API / server:
+  execute the requested pick-and-place motion.
+```
+
+Therefore, if `fake_digital_twin_node` publishes a hardcoded measured coordinate,
+the server will treat that coordinate as the real cup location and attempt to
+pick there. This is intentional for this experiment: it isolates the
+LLM/GSP/executor/API request path from perception accuracy.
+
 ## Run
 
 Dry-run mode logs executor request bodies and publishes success without calling
