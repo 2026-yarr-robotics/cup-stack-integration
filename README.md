@@ -11,7 +11,7 @@ this plan before modifying implementation.
 Run one fixed scenario:
 
 ```text
-3단 피라미드에서 1단만 쌓아줘
+3단 피라미드 쌓아줘
 ```
 
 Expected cold-start normalization:
@@ -19,17 +19,27 @@ Expected cold-start normalization:
 ```json
 {
   "base_levels": 3,
-  "cup_budget": 3,
-  "target_slots": ["L1_left", "L1_mid", "L1_right"]
+  "cup_budget": 6,
+  "target_slots": [
+    "L1_left",
+    "L1_mid",
+    "L1_right",
+    "L2_left",
+    "L2_right",
+    "L3_top"
+  ]
 }
 ```
 
-The robot should execute three pyramid API calls for the bottom row only:
+The robot should execute six pyramid API calls for the full 3-level pyramid:
 
 ```text
 L1_left  -> API slot 1l
 L1_mid   -> API slot 1m
 L1_right -> API slot 1r
+L2_left  -> API slot 2l
+L2_right -> API slot 2r
+L3_top   -> API slot 3m
 ```
 
 ## Core Rule
@@ -101,7 +111,7 @@ Initial state:
 
 ```json
 {
-  "cups_on_table": {"red": 3},
+  "cups_on_table": {"blue": 6},
   "stack": {
     "L1_left": null,
     "L1_mid": null,
@@ -137,12 +147,15 @@ Subscribes:
 /action_result
 ```
 
-Measured red cup poses:
+Measured blue cup poses:
 
 ```text
-L1_left  -> track id 1, x=0.280, y=-0.15
-L1_mid   -> track id 2, x=0.280, y=0.00
-L1_right -> track id 3, x=0.280, y=0.15
+L1_left  -> track id 1, x=0.20, y=0.195
+L1_mid   -> track id 2, x=0.20, y=0.350
+L1_right -> track id 3, x=0.20, y=-0.160
+L2_left  -> track id 4, x=0.35, y=0.195
+L2_right -> track id 5, x=0.35, y=0.350
+L3_top   -> track id 6, x=0.35, y=-0.160
 ```
 
 These poses must be emitted as `visualization_msgs/MarkerArray`, matching what
@@ -225,9 +238,12 @@ It should not accept fake coordinates directly in the ROS experiment.
 With the measured fake digital twin poses, the executor should produce:
 
 ```json
-{"x": 0.280, "y": -0.15, "slot": "1l"}
-{"x": 0.280, "y": 0.0, "slot": "1m"}
-{"x": 0.280, "y": 0.15, "slot": "1r"}
+{"x": 0.20, "y": 0.195, "slot": "1l"}
+{"x": 0.20, "y": 0.350, "slot": "1m"}
+{"x": 0.20, "y": -0.160, "slot": "1r"}
+{"x": 0.35, "y": 0.195, "slot": "2l"}
+{"x": 0.35, "y": 0.350, "slot": "2r"}
+{"x": 0.35, "y": -0.160, "slot": "3m"}
 ```
 
 ## HTTP API / Server Role
@@ -243,7 +259,7 @@ POST /api/robot/skill/pyramid
 Request body:
 
 ```json
-{"x": 0.280, "y": -0.15, "slot": "1l"}
+{"x": 0.20, "y": 0.195, "slot": "1l"}
 ```
 
 Meaning:

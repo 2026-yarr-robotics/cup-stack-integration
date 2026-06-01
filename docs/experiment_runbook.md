@@ -20,7 +20,7 @@ Do not use a separate non-ROS orchestration client for this experiment.
 Fixed user command:
 
 ```text
-3단 피라미드에서 1단만 쌓아줘
+3단 피라미드 쌓아줘
 ```
 
 Expected cold-start target:
@@ -28,17 +28,27 @@ Expected cold-start target:
 ```json
 {
   "base_levels": 3,
-  "cup_budget": 3,
-  "target_slots": ["L1_left", "L1_mid", "L1_right"]
+  "cup_budget": 6,
+  "target_slots": [
+    "L1_left",
+    "L1_mid",
+    "L1_right",
+    "L2_left",
+    "L2_right",
+    "L3_top"
+  ]
 }
 ```
 
 Expected robot skill API bodies:
 
 ```json
-{"x": 0.280, "y": -0.15, "slot": "1l"}
-{"x": 0.280, "y": 0.0, "slot": "1m"}
-{"x": 0.280, "y": 0.15, "slot": "1r"}
+{"x": 0.20, "y": 0.195, "slot": "1l"}
+{"x": 0.20, "y": 0.350, "slot": "1m"}
+{"x": 0.20, "y": -0.160, "slot": "1r"}
+{"x": 0.35, "y": 0.195, "slot": "2l"}
+{"x": 0.35, "y": 0.350, "slot": "2r"}
+{"x": 0.35, "y": -0.160, "slot": "3m"}
 ```
 
 ## 0. Sync Repo
@@ -158,11 +168,11 @@ Dry-run success criteria:
 
 ```text
 /llm_input cold_start is published once after /user_command.
-/llm_output contains a 3-step bottom-row plan.
-plan_executor_node logs three dry-run POST bodies.
+/llm_output contains a 6-step 3-level plan.
+plan_executor_node logs six dry-run POST bodies.
 /action_result reports success for each executed pyramid step.
-/stack fills L1_left, L1_mid, L1_right over time.
-/cups_on_table red count decreases from 3 to 0.
+/stack fills L1_left, L1_mid, L1_right, L2_left, L2_right, L3_top over time.
+/cups_on_table blue count decreases from 6 to 0.
 /stack_track_ids accumulates used track ids.
 ```
 
@@ -204,9 +214,12 @@ API_TIMEOUT_S=240.0 ./start.sh --real-api
 Expected physical sequence:
 
 ```text
-1. Pick measured cup at x=0.280, y=-0.15 and place slot 1l.
-2. Pick measured cup at x=0.280, y=0.00 and place slot 1m.
-3. Pick measured cup at x=0.280, y=0.15 and place slot 1r.
+1. Pick measured cup at x=0.20, y=0.195 and place slot 1l.
+2. Pick measured cup at x=0.20, y=0.350 and place slot 1m.
+3. Pick measured cup at x=0.20, y=-0.160 and place slot 1r.
+4. Pick measured cup at x=0.35, y=0.195 and place slot 2l.
+5. Pick measured cup at x=0.35, y=0.350 and place slot 2r.
+6. Pick measured cup at x=0.35, y=-0.160 and place slot 3m.
 ```
 
 ## Failure Triage
@@ -240,7 +253,7 @@ ros2 topic echo /stack_track_ids
 Likely causes:
 
 ```text
-fake_digital_twin_node marker labels not parsed as red upright cups.
+fake_digital_twin_node marker labels not parsed as blue upright cups.
 stack_track_ids excluded the wrong cup.
 target_slot to API slot mapping issue.
 ```

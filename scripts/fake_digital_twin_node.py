@@ -7,10 +7,13 @@ for the fixed experiment while keeping plan_executor_node unchanged:
   publish /stack_track_ids       std_msgs/Int32MultiArray
   subscribe /action_result       std_msgs/String JSON
 
-Measured red cup pick positions for the experiment:
-  L1_left  -> track id 1, x=0.280, y=-0.15
-  L1_mid   -> track id 2, x=0.280, y=0.00
-  L1_right -> track id 3, x=0.280, y=0.15
+Measured blue cup pick positions for the experiment:
+  L1_left  -> track id 1, x=0.20, y=0.195
+  L1_mid   -> track id 2, x=0.20, y=0.350
+  L1_right -> track id 3, x=0.20, y=-0.160
+  L2_left  -> track id 4, x=0.35, y=0.195
+  L2_right -> track id 5, x=0.35, y=0.350
+  L3_top   -> track id 6, x=0.35, y=-0.160
 """
 from __future__ import annotations
 
@@ -23,9 +26,12 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 
 MEASURED_CUPS: dict[str, tuple[int, float, float]] = {
-    'L1_left': (1, 0.280, -0.15),
-    'L1_mid': (2, 0.280, 0.00),
-    'L1_right': (3, 0.280, 0.15),
+    'L1_left': (1, 0.20, 0.195),
+    'L1_mid': (2, 0.20, 0.350),
+    'L1_right': (3, 0.20, -0.160),
+    'L2_left': (4, 0.35, 0.195),
+    'L2_right': (5, 0.35, 0.350),
+    'L3_top': (6, 0.35, -0.160),
 }
 
 
@@ -60,7 +66,7 @@ class FakeDigitalTwinNode(Node):
             self._publish,
         )
         self.get_logger().info(
-            'fake_digital_twin_node: publishing measured red cup poses')
+            'fake_digital_twin_node: publishing measured blue cup poses')
 
     def _on_action_result(self, msg: String) -> None:
         try:
@@ -102,7 +108,7 @@ class FakeDigitalTwinNode(Node):
         marker.ns = 'box_labels'
         marker.id = track_id
         marker.action = Marker.ADD
-        marker.text = f'#{track_id}_slot={slot}_c=red_upright-cup'
+        marker.text = f'#{track_id}_slot={slot}_c=blue_upright-cup'
         return marker
 
 

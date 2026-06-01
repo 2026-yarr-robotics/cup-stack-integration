@@ -40,12 +40,12 @@ class FakeAggregatorNode(Node):
         self.declare_parameter('action_result_topic', '/action_result')
         self.declare_parameter(
             'user_command',
-            '3단 피라미드에서 1단만 쌓아줘',
+            '3단 피라미드 쌓아줘',
         )
         self.declare_parameter('publish_period_s', 0.5)
         self.declare_parameter('initial_command_delay_s', 2.0)
 
-        self._cups_on_table: dict[str, int] = {'red': 3}
+        self._cups_on_table: dict[str, int] = {'blue': 6}
         self._stack: dict[str, str | None] = {slot: None for slot in STACK_SLOTS}
         self._command_published = False
         self._started_at = time.monotonic()
