@@ -3,6 +3,7 @@ set -euo pipefail
 
 DRY_RUN=true
 API_URL="${API_URL:-https://yarr-api-31.simplyimg.com/api/robot/skill/pyramid}"
+API_TIMEOUT_S="${API_TIMEOUT_S:-180}"
 MODEL="${MODEL:-qwen3.6:35b}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
@@ -44,6 +45,7 @@ launch llm_node python3 scripts/llm_node.py \
 launch plan_executor python3 scripts/plan_executor_node.py \
   --ros-args \
   -p api_url_pyramid:="${API_URL}" \
+  -p api_timeout_s:="${API_TIMEOUT_S}" \
   -p dry_run:="${DRY_RUN}"
 
 wait
