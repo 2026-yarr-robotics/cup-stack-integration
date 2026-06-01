@@ -106,7 +106,43 @@ llm_node
 
 ## 3. Inspect Topics
 
-Use separate terminals if detailed inspection is needed:
+`start.sh` writes node logs and topic snapshots under a timestamped directory:
+
+```text
+logs/YYYYmmdd_HHMMSS/
+```
+
+The run prints the exact directory at startup:
+
+```text
+[start.sh] logs: logs/YYYYmmdd_HHMMSS
+```
+
+Useful files:
+
+```text
+topics.jsonl                 all observed topic messages
+llm_input.jsonl              /llm_input only
+llm_output.jsonl             /llm_output only
+action_result.jsonl          /action_result only
+cups_on_table.jsonl          /cups_on_table only
+stack.jsonl                  /stack only
+stack_track_ids.jsonl        /stack_track_ids only
+digital_twin__boxes.jsonl    /digital_twin/boxes only
+plan_executor.log            plan_executor_node stdout/stderr
+llm_node.log                 llm_node stdout/stderr
+goal_state_publisher.log     goal_state_publisher_node stdout/stderr
+```
+
+Examples:
+
+```bash
+tail -f logs/YYYYmmdd_HHMMSS/plan_executor.log
+tail -f logs/YYYYmmdd_HHMMSS/action_result.jsonl
+tail -f logs/YYYYmmdd_HHMMSS/topics.jsonl
+```
+
+Use separate terminals only if live detailed inspection is still needed:
 
 ```bash
 ros2 topic echo /llm_input

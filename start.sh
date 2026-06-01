@@ -5,6 +5,8 @@ DRY_RUN=true
 API_URL="${API_URL:-https://yarr-api-31.simplyimg.com/api/robot/skill/pyramid}"
 MODEL="${MODEL:-qwen3.6:35b}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+LOG_DIR="${LOG_DIR:-logs/${RUN_ID}}"
 
 if [[ "${1:-}" == "--real-api" ]]; then
   DRY_RUN=false
@@ -19,16 +21,29 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 scripts/fake_aggregator_node.py &
-python3 scripts/fake_digital_twin_node.py &
-python3 scripts/goal_state_publisher_node.py &
-python3 scripts/llm_node.py \
+mkdir -p "${LOG_DIR}"
+export PYTHONUNBUFFERED=1
+echo "[start.sh] logs: ${LOG_DIR}"
+
+launch() {
+  local name="$1"
+  shift
+  "$@" > >(tee -a "${LOG_DIR}/${name}.log") 2>&1 &
+}
+
+launch fake_aggregator python3 scripts/fake_aggregator_node.py
+launch fake_digital_twin python3 scripts/fake_digital_twin_node.py
+launch goal_state_publisher python3 scripts/goal_state_publisher_node.py
+launch topic_logger python3 scripts/topic_logger_node.py \
+  --ros-args \
+  -p log_dir:="${LOG_DIR}"
+launch llm_node python3 scripts/llm_node.py \
   --ros-args \
   -p model:="${MODEL}" \
-  -p ollama_url:="${OLLAMA_URL}" &
-python3 scripts/plan_executor_node.py \
+  -p ollama_url:="${OLLAMA_URL}"
+launch plan_executor python3 scripts/plan_executor_node.py \
   --ros-args \
   -p api_url_pyramid:="${API_URL}" \
-  -p dry_run:="${DRY_RUN}" &
+  -p dry_run:="${DRY_RUN}"
 
 wait
