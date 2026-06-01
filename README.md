@@ -162,6 +162,18 @@ These poses must be emitted as `visualization_msgs/MarkerArray`, matching what
 `plan_executor_node.py` already consumes. Do not pass these coordinates through
 CLI JSON or custom topics in the ROS experiment.
 
+Disturbance mode is enabled by default for the current experiment:
+
+```text
+Trigger: after L2_right succeeds
+Removed slot: L2_left
+Returned cup: track id 4 at x=0.250, y=-0.20
+```
+
+This simulates a person removing the 4th stacked cup while the 5th step is
+being completed. The fake digital twin removes track id 4 from
+`/stack_track_ids` so the executor can pick it again.
+
 ### goal_state_publisher_node.py
 
 Builds `/llm_input`.

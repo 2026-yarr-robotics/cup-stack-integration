@@ -222,6 +222,25 @@ Expected physical sequence:
 6. Pick measured cup at x=0.350, y=0.20 and place slot 3m.
 ```
 
+Current disturbance scenario is enabled by default:
+
+```text
+After step 5 succeeds:
+  fake_aggregator_node publishes L2_left=null and blue table count +1.
+  fake_digital_twin_node removes track id 4 from /stack_track_ids.
+  track id 4 reappears at x=0.250, y=-0.20.
+
+Expected LLM response:
+  in_flight -> replan
+  new plan fills L2_left first, then L3_top.
+```
+
+Disable the disturbance only when running a clean no-disturbance baseline:
+
+```bash
+DISTURBANCE_ENABLED=false ./start.sh --real-api
+```
+
 ## Failure Triage
 
 ### LLM output is wrong

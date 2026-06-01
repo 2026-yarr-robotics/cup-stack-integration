@@ -95,6 +95,31 @@ class GoalStateBuilderTest(unittest.TestCase):
         self.assertFalse(action_result_reflected(result, before, stale))
         self.assertTrue(action_result_reflected(result, before, reflected))
 
+    def test_action_result_allows_same_count_when_disturbed(self):
+        result = {
+            'step': 5,
+            'action': 'pyramid',
+            'result': 'success',
+            'color': 'blue',
+            'target_slot': 'L2_right',
+        }
+        before = {
+            'cups_on_table': {'blue': 2},
+            'stack': {
+                'L2_left': {'color': 'blue'},
+                'L2_right': None,
+            },
+        }
+        disturbed = {
+            'cups_on_table': {'blue': 2},
+            'stack': {
+                'L2_left': None,
+                'L2_right': {'color': 'blue'},
+            },
+        }
+
+        self.assertTrue(action_result_reflected(result, before, disturbed))
+
     def test_previous_world_state_is_last_published_snapshot(self):
         builder = GoalStateBuilder()
         builder.set_world({'blue': 6}, {'L1_left': None})

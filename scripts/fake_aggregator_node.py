@@ -9,6 +9,11 @@ This is fake data with the same topic shape the GSP already consumes:
 
 It updates the fake world state after successful pyramid action results so the
 next LLM input sees the same state transition perception would have reported.
+
+Disturbance experiment:
+  after L2_right succeeds, simulate removing the already-stacked L2_left cup.
+  The removed cup returns to the table, so /stack L2_left becomes null and
+  /cups_on_table blue is incremented once.
 """
 from __future__ import annotations
 
@@ -44,10 +49,14 @@ class FakeAggregatorNode(Node):
         )
         self.declare_parameter('publish_period_s', 0.5)
         self.declare_parameter('initial_command_delay_s', 2.0)
+        self.declare_parameter('disturbance_enabled', True)
+        self.declare_parameter('disturbance_trigger_slot', 'L2_right')
+        self.declare_parameter('disturbance_removed_slot', 'L2_left')
 
         self._cups_on_table: dict[str, int] = {'blue': 6}
         self._stack: dict[str, str | None] = {slot: None for slot in STACK_SLOTS}
         self._command_published = False
+        self._disturbance_applied = False
         self._started_at = time.monotonic()
 
         self._cups_pub = self.create_publisher(
@@ -98,7 +107,32 @@ class FakeAggregatorNode(Node):
             int(self._cups_on_table.get(color, 0)) - 1,
             0,
         )
+        self._maybe_apply_disturbance(target_slot)
         self._publish()
+
+    def _maybe_apply_disturbance(self, completed_slot: str) -> None:
+        if self._disturbance_applied:
+            return
+        if not bool(self.get_parameter('disturbance_enabled').value):
+            return
+        trigger_slot = str(
+            self.get_parameter('disturbance_trigger_slot').value)
+        if completed_slot != trigger_slot:
+            return
+        removed_slot = str(
+            self.get_parameter('disturbance_removed_slot').value)
+        removed_color = self._stack.get(removed_slot)
+        if removed_color is None:
+            self.get_logger().warn(
+                f'disturbance skipped: {removed_slot} is already empty')
+            return
+        self._stack[removed_slot] = None
+        self._cups_on_table[removed_color] = (
+            int(self._cups_on_table.get(removed_color, 0)) + 1)
+        self._disturbance_applied = True
+        self.get_logger().info(
+            f'disturbance applied: removed {removed_color} from '
+            f'{removed_slot} after {completed_slot}')
 
     def _publish(self) -> None:
         self._cups_pub.publish(

@@ -14,6 +14,10 @@ Measured blue cup pick positions for the experiment:
   L2_left  -> track id 4, x=0.350, y=-0.20
   L2_right -> track id 5, x=0.350, y=0.00
   L3_top   -> track id 6, x=0.350, y=0.20
+
+Disturbance experiment:
+  after L2_right succeeds, track id 4 (L2_left) is removed from the stack and
+  reappears at the L1_left table position x=0.250, y=-0.20.
 """
 from __future__ import annotations
 
@@ -34,6 +38,10 @@ MEASURED_CUPS: dict[str, tuple[int, float, float]] = {
     'L3_top': (6, 0.350, 0.20),
 }
 
+DISTURBANCE_RETURN_POSES: dict[str, tuple[float, float]] = {
+    'L2_left': (0.250, -0.20),
+}
+
 
 class FakeDigitalTwinNode(Node):
     def __init__(self) -> None:
@@ -43,8 +51,15 @@ class FakeDigitalTwinNode(Node):
         self.declare_parameter('stack_track_ids_topic', '/stack_track_ids')
         self.declare_parameter('action_result_topic', '/action_result')
         self.declare_parameter('publish_period_s', 0.5)
+        self.declare_parameter('disturbance_enabled', True)
+        self.declare_parameter('disturbance_trigger_slot', 'L2_right')
+        self.declare_parameter('disturbance_removed_slot', 'L2_left')
 
         self._stacked_ids: set[int] = set()
+        self._cup_positions: dict[str, tuple[float, float]] = {
+            slot: (x, y) for slot, (_, x, y) in MEASURED_CUPS.items()
+        }
+        self._disturbance_applied = False
         self._boxes_pub = self.create_publisher(
             MarkerArray,
             str(self.get_parameter('boxes_topic').value),
@@ -82,11 +97,39 @@ class FakeDigitalTwinNode(Node):
             return
         track_id, _, _ = measured
         self._stacked_ids.add(track_id)
+        self._maybe_apply_disturbance(target_slot)
         self._publish()
+
+    def _maybe_apply_disturbance(self, completed_slot: str) -> None:
+        if self._disturbance_applied:
+            return
+        if not bool(self.get_parameter('disturbance_enabled').value):
+            return
+        trigger_slot = str(
+            self.get_parameter('disturbance_trigger_slot').value)
+        if completed_slot != trigger_slot:
+            return
+        removed_slot = str(
+            self.get_parameter('disturbance_removed_slot').value)
+        measured = MEASURED_CUPS.get(removed_slot)
+        return_pose = DISTURBANCE_RETURN_POSES.get(removed_slot)
+        if measured is None or return_pose is None:
+            self.get_logger().warn(
+                f'disturbance skipped: no measured return pose for '
+                f'{removed_slot}')
+            return
+        track_id, _, _ = measured
+        self._stacked_ids.discard(track_id)
+        self._cup_positions[removed_slot] = return_pose
+        self._disturbance_applied = True
+        self.get_logger().info(
+            f'disturbance applied: track id {track_id} returned to '
+            f'({return_pose[0]:.3f},{return_pose[1]:.3f})')
 
     def _publish(self) -> None:
         markers = MarkerArray()
-        for slot, (track_id, x, y) in MEASURED_CUPS.items():
+        for slot, (track_id, _, _) in MEASURED_CUPS.items():
+            x, y = self._cup_positions[slot]
             markers.markers.append(self._box_top_marker(track_id, x, y))
             markers.markers.append(self._label_marker(track_id, slot))
         self._boxes_pub.publish(markers)

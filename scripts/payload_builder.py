@@ -129,9 +129,11 @@ def action_result_reflected(
 ) -> bool:
     """Whether world state reflects a successful atomic pyramid action.
 
-    For this experiment a successful pyramid action must fill the target slot
-    and decrement the table count for that color by one. This lets GSP publish
-    only after the fake aggregator's real topics have caught up.
+    For this experiment a successful pyramid action must fill the target slot.
+    In the normal flow the table count for that color decreases by one. In the
+    disturbance scenario another stacked cup may be removed at the same time,
+    making the table count stay unchanged. Publish once the target slot is
+    reflected and the table count has not increased beyond the previous count.
     """
     if not result:
         return False
@@ -145,6 +147,8 @@ def action_result_reflected(
         return False
     if not before or not current:
         return False
+    if stack_slot_color(before, target_slot) == color:
+        return False
     if stack_slot_color(current, target_slot) != color:
         return False
     before_cups = before.get('cups_on_table') or {}
@@ -154,7 +158,7 @@ def action_result_reflected(
         current_count = int(current_cups.get(color, 0))
     except (TypeError, ValueError):
         return False
-    return current_count == max(before_count - 1, 0)
+    return current_count <= before_count
 
 
 class GoalStateBuilder:

@@ -6,6 +6,9 @@ API_URL="${API_URL:-https://yarr-api-31.simplyimg.com/api/robot/skill/pyramid}"
 API_TIMEOUT_S="${API_TIMEOUT_S:-180.0}"
 MODEL="${MODEL:-qwen3.6:35b}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
+DISTURBANCE_ENABLED="${DISTURBANCE_ENABLED:-true}"
+DISTURBANCE_TRIGGER_SLOT="${DISTURBANCE_TRIGGER_SLOT:-L2_right}"
+DISTURBANCE_REMOVED_SLOT="${DISTURBANCE_REMOVED_SLOT:-L2_left}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_ID}}"
 
@@ -32,8 +35,16 @@ launch() {
   "$@" > >(tee -a "${LOG_DIR}/${name}.log") 2>&1 &
 }
 
-launch fake_aggregator python3 scripts/fake_aggregator_node.py
-launch fake_digital_twin python3 scripts/fake_digital_twin_node.py
+launch fake_aggregator python3 scripts/fake_aggregator_node.py \
+  --ros-args \
+  -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
+  -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
+  -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
+launch fake_digital_twin python3 scripts/fake_digital_twin_node.py \
+  --ros-args \
+  -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
+  -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
+  -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
 launch goal_state_publisher python3 scripts/goal_state_publisher_node.py
 launch topic_logger python3 scripts/topic_logger_node.py \
   --ros-args \
