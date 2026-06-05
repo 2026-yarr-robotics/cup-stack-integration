@@ -1,42 +1,48 @@
-"""plan_executor_node — bridge LLM pyramid plans to the cup-stack skill server.
+"""plan_executor_node — bridge LLM pyramid plans to a coarse robot move.
 
 Canonical source (lives in LLM-prompting; copied into the integration package
-`system_state_aggregator`). Closes the planner→skill loop:
+`system_state_aggregator`). Drives the planner→robot loop, but only the COARSE
+half of it:
 
-    llm_node --/llm_output--> plan_executor_node --POST /api/robot/skill/pyramid--> robot skill API
+    llm_node --/llm_output--> plan_executor_node --POST /api/robot/move--> robot
                                     │
-                                    +--/action_result--> goal_state_publisher
+                                    +--/move_result--> pick_node
 
-Skill contract (per docs/pipeline_runtime.md §3/§8)
----------------------------------------------------
-The `2026-yarr-robotics/server` FastAPI service owns ALL pyramid geometry. One
-atomic skill call moves one cup:
+Two-stage pick (per the v1.1 design)
+------------------------------------
+The old flow had this node call /api/robot/skill/pyramid directly with an
+exo-view XY. That XY (external camera) was too imprecise to pick on. v1.1 splits
+the pick into coarse → fine:
 
-    POST /api/robot/skill/pyramid  {"x": <pick cup X>, "y": <pick cup Y>, "slot": "1l"}
+  * plan_executor (this node): resolve color → exo-view cup XY and MOVE the arm
+    roughly above it via POST /api/robot/move {x, y, z}. z is a fixed approach
+    height so the hand-eye camera can then see the cup.
+  * pick_node (other team): once the move returns 200, it reads its hand-eye view,
+    computes the precise XY of the nearest cup, and calls /api/robot/skill/pyramid
+    itself. pick_node also owns the /action_result completion signal back to GSP,
+    because the cup is only actually placed at its pyramid call — not at our move.
 
-The server resolves pick_z and the absolute place pose from its own
-/api/robot/config/pyramid (center, degree, pick_z, slot offsets) and proxies to
-the low-level skill_api_node (:8765 /skill/pyramid_step). So this node carries
-NO geometry: it only resolves a color to a concrete cup's (x, y) and maps the
-slot name. (This is why the old per-cup geometry math — cp/degree polling,
-place_x/y/z, cup dimensions, /config sync — is gone.)
+So this node carries NO pick/place geometry and never touches the skill server.
+Its ONLY output is /move_result: on a successful move it carries the target color
+and the API slot key pick_node needs for its pyramid call; on failure it carries
+result="fail" with a reason and no slot. It never publishes /action_result — that
+GSP completion signal is pick_node's job, because the cup is only actually placed
+at pick_node's pyramid call, not at our move.
 
-LLM plan steps are the combined `pyramid` action:
+LLM plan steps are still the combined `pyramid` action:
     {"step": 1, "action": "pyramid", "color": "red", "target_slot": "L1_left"}
 
-The server exposes neither cup color nor stack occupancy, so this node still
-needs ROS perception:
+Color→cup resolution still needs ROS perception (the server exposes neither):
   * /digital_twin/boxes (MarkerArray) → per-cup pose + color/class labels
   * /stack_track_ids (Int32MultiArray) → track ids already stacked (excluded)
 
 dry_run:=true logs each POST body and synthesises success without hitting the
-server — safe before the skill stack is up.
+server — safe before the robot stack is up.
 """
 from __future__ import annotations
 
 import json
 import threading
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -55,6 +61,8 @@ except ImportError:  # pragma: no cover - exercised only outside a ROS env
 
 # ── Slot translation: LLM canonical convention → server API slot key ──────
 # Keep in sync with docs/pipeline_runtime.md §3 and the prompts in prompts/.
+# pick_node calls /api/robot/skill/pyramid (body field `slot`) with this key, so
+# we hand it the already-mapped value in /move_result.
 _LLM_TO_API_SLOT: dict[str, str] = {
     'L1_left': '1l', 'L1_mid': '1m', 'L1_right': '1r',
     'L2_left': '2l', 'L2_right': '2r',
@@ -85,6 +93,15 @@ class _HTTPResult:
     ok: bool
     detail: str = ''
     data: Any = None
+
+
+@dataclass
+class _MoveOutcome:
+    """Result of resolving a step and moving the arm above the target cup."""
+    result: str                  # 'success' | 'fail'
+    reason: str | None = None
+    color: str | None = None
+    api_slot: str | None = None  # mapped key (1l) pick_node passes to pyramid
 
 
 # ── Pure helpers (no ROS) — unit-tested in test_plan_executor.py ──────────
@@ -124,8 +141,9 @@ def select_cup(
 ) -> tuple[int, tuple[float, float]] | None:
     """First upright, non-stacked, located cup of `color` → (track id, (x, y)).
 
-    The robot only needs the pick cup's XY; the server derives pick_z. Same-color
-    cups are interchangeable, so first match (track-id dict order) is fine.
+    The arm only needs the coarse pick cup's XY to move above it; z is a fixed
+    approach height and the hand-eye stage refines XY. Same-color cups are
+    interchangeable, so first match (track-id dict order) is fine.
     """
     wanted = color.lower()
     for tid, cup in cups.items():
@@ -143,9 +161,9 @@ def select_cup(
     return None
 
 
-def build_pyramid_body(x: float, y: float, api_slot: str) -> dict:
-    """The full POST body for /api/robot/skill/pyramid — server owns geometry."""
-    return {'x': float(x), 'y': float(y), 'slot': api_slot}
+def build_move_body(x: float, y: float, z: float, mode: str = 'absolute') -> dict:
+    """The POST body for /api/robot/move — x, y, z are all required."""
+    return {'x': float(x), 'y': float(y), 'z': float(z), 'mode': mode}
 
 
 class PlanExecutorNode(Node):
@@ -153,35 +171,26 @@ class PlanExecutorNode(Node):
         super().__init__('plan_executor_node')
 
         self.declare_parameter('llm_output_topic', '/llm_output')
-        self.declare_parameter('action_result_topic', '/action_result')
+        self.declare_parameter('move_result_topic', '/move_result')
         self.declare_parameter('boxes_topic', '/digital_twin/boxes')
         self.declare_parameter('stack_track_ids_topic', '/stack_track_ids')
-        # New server (2026-yarr-robotics/server) owns pyramid geometry; one call
-        # = one cup. {x, y, slot} only.
+        # Coarse move endpoint (robot base_link). pick_node owns the subsequent
+        # fine pick + /api/robot/skill/pyramid call.
         self.declare_parameter(
-            'api_url_pyramid',
-            'https://yarr-api-31.simplyimg.com/api/robot/skill/pyramid')
+            'api_url_move',
+            'https://yarr-api-31.simplyimg.com/api/robot/move')
         self.declare_parameter('api_timeout_s', 15.0)
-        self.declare_parameter('skill_status_url', 'http://localhost:8765/status')
-        self.declare_parameter('skill_idle_timeout_s', 10.0)
-        self.declare_parameter('skill_idle_poll_s', 0.2)
-        self.declare_parameter('skill_status_timeout_s', 1.0)
+        # Fixed approach height so hand-eye can see the cup after the move.
+        self.declare_parameter('move_z', 0.45)
         self.declare_parameter('dry_run', True)
 
         llm_out = str(self.get_parameter('llm_output_topic').value)
-        action_topic = str(self.get_parameter('action_result_topic').value)
+        move_topic = str(self.get_parameter('move_result_topic').value)
         boxes_topic = str(self.get_parameter('boxes_topic').value)
         stacked_topic = str(self.get_parameter('stack_track_ids_topic').value)
-        self._api_url = str(self.get_parameter('api_url_pyramid').value)
+        self._api_url = str(self.get_parameter('api_url_move').value)
         self._timeout = float(self.get_parameter('api_timeout_s').value)
-        self._skill_status_url = str(
-            self.get_parameter('skill_status_url').value)
-        self._idle_timeout_s = float(
-            self.get_parameter('skill_idle_timeout_s').value)
-        self._idle_poll_s = float(
-            self.get_parameter('skill_idle_poll_s').value)
-        self._status_timeout_s = float(
-            self.get_parameter('skill_status_timeout_s').value)
+        self._move_z = float(self.get_parameter('move_z').value)
         self._dry_run = bool(self.get_parameter('dry_run').value)
 
         self._state_lock = threading.Lock()
@@ -190,9 +199,8 @@ class PlanExecutorNode(Node):
         self._plan: list[dict] = []
         self._step_idx: int = 0
         self._busy: bool = False
-        self._sent_real_skill_request: bool = False
 
-        self._action_pub = self.create_publisher(String, action_topic, 10)
+        self._move_pub = self.create_publisher(String, move_topic, 10)
         self.create_subscription(String, llm_out, self._on_llm_output, 10)
         self.create_subscription(
             MarkerArray, boxes_topic, self._on_boxes, 10)
@@ -201,9 +209,8 @@ class PlanExecutorNode(Node):
 
         self.get_logger().info(
             f'plan_executor_node: api={self._api_url} '
-            f'timeout={self._timeout}s dry_run={self._dry_run} '
-            f'skill_status={self._skill_status_url} '
-            f'idle_timeout={self._idle_timeout_s}s')
+            f'timeout={self._timeout}s move_z={self._move_z} '
+            f'dry_run={self._dry_run} move_result={move_topic}')
 
     # ── Perception tracking ────────────────────────────────────────────────
 
@@ -293,95 +300,62 @@ class PlanExecutorNode(Node):
         action = step.get('action')
         try:
             if action == 'pyramid':
-                result, reason = self._do_pyramid(
+                outcome = self._do_move(
                     step.get('color'), step.get('target_slot'))
             else:
-                result, reason = 'fail', f'unknown action {action!r}'
+                outcome = _MoveOutcome('fail', f'unknown action {action!r}')
         except Exception as exc:  # noqa: BLE001
-            result, reason = 'fail', f'executor exception: {exc}'
+            outcome = _MoveOutcome('fail', f'executor exception: {exc}')
 
-        self._publish_action_result(step, result, reason)
+        # Single output channel: /move_result carries success (with slot, handed
+        # off to pick_node) or failure. We never talk to GSP — pick_node owns the
+        # /action_result completion signal. Advance only on a successful move so
+        # the next LLM `continue` (which only arrives after pick_node finishes
+        # this cup) fires the next move.
+        self._publish_move_result(step, outcome)
         with self._state_lock:
-            if result == 'success':
+            if outcome.result == 'success':
                 self._step_idx += 1
             self._busy = False
 
-    # ── pyramid: resolve color→cup, map slot, one POST ───────────────────────
+    # ── pyramid step: resolve color→cup, move arm above it ───────────────────
 
-    def _do_pyramid(
+    def _do_move(
         self, color: str | None, llm_slot: str | None,
-    ) -> tuple[str, str | None]:
+    ) -> _MoveOutcome:
         if not color:
-            return 'fail', 'pyramid step missing color'
+            return _MoveOutcome('fail', 'pyramid step missing color')
         api_slot = llm_to_api_slot(llm_slot)
         if api_slot is None:
-            return 'fail', f'unknown slot {llm_slot!r}'
+            return _MoveOutcome('fail', f'unknown slot {llm_slot!r}')
         with self._state_lock:
             chosen = select_cup(self._cups, set(self._stacked_ids), color)
             tracked, stacked = len(self._cups), len(self._stacked_ids)
         if chosen is None:
-            return 'fail', (
+            return _MoveOutcome('fail', (
                 f'no upright {color} cup available '
-                f'(tracked={tracked}, stacked={stacked})')
+                f'(tracked={tracked}, stacked={stacked})'))
         tid, (x, y) = chosen
-        body = build_pyramid_body(x, y, api_slot)
+        z = self._move_z
+        body = build_move_body(x, y, z)
         self.get_logger().info(
-            f'pyramid: #{tid} {color} at ({x:.3f},{y:.3f}) → {llm_slot}')
-        return self._post(body, source_tid=tid, llm_slot=llm_slot)
+            f'move: #{tid} {color} at ({x:.3f},{y:.3f},{z:.3f}) '
+            f'→ {llm_slot} (api={api_slot})')
+        result, reason = self._post_move(body, source_tid=tid, llm_slot=llm_slot)
+        return _MoveOutcome(result, reason, color=color, api_slot=api_slot)
 
-    def _post(self, body: dict, *, source_tid: int,
-              llm_slot: str) -> tuple[str, str | None]:
+    def _post_move(self, body: dict, *, source_tid: int,
+                   llm_slot: str | None) -> tuple[str, str | None]:
         if not self._api_url:
-            return 'fail', 'api_url_pyramid is empty'
-        log = f'#{source_tid} → {llm_slot} (api={body["slot"]})'
+            return 'fail', 'api_url_move is empty'
+        log = f'#{source_tid} → {llm_slot}'
         if self._dry_run:
             self.get_logger().info(
                 f'[dry-run] POST {self._api_url} {body}  ({log})')
             return 'success', None
-        if self._sent_real_skill_request:
-            idle, reason = self._wait_for_skill_idle()
-            if not idle:
-                return 'fail', reason
         self.get_logger().info(f'POST {self._api_url} {body}  ({log})')
         result = self._http_post_json(self._api_url, body)
-        self._sent_real_skill_request = True
         return ('success', None) if result.ok else ('fail', result.detail)
-
-    def _wait_for_skill_idle(self) -> tuple[bool, str | None]:
-        """Wait until skill_api_node's final lift clears its busy flag.
-
-        The server now returns /skill/pyramid_step as soon as the cup is
-        released at the place pose. That is intentionally early so GSP/LLM can
-        infer during the final lift, but the next physical skill must not be
-        submitted until skill_api_node reports busy=false.
-        """
-        if not self._skill_status_url:
-            return True, None
-        deadline = time.monotonic() + self._idle_timeout_s
-        logged_wait = False
-        while True:
-            status = self._http_get_json(
-                self._skill_status_url,
-                timeout=self._status_timeout_s,
-            )
-            if not status.ok:
-                return False, f'skill status unavailable: {status.detail}'
-            data = status.data if isinstance(status.data, dict) else {}
-            ready = bool(data.get('ready', True))
-            busy = bool(data.get('busy', False))
-            if ready and not busy:
-                if logged_wait:
-                    self.get_logger().info('skill_api_node idle; next POST allowed')
-                return True, None
-            if not logged_wait:
-                self.get_logger().info(
-                    'skill_api_node busy; waiting for final lift before next POST')
-                logged_wait = True
-            if time.monotonic() >= deadline:
-                return False, (
-                    f'skill_api_node busy after {self._idle_timeout_s:.1f}s '
-                    f'at {self._skill_status_url}')
-            time.sleep(self._idle_poll_s)
 
     def _http_post_json(self, url: str, payload: dict) -> _HTTPResult:
         try:
@@ -415,46 +389,33 @@ class PlanExecutorNode(Node):
                 data=parsed)
         return _HTTPResult(ok=True, data=parsed)
 
-    def _http_get_json(self, url: str, *, timeout: float) -> _HTTPResult:
-        try:
-            req = urllib.request.Request(
-                url, method='GET',
-                headers={'Accept': 'application/json',
-                         'User-Agent': 'curl/7.81.0'})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = resp.read().decode('utf-8', 'replace')
-        except urllib.error.HTTPError as e:
-            return _HTTPResult(
-                ok=False,
-                detail=f'HTTP {e.code}: '
-                       f'{e.read().decode("utf-8", "replace")[:200]}')
-        except urllib.error.URLError as e:
-            return _HTTPResult(ok=False, detail=f'network: {e.reason}')
-        except Exception as e:  # noqa: BLE001
-            return _HTTPResult(ok=False, detail=f'transport: {e}')
-        try:
-            return _HTTPResult(ok=True, data=json.loads(body))
-        except ValueError:
-            return _HTTPResult(
-                ok=False, detail=f'non-JSON response: {body[:200]}')
+    # ── publish ───────────────────────────────────────────────────────────────
 
-    # ── /action_result publish ───────────────────────────────────────────────
+    def _publish_move_result(self, step: dict, outcome: _MoveOutcome) -> None:
+        """Emit the move outcome on /move_result — this node's only output.
 
-    def _publish_action_result(
-        self, step: dict, result: str, failure_reason: str | None,
-    ) -> None:
+        On success the arm is above the target cup and `slot` carries the API key
+        pick_node passes to its pyramid call. On failure `slot` is omitted and
+        `failure_reason` explains why. ROS publish is fire-and-forget, so an
+        exception is the only failure we can observe — we log it (there is no
+        other channel to fall back to by design).
+        """
         out: dict = {
             'step': step.get('step'),
             'action': step.get('action'),
-            'result': result,
-            'failure_reason': failure_reason,
+            'color': step.get('color'),
+            'result': outcome.result,
         }
-        if 'color' in step:
-            out['color'] = step['color']
-        if 'target_slot' in step:
-            out['target_slot'] = step['target_slot']
-        self._action_pub.publish(String(data=json.dumps(out)))
-        self.get_logger().info(f'/action_result {result}: {out}')
+        if outcome.result == 'success':
+            out['slot'] = outcome.api_slot
+        else:
+            out['failure_reason'] = outcome.reason
+        try:
+            self._move_pub.publish(String(data=json.dumps(out)))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f'/move_result publish failed: {exc}')
+            return
+        self.get_logger().info(f'/move_result {outcome.result}: {out}')
 
 
 def main(args: list[str] | None = None) -> None:
