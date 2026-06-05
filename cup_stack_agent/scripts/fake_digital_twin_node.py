@@ -1,4 +1,4 @@
-"""fake_digital_twin_node — publish measured cup poses on real executor topics.
+"""fake_digital_twin_node — publish the EXO-view cup poses plan_executor reads.
 
 This is fake data with real topic/message shape. It replaces the digital twin
 for the fixed experiment while keeping plan_executor_node unchanged:
@@ -7,7 +7,17 @@ for the fixed experiment while keeping plan_executor_node unchanged:
   publish /stack_track_ids       std_msgs/Int32MultiArray
   subscribe /action_result       std_msgs/String JSON
 
-Measured blue cup pick positions for the experiment:
+v1.1 coarse→fine pick: plan_executor uses the imprecise EXO view to move the arm
+roughly above a cup; pick_node then refines with its hand-eye view. So the poses
+published here are the GROUND TRUTH (see MEASURED_CUPS) plus a small, fixed,
+per-cup error (`exo_xy_error_m`, default 0.02 m). The matching ground-truth poses
+that pick_node consumes are published by fake_pick_view_node on /hand_eye/boxes.
+
+The error stays well under half the 0.10 m cup spacing so each perturbed pose is
+still nearest to its own true cup — pick_node picks the nearest cup, so a larger
+error would make it grab the wrong one.
+
+Measured (ground-truth) blue cup pick positions for the experiment:
   L1_left  -> track id 1, x=0.250, y=-0.20
   L1_mid   -> track id 2, x=0.250, y=0.00
   L1_right -> track id 3, x=0.250, y=0.20
@@ -22,6 +32,7 @@ Disturbance experiment:
 from __future__ import annotations
 
 import json
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -43,6 +54,17 @@ DISTURBANCE_RETURN_POSES: dict[str, tuple[float, float]] = {
 }
 
 
+def exo_offset(track_id: int, error_m: float) -> tuple[float, float]:
+    """Fixed, deterministic per-cup XY error for the EXO view.
+
+    Magnitude is exactly `error_m`; the direction is spread around a circle by
+    track id so cups err in different directions but identically every tick (no
+    randomness, so the experiment replays the same way each run).
+    """
+    angle = track_id * (2.0 * math.pi / len(MEASURED_CUPS))
+    return error_m * math.cos(angle), error_m * math.sin(angle)
+
+
 class FakeDigitalTwinNode(Node):
     def __init__(self) -> None:
         super().__init__('fake_digital_twin_node')
@@ -51,11 +73,16 @@ class FakeDigitalTwinNode(Node):
         self.declare_parameter('stack_track_ids_topic', '/stack_track_ids')
         self.declare_parameter('action_result_topic', '/action_result')
         self.declare_parameter('publish_period_s', 0.5)
+        # Per-cup XY error baked into the EXO view plan_executor reads. Kept well
+        # under half the 0.10 m cup spacing so each perturbed pose stays nearest
+        # to its own true cup (pick_node grabs the nearest one).
+        self.declare_parameter('exo_xy_error_m', 0.02)
         self.declare_parameter('disturbance_enabled', True)
         self.declare_parameter('disturbance_trigger_slot', 'L2_right')
         self.declare_parameter('disturbance_removed_slot', 'L2_left')
 
         self._stacked_ids: set[int] = set()
+        self._exo_error = float(self.get_parameter('exo_xy_error_m').value)
         self._cup_positions: dict[str, tuple[float, float]] = {
             slot: (x, y) for slot, (_, x, y) in MEASURED_CUPS.items()
         }
@@ -130,7 +157,9 @@ class FakeDigitalTwinNode(Node):
         markers = MarkerArray()
         for slot, (track_id, _, _) in MEASURED_CUPS.items():
             x, y = self._cup_positions[slot]
-            markers.markers.append(self._box_top_marker(track_id, x, y))
+            dx, dy = exo_offset(track_id, self._exo_error)
+            markers.markers.append(
+                self._box_top_marker(track_id, x + dx, y + dy))
             markers.markers.append(self._label_marker(track_id, slot))
         self._boxes_pub.publish(markers)
         self._stack_ids_pub.publish(

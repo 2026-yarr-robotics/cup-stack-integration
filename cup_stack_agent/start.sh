@@ -5,6 +5,7 @@ DRY_RUN=true
 API_URL="${API_URL:-https://yarr-api-31.simplyimg.com/api/robot/move}"
 API_TIMEOUT_S="${API_TIMEOUT_S:-180.0}"
 MOVE_Z="${MOVE_Z:-0.45}"
+EXO_XY_ERROR_M="${EXO_XY_ERROR_M:-0.02}"
 MODEL="${MODEL:-qwen3.6:35b}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
 DISTURBANCE_ENABLED="${DISTURBANCE_ENABLED:-true}"
@@ -42,6 +43,12 @@ launch fake_aggregator python3 scripts/fake_aggregator_node.py \
   -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
   -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
 launch fake_digital_twin python3 scripts/fake_digital_twin_node.py \
+  --ros-args \
+  -p exo_xy_error_m:="${EXO_XY_ERROR_M}" \
+  -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
+  -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
+  -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
+launch fake_hand_eye python3 scripts/fake_hand_eye_node.py \
   --ros-args \
   -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
   -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
