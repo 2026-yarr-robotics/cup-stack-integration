@@ -18,6 +18,19 @@ if [[ "${1:-}" == "--real-api" ]]; then
   DRY_RUN=false
 fi
 
+# pick_node (sim=false) imports moveit_py. Auto-source the workspace that
+# provides it so a forgotten `source` doesn't make the loop stall after the
+# first move. Override the path with MOVEIT_SETUP, or set MOVEIT_SETUP="" to
+# skip (e.g. when it is already sourced). set -u is relaxed around the source
+# because ROS setup scripts reference unbound vars.
+MOVEIT_SETUP="${MOVEIT_SETUP:-/home/ssu/ros2_ws/install/setup.bash}"
+if [[ -n "${MOVEIT_SETUP}" && -f "${MOVEIT_SETUP}" ]]; then
+  set +u
+  source "${MOVEIT_SETUP}"
+  set -u
+  echo "[start.sh] sourced moveit workspace: ${MOVEIT_SETUP}"
+fi
+
 cleanup() {
   local pids
   pids="$(jobs -p)"
