@@ -68,4 +68,15 @@ launch plan_executor python3 scripts/plan_executor_node.py \
   -p move_z:="${MOVE_Z}" \
   -p dry_run:="${DRY_RUN}"
 
+# pick_node closes the loop (/move_result -> hand-eye fine pick ->
+# /api/robot/skill/pyramid -> /action_result). It has NO dry-run and always
+# POSTs the real pyramid API, so only launch it in --real-api mode; otherwise a
+# dry run would drive the real robot.
+if [[ "${DRY_RUN}" == "false" ]]; then
+  launch pick_node python3 scripts/pick_node.py
+else
+  echo "[start.sh] dry-run: pick_node NOT launched (no dry-run; would POST the" \
+       "real pyramid API). Loop stays open. Use --real-api to close it."
+fi
+
 wait
