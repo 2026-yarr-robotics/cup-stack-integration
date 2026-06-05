@@ -1,10 +1,31 @@
 # test_v1.0
 
-Temporary YARR integration experiment for validating the LLM closed loop with
-fake perception inputs but the same ROS topic contract as the real pipeline.
+YARR integration experiment for the LLM closed loop, driven by the **real vision
+pipeline** (depth_digital_twin + cup_stacking_verify) over the same ROS topic
+contract the agent already consumed.
 
-This README is written as the source of truth for future AI/code agents. Follow
-this plan before modifying implementation.
+This replaces the earlier GT-injection setup. One in-repo perception-glue node
+remains (the file is still named `fake_*` for history, but no longer injects
+ground truth):
+
+- `fake_aggregator_node.py` → **user_command_node**: publishes only `/user_command`
+  (the one world-state input perception cannot produce). `/cups_on_table` and
+  `/stack` now come from the real nodes.
+
+Cup-position stabilization no longer lives in this repo. It now runs in the
+vision workspace as `box_stabilizer_node` (ROS package `depth_digital_twin`,
+workspace `ros2-depth-point-cloude`), which subscribes the raw
+`/digital_twin/boxes` from `point_cloud_node` and republishes
+`/digital_twin/boxes_filtered`.
+
+Both **blue and red** cups are supported (the real HSV classifier and the
+executor's `parse_label` both handle every color). Track ids are dynamic
+(ByteTrack), not a fixed slot→id table; the executor selects a cup by color +
+upright + not-yet-stacked. The disturbance scenario is no longer scripted — a
+physically moved cup is reflected by perception on the next frame.
+
+This README is the source of truth for future AI/code agents. Follow this plan
+before modifying implementation.
 
 ## Experiment Goal
 
@@ -44,27 +65,44 @@ L3_top   -> API slot 3m
 
 ## Core Rule
 
-The experiment is fake, but the I/O must match the real ROS pipeline.
+The I/O must match the real ROS pipeline.
 
 Do not introduce alternate topic names, alternate message paths, or direct
-coordinate parameters for the ROS experiment. Fake data should be injected
-through the same topics the real nodes use.
+coordinate parameters. The agent consumes exactly the topics the real perception
+nodes publish.
+
+## Real Vision Pipeline (separate workspace)
+
+The perception nodes run in their own sourced workspace and must be publishing
+before the agent is useful:
+
+```text
+point_cloud_node            (depth_digital_twin)
+  -> /digital_twin/boxes       (raw per-frame cup markers)
+  -> /cups_on_table            (real {blue, red, ...} counts, minus stacked)
+
+box_stabilizer_node         (depth_digital_twin)
+  <- /digital_twin/boxes       (raw, from point_cloud_node)
+  -> /digital_twin/boxes_filtered  (per-track median over a sliding window)
+
+verifier_node               (cup_stacking_verify)
+  -> /stack                    (JSON {slot: color|null})
+  -> /stack_track_ids          (track ids occupying the pyramid)
+```
 
 ## Primary ROS Experiment Path
 
 Use this path as the main experiment.
 
 ```text
-fake_aggregator_node
-  -> /cups_on_table
-  -> /stack
-  -> /user_command
-  <- /action_result
+point_cloud_node  -> /digital_twin/boxes  (raw)
 
-fake_digital_twin_node
-  -> /digital_twin/boxes
-  -> /stack_track_ids
-  <- /action_result
+box_stabilizer_node            (vision workspace, depth_digital_twin)
+  <- /digital_twin/boxes
+  -> /digital_twin/boxes_filtered  (per-track median x,y,z over a sliding window)
+
+user_command_node              (was fake_aggregator_node)
+  -> /user_command
 
 goal_state_publisher_node
   <- /cups_on_table
@@ -81,7 +119,7 @@ llm_node
 
 plan_executor_node
   <- /llm_output
-  <- /digital_twin/boxes
+  <- /digital_twin/boxes_filtered
   <- /stack_track_ids
   -> POST /api/robot/skill/pyramid {"x": ..., "y": ..., "slot": ...}
   -> /action_result
@@ -89,90 +127,45 @@ plan_executor_node
 
 ## Node Responsibilities
 
-### fake_aggregator_node.py
+### fake_aggregator_node.py  (user_command_node)
 
-Fake replacement for perception/world aggregation.
+Publishes the operator command — the only world-state input the real perception
+pipeline cannot produce.
 
 Publishes:
 
 ```text
-/cups_on_table
-/stack
 /user_command
 ```
 
-Subscribes:
+It publishes once, after `initial_command_delay_s` (default 2.0s), so
+`goal_state_publisher_node` is up and the real perception topics have settled
+first. `/cups_on_table` and `/stack` are NOT published here anymore — they come
+from `point_cloud_node` and `verifier_node`.
+
+Parameters:
 
 ```text
-/action_result
+user_command              default '3단 피라미드 쌓아줘'
+user_command_topic        default /user_command
+initial_command_delay_s   default 2.0
+publish_period_s          default 0.5
 ```
 
-Initial state:
+### Cup-position stabilization (moved to the vision repo)
 
-```json
-{
-  "cups_on_table": {"blue": 6},
-  "stack": {
-    "L1_left": null,
-    "L1_mid": null,
-    "L1_right": null,
-    "L2_left": null,
-    "L2_right": null,
-    "L3_top": null
-  }
-}
-```
+Stabilization is no longer an in-repo node. It now runs in the vision workspace
+as `box_stabilizer_node` (ROS package `depth_digital_twin`, workspace
+`ros2-depth-point-cloude`). It subscribes the raw `/digital_twin/boxes` from
+`point_cloud_node` and publishes `/digital_twin/boxes_filtered`: a per-track
+median over a sliding time window (default 1.0s), with x, y, and z stabilized,
+the color/class label passed through unchanged, in the `world` frame. The
+executor here consumes `/digital_twin/boxes_filtered`. Its math is unit-tested
+in the vision repo (`depth_digital_twin/test/test_box_stabilizer.py`).
 
-After a successful `/action_result`, it updates fake perception state:
-
-```text
-cups_on_table[color] -= 1
-stack[target_slot] = color
-```
-
-### fake_digital_twin_node.py
-
-Fake replacement for the digital twin cup pose output.
-
-Publishes:
-
-```text
-/digital_twin/boxes
-/stack_track_ids
-```
-
-Subscribes:
-
-```text
-/action_result
-```
-
-Measured blue cup poses:
-
-```text
-L1_left  -> track id 1, x=0.250, y=-0.20
-L1_mid   -> track id 2, x=0.250, y=0.00
-L1_right -> track id 3, x=0.250, y=0.20
-L2_left  -> track id 4, x=0.350, y=-0.20
-L2_right -> track id 5, x=0.350, y=0.00
-L3_top   -> track id 6, x=0.350, y=0.20
-```
-
-These poses must be emitted as `visualization_msgs/MarkerArray`, matching what
-`plan_executor_node.py` already consumes. Do not pass these coordinates through
-CLI JSON or custom topics in the ROS experiment.
-
-Disturbance mode is enabled by default for the current experiment:
-
-```text
-Trigger: after L2_right succeeds
-Removed slot: L2_left
-Returned cup: track id 4 at x=0.250, y=-0.20
-```
-
-This simulates a person removing the 4th stacked cup while the 5th step is
-being completed. The fake digital twin removes track id 4 from
-`/stack_track_ids` so the executor can pick it again.
+There is no scripted disturbance: a physically moved or removed cup is reflected
+by perception on the next frame (its track leaves/returns naturally, and
+`verifier_node` updates `/stack_track_ids`).
 
 ### goal_state_publisher_node.py
 
@@ -220,7 +213,7 @@ It must:
 
 ```text
 read /llm_output
-read /digital_twin/boxes
+read /digital_twin/boxes_filtered
 read /stack_track_ids
 select a cup by color
 map LLM target_slot to API slot
@@ -240,13 +233,13 @@ the first skill request.
 ## LLM Call Sequence
 
 ```text
-1. fake_aggregator_node publishes /user_command.
+1. user_command_node publishes /user_command.
 2. goal_state_publisher_node publishes cold_start /llm_input.
 3. llm_node publishes cold-start /llm_output with plan.
 4. plan_executor_node executes the first pyramid step.
 5. plan_executor_node publishes /action_result at cup release/place time.
-6. fake_aggregator_node updates /cups_on_table and /stack.
-7. fake_digital_twin_node updates /stack_track_ids.
+6. point_cloud_node /cups_on_table drops the picked cup; verifier_node updates /stack.
+7. verifier_node updates /stack_track_ids as the cup enters its slot.
 8. goal_state_publisher_node publishes in_flight /llm_input.
 9. llm_node publishes continue/replan/done.
 10. plan_executor_node waits for skill_api_node busy=false.
@@ -255,7 +248,8 @@ the first skill request.
 
 ## Expected API Bodies
 
-With the measured fake digital twin poses, the executor should produce:
+With cups at their nominal experiment positions, the executor should produce
+roughly these bodies (real perception x,y will be close, not exact):
 
 ```json
 {"x": 0.250, "y": -0.20, "slot": "1l"}
@@ -317,14 +311,17 @@ Responsibility split:
 LLM / GSP:
   decide and track what should happen next.
 
-fake_aggregator_node:
-  provide fake world state through the same topics as perception/aggregation.
+user_command_node:
+  provide the operator command through /user_command.
 
-fake_digital_twin_node:
-  provide fake measured cup poses through /digital_twin/boxes.
+box_stabilizer_node (real vision, separate workspace):
+  smooth raw /digital_twin/boxes and publish /digital_twin/boxes_filtered.
+
+point_cloud_node / verifier_node (real vision, separate workspace):
+  provide world state through /cups_on_table, /stack, /stack_track_ids.
 
 plan_executor_node:
-  select a cup pose from /digital_twin/boxes,
+  select a cup pose from /digital_twin/boxes_filtered,
   convert LLM target_slot to API slot,
   call the HTTP API.
 
@@ -332,25 +329,38 @@ HTTP API / server:
   execute the requested pick-and-place motion.
 ```
 
-Therefore, if `fake_digital_twin_node` publishes a hardcoded measured coordinate,
-the server will treat that coordinate as the real cup location and attempt to
-pick there. This is intentional for this experiment: it isolates the
-LLM/GSP/executor/API request path from perception accuracy.
+The server trusts whatever x,y the executor sends and picks there. The pick
+accuracy therefore depends on perception + the stabilizer; the world frame must
+be calibrated (world_origin_node) so cup positions land in the robot base frame.
 
 ## Run
 
-Dry-run mode logs executor request bodies and publishes success without calling
-the API.
+First bring up the real vision pipeline in its own sourced workspace. Run
+`point_cloud_node` normally (it publishes `/digital_twin/boxes`) and run
+`box_stabilizer_node`, which produces `/digital_twin/boxes_filtered`:
 
 ```bash
-./start.sh
+ros2 run depth_digital_twin point_cloud_node
+ros2 run depth_digital_twin box_stabilizer_node
+# plus detection_node, world_origin_node, boxes_to_detections, verifier_node
+```
+
+Then start the agent. Dry-run mode logs executor request bodies without calling
+the robot API:
+
+```bash
+./start.sh                                  # or: ros2 launch launch/agent.launch.py
 ```
 
 To call the real pyramid API:
 
 ```bash
-./start.sh --real-api
+./start.sh --real-api                       # or: ros2 launch launch/agent.launch.py dry_run:=false
 ```
+
+`launch/agent.launch.py` accepts `with_llm:=false` (skip ollama, e.g. to smoke
+test the perception-glue path). The x,y stabilization is tuned in the vision
+workspace on `box_stabilizer_node`, not here.
 
 Useful environment variables:
 
@@ -380,7 +390,19 @@ OLLAMA_URL  default http://localhost:11434/api/chat
 ## Test
 
 ```bash
-python3 -m unittest discover -s tests -v
-python3 -m py_compile scripts/*.py
+python3 -m unittest discover -s tests -v    # offline + live DDS node tests
+python3 -m py_compile scripts/*.py launch/agent.launch.py
 bash -n start.sh
+```
+
+`tests/test_user_command.py` covers the in-repo perception glue without a
+camera/robot: a live rclpy test that spins `user_command_node` over DDS and
+asserts it publishes `/user_command`. It skips automatically if ROS middleware
+is unavailable. The stabilizer's own math is unit-tested in the vision repo
+(`depth_digital_twin/test/test_box_stabilizer.py`).
+
+Headless smoke test of the whole agent without ollama/camera:
+
+```bash
+ros2 launch launch/agent.launch.py with_llm:=false   # nodes come up; /user_command -> /llm_input
 ```

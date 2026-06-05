@@ -26,7 +26,8 @@ LLM plan steps are the combined `pyramid` action:
 
 The server exposes neither cup color nor stack occupancy, so this node still
 needs ROS perception:
-  * /digital_twin/boxes (MarkerArray) → per-cup pose + color/class labels
+  * /digital_twin/boxes_filtered (MarkerArray) → stabilized per-cup pose +
+    color/class labels (published by fake_digital_twin_node in this repo)
   * /stack_track_ids (Int32MultiArray) → track ids already stacked (excluded)
 
 dry_run:=true logs each POST body and synthesises success without hitting the
@@ -154,7 +155,7 @@ class PlanExecutorNode(Node):
 
         self.declare_parameter('llm_output_topic', '/llm_output')
         self.declare_parameter('action_result_topic', '/action_result')
-        self.declare_parameter('boxes_topic', '/digital_twin/boxes')
+        self.declare_parameter('boxes_topic', '/digital_twin/boxes_filtered')
         self.declare_parameter('stack_track_ids_topic', '/stack_track_ids')
         # New server (2026-yarr-robotics/server) owns pyramid geometry; one call
         # = one cup. {x, y, slot} only.

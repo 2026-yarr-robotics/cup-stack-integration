@@ -10,9 +10,11 @@ SKILL_IDLE_POLL_S="${SKILL_IDLE_POLL_S:-0.2}"
 SKILL_STATUS_TIMEOUT_S="${SKILL_STATUS_TIMEOUT_S:-1.0}"
 MODEL="${MODEL:-qwen3.6:35b}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
-DISTURBANCE_ENABLED="${DISTURBANCE_ENABLED:-true}"
-DISTURBANCE_TRIGGER_SLOT="${DISTURBANCE_TRIGGER_SLOT:-L2_right}"
-DISTURBANCE_REMOVED_SLOT="${DISTURBANCE_REMOVED_SLOT:-L2_left}"
+# Operator command + x,y stabilizer tuning.
+USER_COMMAND="${USER_COMMAND:-3단 피라미드 쌓아줘}"
+STABILIZE_METHOD="${STABILIZE_METHOD:-median}"
+STABILIZE_WINDOW_S="${STABILIZE_WINDOW_S:-1.0}"
+STABILIZE_TRACK_TIMEOUT_S="${STABILIZE_TRACK_TIMEOUT_S:-1.0}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_ID}}"
 
@@ -39,16 +41,24 @@ launch() {
   "$@" > >(tee -a "${LOG_DIR}/${name}.log") 2>&1 &
 }
 
-launch fake_aggregator python3 scripts/fake_aggregator_node.py \
+# NOTE: the real vision pipeline must be running in its own (sourced) workspace,
+# with these topic remaps so the aggregator can sit in front of goal_state_publisher:
+#   point_cloud_node  -r /cups_on_table:=/vision/cups_on_table   (+ /digital_twin/boxes)
+#   verifier_node     -r /stack:=/vision/stack                   (+ /stack_track_ids)
+# The two glue nodes below live in this repo.
+
+# aggregator: relay real vision world-state (/vision/cups_on_table, /vision/stack)
+# to /cups_on_table, /stack for goal_state_publisher, and publish /user_command.
+launch aggregator python3 scripts/fake_aggregator_node.py \
   --ros-args \
-  -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
-  -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
-  -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
-launch fake_digital_twin python3 scripts/fake_digital_twin_node.py \
+  -p user_command:="${USER_COMMAND}"
+# x,y stabilizer: median/mean-filters the raw /digital_twin/boxes and republishes
+# /digital_twin/boxes_filtered (what plan_executor consumes).
+launch digital_twin_stabilizer python3 scripts/fake_digital_twin_node.py \
   --ros-args \
-  -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
-  -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
-  -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
+  -p method:="${STABILIZE_METHOD}" \
+  -p window_s:="${STABILIZE_WINDOW_S}" \
+  -p track_timeout_s:="${STABILIZE_TRACK_TIMEOUT_S}"
 launch goal_state_publisher python3 scripts/goal_state_publisher_node.py
 launch topic_logger python3 scripts/topic_logger_node.py \
   --ros-args \

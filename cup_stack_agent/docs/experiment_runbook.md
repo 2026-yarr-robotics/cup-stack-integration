@@ -1,16 +1,24 @@
 # Experiment Runbook
 
-This runbook describes how to execute the `test_v1.0` fake-perception
-experiment.
+This runbook describes how to execute the `test_v1.0` experiment over the **real
+vision pipeline**.
 
-The goal is to validate the real ROS topic pipeline with fake perception inputs:
+Agent nodes (this repo):
 
 ```text
-fake_aggregator_node
-fake_digital_twin_node
+user_command_node            (file: fake_aggregator_node.py)
 goal_state_publisher_node
 llm_node
 plan_executor_node
+```
+
+Real vision nodes (separate sourced workspace) must also be running:
+
+```text
+point_cloud_node    -> /digital_twin/boxes, /cups_on_table
+box_stabilizer_node -> /digital_twin/boxes_filtered  (consumes /digital_twin/boxes)
+verifier_node       -> /stack, /stack_track_ids
+(+ detection_node, world_origin_node, boxes_to_detections_node)
 ```
 
 Do not use a separate non-ROS orchestration client for this experiment.
@@ -54,11 +62,31 @@ Expected robot skill API bodies:
 ## 0. Sync Repo
 
 ```bash
-cd /private/tmp/test_v1.0
+cd ~/Projects/cup-stack-integration/cup_stack_agent
 git pull
 ```
 
-## 1. Check LLM Backend
+## 1. Bring Up Real Vision
+
+In the vision workspace (sourced separately), start perception. Run
+`point_cloud_node` normally (it publishes `/digital_twin/boxes`) and run
+`box_stabilizer_node`, which produces `/digital_twin/boxes_filtered`:
+
+```bash
+ros2 run depth_digital_twin point_cloud_node
+ros2 run depth_digital_twin box_stabilizer_node
+# plus detection_node, world_origin_node, boxes_to_detections_node, verifier_node
+```
+
+Sanity check the topics carry real data before continuing:
+
+```bash
+ros2 topic echo --once /digital_twin/boxes_filtered  # stabilized markers present
+ros2 topic echo --once /cups_on_table                # {"blue": N, "red": M, ...}
+ros2 topic echo --once /stack                        # {slot: color|null}
+```
+
+## 1b. Check LLM Backend
 
 Ollama must be running and the target model must be available.
 
@@ -86,10 +114,11 @@ Dry-run mode should log request bodies instead of moving the robot.
 Expected high-level flow:
 
 ```text
-fake_aggregator_node
-  publishes /user_command, /cups_on_table, /stack
+user_command_node
+  publishes /user_command
 
 goal_state_publisher_node
+  reads real /cups_on_table, /stack
   publishes cold_start /llm_input
 
 llm_node
@@ -97,15 +126,13 @@ llm_node
   publishes /llm_output plan
 
 plan_executor_node
-  reads /digital_twin/boxes
+  reads /digital_twin/boxes_filtered (stabilized)
   logs dry-run POST body
   publishes /action_result success
 
-fake_aggregator_node
-  updates /cups_on_table and /stack
-
-fake_digital_twin_node
-  updates /stack_track_ids
+real vision
+  /cups_on_table drops the picked cup; verifier_node updates /stack and
+  /stack_track_ids as the cup enters its slot
 
 goal_state_publisher_node
   publishes in_flight /llm_input
@@ -138,7 +165,7 @@ action_result.jsonl          /action_result only
 cups_on_table.jsonl          /cups_on_table only
 stack.jsonl                  /stack only
 stack_track_ids.jsonl        /stack_track_ids only
-digital_twin__boxes.jsonl    /digital_twin/boxes only
+digital_twin__boxes_filtered.jsonl  /digital_twin/boxes_filtered only
 plan_executor.log            plan_executor_node stdout/stderr
 llm_node.log                 llm_node stdout/stderr
 goal_state_publisher.log     goal_state_publisher_node stdout/stderr
@@ -161,7 +188,8 @@ ros2 topic echo /action_result
 ros2 topic echo /cups_on_table
 ros2 topic echo /stack
 ros2 topic echo /stack_track_ids
-ros2 topic echo /digital_twin/boxes
+ros2 topic echo /digital_twin/boxes_filtered   # what the executor consumes
+ros2 topic echo /digital_twin/boxes            # raw, from point_cloud_node
 ```
 
 Dry-run success criteria:
@@ -172,8 +200,9 @@ Dry-run success criteria:
 plan_executor_node logs six dry-run POST bodies.
 /action_result reports success for each executed pyramid step.
 /stack fills L1_left, L1_mid, L1_right, L2_left, L2_right, L3_top over time.
-/cups_on_table blue count decreases from 6 to 0.
+/cups_on_table table count (blue/red) decreases as cups are stacked.
 /stack_track_ids accumulates used track ids.
+/digital_twin/boxes_filtered x,y are stable (stabilized), not jittering frame to frame.
 ```
 
 ## 4. Prepare Real Robot API
@@ -234,24 +263,22 @@ Expected physical sequence:
 6. Pick measured cup at x=0.350, y=0.20 and place slot 3m.
 ```
 
-Current disturbance scenario is enabled by default:
+Disturbance is now physical, not scripted. To exercise replanning, remove an
+already-stacked cup by hand during the run:
 
 ```text
-After step 5 succeeds:
-  fake_aggregator_node publishes L2_left=null and blue table count +1.
-  fake_digital_twin_node removes track id 4 from /stack_track_ids.
-  track id 4 reappears at x=0.250, y=-0.20.
+After a stacked cup is physically removed:
+  perception stops seeing it in its slot -> verifier_node drops it from
+    /stack and /stack_track_ids.
+  the cup reappears on the table -> point_cloud_node re-tracks it and
+    /cups_on_table increments its color.
 
 Expected LLM response:
   in_flight -> replan
-  new plan fills L2_left first, then L3_top.
+  new plan refills the emptied slot before continuing.
 ```
 
-Disable the disturbance only when running a clean no-disturbance baseline:
-
-```bash
-DISTURBANCE_ENABLED=false ./start.sh --real-api
-```
+For a clean baseline, simply do not disturb the stack.
 
 ## Failure Triage
 
@@ -269,7 +296,7 @@ Likely causes:
 ```text
 Prompt mismatch.
 Ollama model mismatch.
-Malformed world state from fake_aggregator_node.
+Malformed world state from point_cloud_node /cups_on_table or verifier /stack.
 ```
 
 ### POST body is wrong
@@ -284,7 +311,9 @@ ros2 topic echo /stack_track_ids
 Likely causes:
 
 ```text
-fake_digital_twin_node marker labels not parsed as blue upright cups.
+point_cloud_node marker labels not parsed as upright cups of the wanted color.
+world frame uncalibrated -> x,y off (check world_origin_node).
+stabilizer window too long -> lags a moved cup (lower window_s).
 stack_track_ids excluded the wrong cup.
 target_slot to API slot mapping issue.
 ```
@@ -301,7 +330,8 @@ ros2 topic echo /action_result
 Likely cause:
 
 ```text
-fake_digital_twin_node did not add the used track id after /action_result.
+verifier_node did not add the used track id to /stack_track_ids (cup not yet
+seen in its slot), so point_cloud_node still counts it as on-table.
 ```
 
 ### LLM reports replan after success
@@ -317,7 +347,8 @@ ros2 topic echo /action_result
 Likely cause:
 
 ```text
-fake_aggregator_node did not update world state after /action_result.
+verifier_node /stack or point_cloud_node /cups_on_table did not reflect the
+placed cup (perception did not see it land in its slot).
 ```
 
 ### Robot API fails
@@ -340,6 +371,6 @@ Before committing changes:
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile scripts/*.py
+python3 -m py_compile scripts/*.py launch/agent.launch.py
 bash -n start.sh
 ```

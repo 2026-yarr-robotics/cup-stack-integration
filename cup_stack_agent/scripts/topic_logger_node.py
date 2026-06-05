@@ -54,7 +54,7 @@ class TopicLoggerNode(Node):
         )
         self.create_subscription(
             MarkerArray,
-            '/digital_twin/boxes',
+            '/digital_twin/boxes_filtered',
             self._log_boxes,
             10,
         )
