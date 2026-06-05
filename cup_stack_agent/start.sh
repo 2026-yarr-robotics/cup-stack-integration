@@ -73,7 +73,18 @@ launch plan_executor python3 scripts/plan_executor_node.py \
 # POSTs the real pyramid API, so only launch it in --real-api mode; otherwise a
 # dry run would drive the real robot.
 if [[ "${DRY_RUN}" == "false" ]]; then
-  launch pick_node python3 scripts/pick_node.py
+  # pick_node (sim=false) imports moveit_py for hand-eye FK. If the workspace
+  # providing it isn't sourced, it dies at import and the loop silently stalls
+  # after the first move. Fail loud here instead.
+  if python3 -c "import moveit.planning" 2>/dev/null; then
+    launch pick_node python3 scripts/pick_node.py
+  else
+    echo "[start.sh] ERROR: pick_node needs moveit_py but 'import moveit.planning'" \
+         "failed. Source the workspace that provides it (e.g." \
+         "/home/ssu/ros2_ws/install/setup.bash) BEFORE ./start.sh, or run pick_node" \
+         "with sim:=true to bypass MoveItPy. pick_node NOT launched — loop will" \
+         "stall after the first move." >&2
+  fi
 else
   echo "[start.sh] dry-run: pick_node NOT launched (no dry-run; would POST the" \
        "real pyramid API). Loop stays open. Use --real-api to close it."
