@@ -1,0 +1,3 @@
+[submodule "cup-stack-server"]
+	path = cup-stack-server
+	url = https://github.com/2026-yarr-robotics/cup-stack-server.git
