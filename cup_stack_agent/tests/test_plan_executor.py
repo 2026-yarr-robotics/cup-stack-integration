@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
 from plan_executor_node import (  # noqa: E402
     TrackedCup,
-    build_pyramid_body,
+    build_move_body,
     llm_to_api_slot,
     parse_label,
     select_cup,
@@ -40,10 +40,10 @@ class PlanExecutorTest(unittest.TestCase):
         self.assertEqual(select_cup(cups, set(), 'red'), (1, (0.280, -0.15)))
         self.assertEqual(select_cup(cups, {1}, 'red'), (2, (0.280, 0.00)))
 
-    def test_body_is_xy_slot_only(self):
+    def test_move_body_is_xyz_mode(self):
         self.assertEqual(
-            build_pyramid_body(0.280, -0.15, '1l'),
-            {'x': 0.280, 'y': -0.15, 'slot': '1l'},
+            build_move_body(0.280, -0.15, 0.45),
+            {'x': 0.280, 'y': -0.15, 'z': 0.45, 'mode': 'absolute'},
         )
 
 
