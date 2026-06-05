@@ -23,9 +23,10 @@ the pick into coarse → fine:
     because the cup is only actually placed at its pyramid call — not at our move.
 
 So this node carries NO pick/place geometry and never touches the skill server.
-Its ONLY output is /move_result: on a successful move it carries the target color
-and the API slot key pick_node needs for its pyramid call; on failure it carries
-result="fail" with a reason and no slot. It never publishes /action_result — that
+Its ONLY output is /move_result: on a successful move it carries the target color,
+the API slot key, and the coarse move target XY (pick_node's search center — it
+picks the nearest hand-eye cup to it); on failure it carries result="fail" with a
+reason and no slot. It never publishes /action_result — that
 GSP completion signal is pick_node's job, because the cup is only actually placed
 at pick_node's pyramid call, not at our move.
 
@@ -102,6 +103,8 @@ class _MoveOutcome:
     reason: str | None = None
     color: str | None = None
     api_slot: str | None = None  # mapped key (1l) pick_node passes to pyramid
+    x: float | None = None       # coarse move target XY — pick_node's search center
+    y: float | None = None
 
 
 # ── Pure helpers (no ROS) — unit-tested in test_plan_executor.py ──────────
@@ -342,7 +345,8 @@ class PlanExecutorNode(Node):
             f'move: #{tid} {color} at ({x:.3f},{y:.3f},{z:.3f}) '
             f'→ {llm_slot} (api={api_slot})')
         result, reason = self._post_move(body, source_tid=tid, llm_slot=llm_slot)
-        return _MoveOutcome(result, reason, color=color, api_slot=api_slot)
+        return _MoveOutcome(
+            result, reason, color=color, api_slot=api_slot, x=x, y=y)
 
     def _post_move(self, body: dict, *, source_tid: int,
                    llm_slot: str | None) -> tuple[str, str | None]:
@@ -408,6 +412,8 @@ class PlanExecutorNode(Node):
         }
         if outcome.result == 'success':
             out['slot'] = outcome.api_slot
+            out['x'] = outcome.x   # coarse move target — pick_node's search center
+            out['y'] = outcome.y
         else:
             out['failure_reason'] = outcome.reason
         try:

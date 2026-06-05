@@ -11,14 +11,17 @@ Hand-eye 기반 정밀 pick 노드 (cup-stack-integration v1.1 계약).
 
 동작 요약:
   1. /move_result (std_msgs/String, JSON) 구독. 유효한 API slot 이 들어오면 = 앞단
-     plan_executor 의 coarse 이동이 끝났다는 신호.
-       성공 예: {"step":1,"action":"pyramid","color":"blue","result":"success","slot":"1l"}
+     plan_executor 의 coarse 이동이 끝났다는 신호. 본문의 x,y 가 그 coarse move
+     타깃(= EE 가 대강 올라간 위치)이라, 컵 선택 기준으로 쓴다.
+       성공 예: {"step":1,"action":"pyramid","color":"blue","result":"success",
+                 "slot":"1l","x":0.26,"y":-0.18}
        실패 예: {"step":1,"action":"pyramid","color":"blue","result":"fail",
                  "failure_reason":"..."}  (slot 없음 → 무시)
   2. /hand_eye/boxes (visualization_msgs/MarkerArray, **base_link frame**) 에서
-     컵 후보를 읽어, 현재 EE(그리퍼) 위치에 가장 가까운 컵의 (x,y) 를 고른다.
-     (좌표 변환은 hand-eye 비전 노드가 담당 — 마커는 이미 base_link 좌표.
-      EE 위치는 dsr_practice/stand_fallen_cup.py 의 get_ee_matrix(FK) 재사용.)
+     컵 후보를 읽어, move_result 의 (x,y) 에 가장 가까운 컵의 (x,y) 를 고른다.
+     (좌표 변환은 hand-eye 비전 노드가 담당 — 마커는 이미 base_link 좌표. 실제 EE
+      를 MoveItPy FK 로 읽지 않고 move_result 의 coarse 타깃을 기준으로 쓴다 —
+      로봇이 그 타깃으로 이동했으므로 EE ≈ move 타깃.)
   3. POST {api_base}{api_path} body {x, y, slot}. pick_z·center·yaw 는 서버가
      /api/robot/config/pyramid 에서 자동 주입하므로 본문에 안 넣는다.
   4. HTTP 200 & success=true → /action_result (std_msgs/String, JSON) 발행.
@@ -28,9 +31,8 @@ Hand-eye 기반 정밀 pick 노드 (cup-stack-integration v1.1 계약).
      실패도 result:"fail" 로 발행한다.
 
 전제:
-  - EE 자세: dsr_bringup2_moveit.launch.py 가 떠 있어야 MoveItPy FK 가능 (컵 선택용).
+  - 컵 선택 기준 좌표는 /move_result 의 x,y (MoveItPy/로봇 bringup 불필요).
   - /hand_eye/boxes 발행 주체: 실로봇은 hand-eye 비전 노드, sim 은 fake_hand_eye_node.
-    없으면 sim:=true 로 sim_pick_x/y 사용.
 """
 
 import json
@@ -49,10 +51,6 @@ from visualization_msgs.msg import Marker, MarkerArray
 # ─────────────────────────────────────────────────────────
 #  상수 (stand_fallen_cup.py 와 동일 환경 가정)
 # ─────────────────────────────────────────────────────────
-GROUP_NAME = "manipulator"
-BASE_FRAME = "base_link"
-EE_LINK = "link_6"
-
 VALID_SLOTS = ("1l", "1m", "1r", "2l", "2r", "3m")
 
 # API slot(1l) → LLM canonical slot(L1_left). /move_result 는 API slot 만 주는데,
@@ -75,14 +73,6 @@ _KNOWN_COLORS = frozenset({
 # ─────────────────────────────────────────────────────────
 #  유틸
 # ─────────────────────────────────────────────────────────
-def get_ee_matrix(moveit_robot):
-    """현재 link_6(EE) 의 base_link 기준 4x4 변환 (planning scene read-only)."""
-    psm = moveit_robot.get_planning_scene_monitor()
-    with psm.read_only() as scene:
-        T = scene.current_state.get_global_link_transform(EE_LINK)
-    return np.asarray(T, dtype=float)
-
-
 def parse_label_color(text):
     """box_labels 마커 텍스트에서 color 추출 (예: '#5_slot=L2_right_c=blue_upright-cup').
     못 찾으면 None."""
@@ -125,10 +115,6 @@ class PickNode(Node):
         self.declare_parameter("require_result_success", False)
         self.declare_parameter("success_result_values", "success,ok,200,true,done")
         self.declare_parameter("trigger_actions", "")  # 빈값=모든 action 허용
-        # sim / 테스트 (인식·MoveItPy 우회)
-        self.declare_parameter("sim", False)
-        self.declare_parameter("sim_pick_x", 0.40)
-        self.declare_parameter("sim_pick_y", 0.10)
 
         self.move_result_topic = str(self.get_parameter("move_result_topic").value)
         self.hand_eye_boxes_topic = str(
@@ -155,28 +141,12 @@ class PickNode(Node):
             for v in str(self.get_parameter("trigger_actions").value).split(",")
             if v.strip()
         ]
-        self.sim = bool(self.get_parameter("sim").value)
-        self.sim_pick_x = float(self.get_parameter("sim_pick_x").value)
-        self.sim_pick_y = float(self.get_parameter("sim_pick_y").value)
 
         log.info("=== pick_node 시작 ===")
-        log.info(f"  trigger : {self.move_result_topic} (slot 게이트)")
+        log.info(f"  trigger : {self.move_result_topic} (slot 게이트, move 타깃 x,y)")
         log.info(f"  pick src: {self.hand_eye_boxes_topic} (base_link MarkerArray)")
         log.info(f"  result  : {self.action_result_topic}")
         log.info(f"  API     : POST {self.api_url} (timeout {self.api_timeout_sec}s)")
-        if self.sim:
-            log.warn(
-                f"=== SIM MODE: 컵 선택/MoveItPy 우회. "
-                f"pick=({self.sim_pick_x:.3f},{self.sim_pick_y:.3f}) base_link ==="
-            )
-
-        # ── MoveItPy (sim 이 아닐 때만; FK 로 EE 위치 읽어 nearest-cup 선택) ──
-        self.robot = None
-        if not self.sim:
-            from moveit.planning import MoveItPy
-            log.info("MoveItPy 초기화 중…")
-            self.robot = MoveItPy(node_name="pick_node_moveit_py")
-            log.info("MoveItPy 초기화 완료")
 
         # ── HTTP 세션 ──────────────────────────────
         self.http = requests.Session()
@@ -256,12 +226,14 @@ class PickNode(Node):
         self._pending = {"slot": slot, "raw": data}
 
     # ── 컵 선택 (hand-eye 마커 → base_link x,y) ────
-    def _select_pick_xy(self, color):
-        """현재 EE 위치에 가장 가까운 hand-eye 컵의 (x,y) 반환. 실패 시 None.
+    def _select_pick_xy(self, color, ref_xy):
+        """ref_xy(=plan_executor 의 coarse move 타깃 x,y) 에 가장 가까운 hand-eye
+        컵의 (x,y) 반환. 실패 시 None.
 
-        plan_executor 가 coarse move 로 EE 를 타깃 컵 위에 대강 올려놓았으므로
-        EE 에 가장 가까운 컵 = 잡을 컵. (각 perturbed pose 가 자기 true 컵에 최근접
-        이라는 fake_digital_twin 전제와 동일.)"""
+        plan_executor 가 coarse move 로 EE 를 타깃 컵 위에 대강 올려놓았으므로, 그
+        move 타깃에 가장 가까운 hand-eye(참값) 컵 = 잡을 컵. MoveItPy 로 실제 EE 를
+        읽을 필요 없이 move_result 의 x,y 를 기준으로 쓴다. (각 perturbed pose 가
+        자기 true 컵에 최근접이라는 fake_digital_twin 전제와 동일.)"""
         log = self.get_logger()
         self._boxes.clear()
 
@@ -285,13 +257,11 @@ class PickNode(Node):
                 log.warn(
                     f"[select] color={cl!r} 매칭 컵 없음 → 전체 {len(cands)}개 중 선택")
 
-        ee = get_ee_matrix(self.robot)
-        ee_xy = ee[:2, 3]
         cid, best = min(
-            cands, key=lambda ib: float(np.linalg.norm(ib[1]["xy"] - ee_xy)))
+            cands, key=lambda ib: float(np.linalg.norm(ib[1]["xy"] - ref_xy)))
         x, y = float(best["xy"][0]), float(best["xy"][1])
         log.info(
-            f"[select] EE=({ee_xy[0]:.3f},{ee_xy[1]:.3f}) → "
+            f"[select] move target=({ref_xy[0]:.3f},{ref_xy[1]:.3f}) → "
             f"cup#{cid} pick=({x:.3f},{y:.3f}) (후보 {len(cands)}개)")
         return np.array([x, y])
 
@@ -361,16 +331,18 @@ class PickNode(Node):
         log.info(f"=== pick 시퀀스 시작 (slot={slot}, color={color!r}) ===")
         x = y = None
         try:
-            if self.sim:
-                x, y = self.sim_pick_x, self.sim_pick_y
-                log.info(f"[sim] 선택 스킵 → pick=({x:.3f},{y:.3f})")
-            else:
-                p = self._select_pick_xy(color)
-                if p is None:
-                    self._publish_result(
-                        req, None, None, False, None, None, "select_failed")
-                    return
-                x, y = float(p[0]), float(p[1])
+            raw = req["raw"]
+            if raw.get("x") is None or raw.get("y") is None:
+                self._publish_result(
+                    req, None, None, False, None, None, "move_result_missing_xy")
+                return
+            ref_xy = np.array([float(raw["x"]), float(raw["y"])], dtype=float)
+            p = self._select_pick_xy(color, ref_xy)
+            if p is None:
+                self._publish_result(
+                    req, None, None, False, None, None, "select_failed")
+                return
+            x, y = float(p[0]), float(p[1])
 
             ok, status, rj, err = self._call_pyramid(x, y, slot)
             self._publish_result(req, x, y, ok, status, rj, err)
@@ -384,9 +356,6 @@ class PickNode(Node):
     # ── 메인 루프 ────────────────────────────────
     def run(self):
         log = self.get_logger()
-        if not self.sim:
-            log.info("[Init] MoveItPy/controller 연결 대기 3s")
-            time.sleep(3.0)
         log.info(f"[Init] 대기 중 — {self.move_result_topic} 에 유효 slot 들어오면 동작")
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.05)
