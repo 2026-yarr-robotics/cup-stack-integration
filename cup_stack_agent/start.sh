@@ -8,7 +8,11 @@ MOVE_Z="${MOVE_Z:-0.45}"
 EXO_XY_ERROR_M="${EXO_XY_ERROR_M:-0.02}"
 MODEL="${MODEL:-qwen3.6:35b}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
-DISTURBANCE_ENABLED="${DISTURBANCE_ENABLED:-true}"
+# Disturbance off for now — the experiment just verifies the happy-path loop.
+# Robust disturbance recovery (continuous perception → GSP triggers LLM replan
+# on world change) is deferred; the scenario code stays in the fake nodes.
+# Re-enable for a run with: DISTURBANCE_ENABLED=true ./start.sh ...
+DISTURBANCE_ENABLED="${DISTURBANCE_ENABLED:-false}"
 DISTURBANCE_TRIGGER_SLOT="${DISTURBANCE_TRIGGER_SLOT:-L2_right}"
 DISTURBANCE_REMOVED_SLOT="${DISTURBANCE_REMOVED_SLOT:-L2_left}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
