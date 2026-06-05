@@ -73,7 +73,9 @@ launch plan_executor python3 scripts/plan_executor_node.py \
 # POSTs the real pyramid API, so only launch it in --real-api mode; otherwise a
 # dry run would drive the real robot.
 if [[ "${DRY_RUN}" == "false" ]]; then
-  launch pick_node python3 scripts/pick_node.py
+  launch pick_node python3 scripts/pick_node.py \
+    --ros-args \
+    -p api_timeout_sec:="${API_TIMEOUT_S}"
 else
   echo "[start.sh] dry-run: pick_node NOT launched (no dry-run; would POST the" \
        "real pyramid API). Loop stays open. Use --real-api to close it."

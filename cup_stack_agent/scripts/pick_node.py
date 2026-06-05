@@ -105,7 +105,11 @@ class PickNode(Node):
         # API
         self.declare_parameter("api_base", "https://yarr-api-31.simplyimg.com")
         self.declare_parameter("api_path", "/api/robot/skill/pyramid")
-        self.declare_parameter("api_timeout_sec", 10.0)
+        # The pyramid skill runs the real arm (move+pick+place) and the server
+        # only responds when it finishes, so this must exceed the skill duration.
+        # Too short → pick_node gives up while the skill keeps running, and the
+        # next call hits HTTP 409 "a skill is already running".
+        self.declare_parameter("api_timeout_sec", 180.0)
         # 컵 선택
         self.declare_parameter("box_wait_sec", 1.5)   # 마커 수집 대기(>= publish 주기)
         self.declare_parameter("box_top_ns", "box_top")
