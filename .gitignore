@@ -2,3 +2,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 logs/
+
+# colcon build artifacts (generated at the repo root; never tracked)
+/build/
+/install/
+/log/
