@@ -54,7 +54,7 @@ class TopicLoggerNode(Node):
         )
         self.create_subscription(
             MarkerArray,
-            '/digital_twin/boxes',
+            '/digital_twin/boxes_filtered',
             self._log_boxes,
             10,
         )
@@ -86,7 +86,7 @@ class TopicLoggerNode(Node):
                     'z': float(marker.pose.position.z),
                 },
             })
-        self._write('/digital_twin/boxes', markers)
+        self._write('/digital_twin/boxes_filtered', markers)
 
     def _write(self, topic: str, payload: Any) -> None:
         encoded_payload = json.dumps(

@@ -1,3 +1,12 @@
 [submodule "cup-stack-server"]
 	path = cup-stack-server
 	url = https://github.com/2026-yarr-robotics/cup-stack-server.git
+[submodule "vision/ros2-depth-point-cloude"]
+	path = vision/ros2-depth-point-cloude
+	url = https://github.com/2026-yarr-robotics/ros2-depth-point-cloude.git
+[submodule "vision/vision-node"]
+	path = vision/vision-node
+	url = https://github.com/2026-yarr-robotics/vision-node.git
+[submodule "vision/ros2-recode-sequence"]
+	path = vision/ros2-recode-sequence
+	url = https://github.com/2026-yarr-robotics/ros2-recode-sequence.git

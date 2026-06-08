@@ -1,23 +1,27 @@
-"""fake_aggregator_node — publish fixed experiment world-state topics.
+"""aggregator_node — relay real vision world-state to the goal-state publisher.
 
-This is fake data with the same topic shape the GSP already consumes:
+(Formerly fake_aggregator_node, which injected a hardcoded {cups_on_table, stack}
+world state.)
 
-  publish /cups_on_table
-  publish /stack
-  publish /user_command
-  subscribe /action_result
+The real vision pipeline computes the world state, but publishes it on namespaced
+topics so this aggregator can sit between vision and goal_state_publisher_node:
 
-It updates the fake world state after successful pyramid action results so the
-next LLM input sees the same state transition perception would have reported.
+  subscribe cups_in_topic   (default /vision/cups_on_table)  <- point_cloud_node
+  subscribe stack_in_topic  (default /vision/stack)          <- verifier_node
+  publish   cups_out_topic  (default /cups_on_table)         -> goal_state_publisher
+  publish   stack_out_topic (default /stack)                 -> goal_state_publisher
+  publish   user_command_topic (default /user_command)
 
-Disturbance experiment:
-  after L2_right succeeds, simulate removing the already-stacked L2_left cup.
-  The removed cup returns to the table, so /stack L2_left becomes null and
-  /cups_on_table blue is incremented once.
+Today it relays the vision values straight through (counts/occupancy carry no
+geometric jitter to filter — that correction applies to x,y positions, handled by
+digital_twin_stabilizer_node). The relay is the single seam where world-state
+refinement (e.g. temporal debouncing of flickering counts) would be added.
+
+It also publishes /user_command — the one world-state input perception cannot
+produce — once, after an initial delay.
 """
 from __future__ import annotations
 
-import json
 import time
 
 import rclpy
@@ -25,132 +29,69 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 
-STACK_SLOTS = [
-    'L1_left',
-    'L1_mid',
-    'L1_right',
-    'L2_left',
-    'L2_right',
-    'L3_top',
-]
+class AggregatorNode(Node):
+    def __init__(self, **kwargs) -> None:
+        super().__init__('aggregator_node', **kwargs)
 
-
-class FakeAggregatorNode(Node):
-    def __init__(self) -> None:
-        super().__init__('fake_aggregator_node')
-
-        self.declare_parameter('cups_on_table_topic', '/cups_on_table')
-        self.declare_parameter('stack_topic', '/stack')
+        self.declare_parameter('cups_in_topic', '/vision/cups_on_table')
+        self.declare_parameter('stack_in_topic', '/vision/stack')
+        self.declare_parameter('cups_out_topic', '/cups_on_table')
+        self.declare_parameter('stack_out_topic', '/stack')
         self.declare_parameter('user_command_topic', '/user_command')
-        self.declare_parameter('action_result_topic', '/action_result')
-        self.declare_parameter(
-            'user_command',
-            '3단 피라미드 쌓아줘',
-        )
-        self.declare_parameter('publish_period_s', 0.5)
+        self.declare_parameter('user_command', '3단 피라미드 쌓아줘')
         self.declare_parameter('initial_command_delay_s', 2.0)
-        self.declare_parameter('disturbance_enabled', True)
-        self.declare_parameter('disturbance_trigger_slot', 'L2_right')
-        self.declare_parameter('disturbance_removed_slot', 'L2_left')
-
-        self._cups_on_table: dict[str, int] = {'blue': 6}
-        self._stack: dict[str, str | None] = {slot: None for slot in STACK_SLOTS}
-        self._command_published = False
-        self._disturbance_applied = False
-        self._started_at = time.monotonic()
+        self.declare_parameter('publish_period_s', 0.5)
 
         self._cups_pub = self.create_publisher(
-            String,
-            str(self.get_parameter('cups_on_table_topic').value),
-            10,
-        )
+            String, str(self.get_parameter('cups_out_topic').value), 10)
         self._stack_pub = self.create_publisher(
-            String,
-            str(self.get_parameter('stack_topic').value),
-            10,
-        )
+            String, str(self.get_parameter('stack_out_topic').value), 10)
         self._command_pub = self.create_publisher(
-            String,
-            str(self.get_parameter('user_command_topic').value),
-            10,
-        )
+            String, str(self.get_parameter('user_command_topic').value), 10)
+
         self.create_subscription(
-            String,
-            str(self.get_parameter('action_result_topic').value),
-            self._on_action_result,
-            10,
-        )
+            String, str(self.get_parameter('cups_in_topic').value),
+            self._relay_cups, 10)
+        self.create_subscription(
+            String, str(self.get_parameter('stack_in_topic').value),
+            self._relay_stack, 10)
+
+        self._command_published = False
+        self._started_at = time.monotonic()
         self.create_timer(
             float(self.get_parameter('publish_period_s').value),
-            self._publish,
-        )
+            self._tick_command)
         self.get_logger().info(
-            'fake_aggregator_node: publishing fixed cups/stack/user command')
+            'aggregator_node: relaying '
+            f'{self.get_parameter("cups_in_topic").value} -> '
+            f'{self.get_parameter("cups_out_topic").value}, '
+            f'{self.get_parameter("stack_in_topic").value} -> '
+            f'{self.get_parameter("stack_out_topic").value}')
 
-    def _on_action_result(self, msg: String) -> None:
-        try:
-            result = json.loads(msg.data)
-        except json.JSONDecodeError as e:
-            self.get_logger().warn(f'/action_result invalid JSON: {e}')
-            return
-        if result.get('result') != 'success':
-            return
-        if result.get('action') != 'pyramid':
-            return
-        color = result.get('color')
-        target_slot = result.get('target_slot')
-        if not isinstance(color, str) or target_slot not in self._stack:
-            return
+    # ------------------------------------------------------------------
+    # Refinement seam: counts/occupancy are relayed as-is today. Temporal
+    # debouncing of the world state would go here.
+    def _relay_cups(self, msg: String) -> None:
+        self._cups_pub.publish(msg)
 
-        self._stack[target_slot] = color
-        self._cups_on_table[color] = max(
-            int(self._cups_on_table.get(color, 0)) - 1,
-            0,
-        )
-        self._maybe_apply_disturbance(target_slot)
-        self._publish()
+    def _relay_stack(self, msg: String) -> None:
+        self._stack_pub.publish(msg)
 
-    def _maybe_apply_disturbance(self, completed_slot: str) -> None:
-        if self._disturbance_applied:
+    def _tick_command(self) -> None:
+        if self._command_published:
             return
-        if not bool(self.get_parameter('disturbance_enabled').value):
+        delay = float(self.get_parameter('initial_command_delay_s').value)
+        if time.monotonic() - self._started_at < delay:
             return
-        trigger_slot = str(
-            self.get_parameter('disturbance_trigger_slot').value)
-        if completed_slot != trigger_slot:
-            return
-        removed_slot = str(
-            self.get_parameter('disturbance_removed_slot').value)
-        removed_color = self._stack.get(removed_slot)
-        if removed_color is None:
-            self.get_logger().warn(
-                f'disturbance skipped: {removed_slot} is already empty')
-            return
-        self._stack[removed_slot] = None
-        self._cups_on_table[removed_color] = (
-            int(self._cups_on_table.get(removed_color, 0)) + 1)
-        self._disturbance_applied = True
-        self.get_logger().info(
-            f'disturbance applied: removed {removed_color} from '
-            f'{removed_slot} after {completed_slot}')
-
-    def _publish(self) -> None:
-        self._cups_pub.publish(
-            String(data=json.dumps(self._cups_on_table, sort_keys=True)))
-        self._stack_pub.publish(
-            String(data=json.dumps(self._stack, sort_keys=True)))
-        if not self._command_published:
-            delay = float(self.get_parameter('initial_command_delay_s').value)
-            if time.monotonic() - self._started_at < delay:
-                return
-            self._command_pub.publish(
-                String(data=str(self.get_parameter('user_command').value)))
-            self._command_published = True
+        command = str(self.get_parameter('user_command').value)
+        self._command_pub.publish(String(data=command))
+        self._command_published = True
+        self.get_logger().info(f'/user_command published: {command!r}')
 
 
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
-    node = FakeAggregatorNode()
+    node = AggregatorNode()
     try:
         rclpy.spin(node)
     finally:

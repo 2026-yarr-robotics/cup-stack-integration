@@ -1,192 +1,201 @@
-"""fake_digital_twin_node — publish the EXO-view cup poses plan_executor reads.
+"""digital_twin_stabilizer_node — publish time-stabilized cup positions.
 
-This is fake data with real topic/message shape. It replaces the digital twin
-for the fixed experiment while keeping plan_executor_node unchanged:
+(Formerly fake_digital_twin_node, which injected hardcoded GT coordinates.)
 
-  publish /digital_twin/boxes    visualization_msgs/MarkerArray
-  publish /stack_track_ids       std_msgs/Int32MultiArray
-  subscribe /action_result       std_msgs/String JSON
+The real perception pipeline (depth_digital_twin/point_cloud_node) publishes the
+raw per-frame cup markers on /digital_twin/boxes. The detector + cup fit already
+EMA-smooth and lock each track, but the published box_top position still drifts a
+few millimetres every frame, so a pick target read off a single frame is noisy.
 
-v1.1 coarse→fine pick: plan_executor uses the imprecise EXO view to move the arm
-roughly above a cup; pick_node then refines with its hand-eye view. So the poses
-published here are the GROUND TRUTH (see MEASURED_CUPS) plus a small, fixed,
-per-cup error (`exo_xy_error_m`, default 0.02 m). The matching ground-truth poses
-that pick_node consumes are published by fake_pick_view_node on /hand_eye/boxes.
+This node sits between the real vision node and plan_executor_node: it keeps a
+short sliding time window of recent positions per track id and republishes the
+**median** (default; robust to YOLO/fit outliers) or mean:
 
-The error stays well under half the 0.10 m cup spacing so each perturbed pose is
-still nearest to its own true cup — pick_node picks the nearest cup, so a larger
-error would make it grab the wrong one.
+  subscribe boxes_in_topic   (default /digital_twin/boxes)
+  publish   boxes_out_topic  (default /digital_twin/boxes_filtered)
 
-Measured (ground-truth) blue cup pick positions for the experiment:
-  L1_left  -> track id 1, x=0.250, y=-0.20
-  L1_mid   -> track id 2, x=0.250, y=0.00
-  L1_right -> track id 3, x=0.250, y=0.20
-  L2_left  -> track id 4, x=0.350, y=-0.20
-  L2_right -> track id 5, x=0.350, y=0.00
-  L3_top   -> track id 6, x=0.350, y=0.20
-
-Disturbance experiment:
-  after L2_right succeeds, track id 4 (L2_left) is removed from the stack and
-  reappears at the L1_left table position x=0.250, y=-0.20.
+Only box_top (position) and box_labels (color/class text) markers are used; the
+label is passed through unchanged so blue/red and upright/fallen survive. Output
+stays a visualization_msgs/MarkerArray in the same `world` frame, so it is a
+drop-in for any consumer of the boxes topic.
 """
 from __future__ import annotations
 
-import json
-import math
+import statistics
+import time
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32MultiArray, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 
-MEASURED_CUPS: dict[str, tuple[int, float, float]] = {
-    'L1_left': (1, 0.250, -0.20),
-    'L1_mid': (2, 0.250, 0.00),
-    'L1_right': (3, 0.250, 0.20),
-    'L2_left': (4, 0.350, -0.20),
-    'L2_right': (5, 0.350, 0.00),
-    'L3_top': (6, 0.350, 0.20),
-}
+def aggregate(samples: list[tuple[float, float, float, float]],
+              now: float, window_s: float,
+              method: str = 'median') -> tuple[float, float, float] | None:
+    """Aggregate recent (t, x, y, z) samples within `window_s` of `now`.
 
-DISTURBANCE_RETURN_POSES: dict[str, tuple[float, float]] = {
-    'L2_left': (0.250, -0.20),
-}
-
-
-def exo_offset(track_id: int, error_m: float) -> tuple[float, float]:
-    """Fixed, deterministic per-cup XY error for the EXO view.
-
-    Magnitude is exactly `error_m`; the direction is spread around a circle by
-    track id so cups err in different directions but identically every tick (no
-    randomness, so the experiment replays the same way each run).
+    Returns (x, y, z) via median (robust) or mean, or None if the window is
+    empty. Pure function — unit-testable without a running node.
     """
-    angle = track_id * (2.0 * math.pi / len(MEASURED_CUPS))
-    return error_m * math.cos(angle), error_m * math.sin(angle)
+    xs, ys, zs = [], [], []
+    for (t, x, y, z) in samples:
+        if now - t <= window_s:
+            xs.append(x)
+            ys.append(y)
+            zs.append(z)
+    if not xs:
+        return None
+    if method == 'mean':
+        return statistics.fmean(xs), statistics.fmean(ys), statistics.fmean(zs)
+    return statistics.median(xs), statistics.median(ys), statistics.median(zs)
 
 
-class FakeDigitalTwinNode(Node):
-    def __init__(self) -> None:
-        super().__init__('fake_digital_twin_node')
+class DigitalTwinStabilizerNode(Node):
+    def __init__(self, **kwargs) -> None:
+        super().__init__('digital_twin_stabilizer_node', **kwargs)
 
-        self.declare_parameter('boxes_topic', '/digital_twin/boxes')
-        self.declare_parameter('stack_track_ids_topic', '/stack_track_ids')
-        self.declare_parameter('action_result_topic', '/action_result')
-        self.declare_parameter('publish_period_s', 0.5)
-        # Per-cup XY error baked into the EXO view plan_executor reads. Kept well
-        # under half the 0.10 m cup spacing so each perturbed pose stays nearest
-        # to its own true cup (pick_node grabs the nearest one).
-        self.declare_parameter('exo_xy_error_m', 0.02)
-        self.declare_parameter('disturbance_enabled', True)
-        self.declare_parameter('disturbance_trigger_slot', 'L2_right')
-        self.declare_parameter('disturbance_removed_slot', 'L2_left')
+        self.declare_parameter('boxes_in_topic', '/digital_twin/boxes')
+        self.declare_parameter('boxes_out_topic', '/digital_twin/boxes_filtered')
+        self.declare_parameter('method', 'median')
+        self.declare_parameter('window_s', 1.0)
+        self.declare_parameter('track_timeout_s', 1.0)
+        self.declare_parameter('publish_period_s', 0.1)
 
-        self._stacked_ids: set[int] = set()
-        self._exo_error = float(self.get_parameter('exo_xy_error_m').value)
-        self._cup_positions: dict[str, tuple[float, float]] = {
-            slot: (x, y) for slot, (_, x, y) in MEASURED_CUPS.items()
-        }
-        self._disturbance_applied = False
-        self._boxes_pub = self.create_publisher(
-            MarkerArray,
-            str(self.get_parameter('boxes_topic').value),
-            10,
-        )
-        self._stack_ids_pub = self.create_publisher(
-            Int32MultiArray,
-            str(self.get_parameter('stack_track_ids_topic').value),
-            10,
-        )
+        self._method = str(self.get_parameter('method').value)
+        self._window_s = float(self.get_parameter('window_s').value)
+        self._track_timeout_s = float(
+            self.get_parameter('track_timeout_s').value)
+
+        # track id -> list[(t, x, y, z)] samples and track id -> latest label
+        self._samples: dict[int, list[tuple[float, float, float, float]]] = {}
+        self._labels: dict[int, str] = {}
+        self._last_seen: dict[int, float] = {}
+        self._frame_id = 'world'
+        self._published_ids: set[int] = set()
+
+        self._pub = self.create_publisher(
+            MarkerArray, str(self.get_parameter('boxes_out_topic').value), 10)
         self.create_subscription(
-            String,
-            str(self.get_parameter('action_result_topic').value),
-            self._on_action_result,
-            10,
-        )
+            MarkerArray, str(self.get_parameter('boxes_in_topic').value),
+            self._on_boxes, 10)
         self.create_timer(
-            float(self.get_parameter('publish_period_s').value),
-            self._publish,
-        )
+            float(self.get_parameter('publish_period_s').value), self._publish)
         self.get_logger().info(
-            'fake_digital_twin_node: publishing measured blue cup poses')
+            f'digital_twin_stabilizer: {self._method} over {self._window_s}s; '
+            f'{self.get_parameter("boxes_in_topic").value} -> '
+            f'{self.get_parameter("boxes_out_topic").value}')
 
-    def _on_action_result(self, msg: String) -> None:
-        try:
-            result = json.loads(msg.data)
-        except json.JSONDecodeError as e:
-            self.get_logger().warn(f'/action_result invalid JSON: {e}')
-            return
-        if result.get('result') != 'success':
-            return
-        target_slot = result.get('target_slot')
-        measured = MEASURED_CUPS.get(target_slot)
-        if measured is None:
-            return
-        track_id, _, _ = measured
-        self._stacked_ids.add(track_id)
-        self._maybe_apply_disturbance(target_slot)
-        self._publish()
+    # ------------------------------------------------------------------
+    def _on_boxes(self, msg: MarkerArray) -> None:
+        now = time.monotonic()
+        for m in msg.markers:
+            if m.action == Marker.DELETEALL:
+                self._samples.clear()
+                self._labels.clear()
+                self._last_seen.clear()
+                continue
+            if m.action == Marker.DELETE:
+                if m.ns in ('box_top', 'boxes', 'box_labels'):
+                    self._drop(m.id)
+                continue
+            if m.ns == 'box_top':
+                if m.header.frame_id:
+                    self._frame_id = m.header.frame_id
+                self._samples.setdefault(m.id, []).append(
+                    (now, float(m.pose.position.x),
+                     float(m.pose.position.y), float(m.pose.position.z)))
+                self._last_seen[m.id] = now
+            elif m.ns == 'box_labels':
+                self._labels[m.id] = m.text
+                self._last_seen[m.id] = now
 
-    def _maybe_apply_disturbance(self, completed_slot: str) -> None:
-        if self._disturbance_applied:
-            return
-        if not bool(self.get_parameter('disturbance_enabled').value):
-            return
-        trigger_slot = str(
-            self.get_parameter('disturbance_trigger_slot').value)
-        if completed_slot != trigger_slot:
-            return
-        removed_slot = str(
-            self.get_parameter('disturbance_removed_slot').value)
-        measured = MEASURED_CUPS.get(removed_slot)
-        return_pose = DISTURBANCE_RETURN_POSES.get(removed_slot)
-        if measured is None or return_pose is None:
-            self.get_logger().warn(
-                f'disturbance skipped: no measured return pose for '
-                f'{removed_slot}')
-            return
-        track_id, _, _ = measured
-        self._stacked_ids.discard(track_id)
-        self._cup_positions[removed_slot] = return_pose
-        self._disturbance_applied = True
-        self.get_logger().info(
-            f'disturbance applied: track id {track_id} returned to '
-            f'({return_pose[0]:.3f},{return_pose[1]:.3f})')
+    def _drop(self, track_id: int) -> None:
+        self._samples.pop(track_id, None)
+        self._labels.pop(track_id, None)
+        self._last_seen.pop(track_id, None)
 
     def _publish(self) -> None:
+        now = time.monotonic()
+        for tid in list(self._last_seen):
+            if now - self._last_seen[tid] > self._track_timeout_s:
+                self._drop(tid)
+                continue
+            if tid in self._samples:
+                self._samples[tid] = [
+                    s for s in self._samples[tid]
+                    if now - s[0] <= self._window_s]
+
         markers = MarkerArray()
-        for slot, (track_id, _, _) in MEASURED_CUPS.items():
-            x, y = self._cup_positions[slot]
-            dx, dy = exo_offset(track_id, self._exo_error)
-            markers.markers.append(
-                self._box_top_marker(track_id, x + dx, y + dy))
-            markers.markers.append(self._label_marker(track_id, slot))
-        self._boxes_pub.publish(markers)
-        self._stack_ids_pub.publish(
-            Int32MultiArray(data=sorted(self._stacked_ids)))
+        live: set[int] = set()
+        for tid in sorted(self._samples):
+            label = self._labels.get(tid)
+            if label is None:
+                continue  # need color/class before the executor can use it
+            agg = aggregate(self._samples[tid], now, self._window_s,
+                            self._method)
+            if agg is None:
+                continue
+            x, y, z = agg
+            live.add(tid)
+            markers.markers.append(self._top_marker(tid, x, y, z))
+            markers.markers.append(self._label_marker(tid, x, y, z, label))
 
-    def _box_top_marker(self, track_id: int, x: float, y: float) -> Marker:
-        marker = Marker()
-        marker.ns = 'box_top'
-        marker.id = track_id
-        marker.action = Marker.ADD
-        marker.pose.position.x = x
-        marker.pose.position.y = y
-        marker.pose.position.z = 0.0
-        return marker
+        for tid in self._published_ids - live:
+            markers.markers.append(self._delete_marker('box_top', tid))
+            markers.markers.append(self._delete_marker('box_labels', tid))
+        self._published_ids = live
 
-    def _label_marker(self, track_id: int, slot: str) -> Marker:
-        marker = Marker()
-        marker.ns = 'box_labels'
-        marker.id = track_id
-        marker.action = Marker.ADD
-        marker.text = f'#{track_id}_slot={slot}_c=blue_upright-cup'
-        return marker
+        if markers.markers:
+            self._pub.publish(markers)
+
+    def _stamp(self, marker: Marker) -> None:
+        marker.header.frame_id = self._frame_id
+        marker.header.stamp = self.get_clock().now().to_msg()
+
+    def _top_marker(self, tid: int, x: float, y: float, z: float) -> Marker:
+        m = Marker()
+        self._stamp(m)
+        m.ns = 'box_top'
+        m.id = tid
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position.x = x
+        m.pose.position.y = y
+        m.pose.position.z = z
+        m.pose.orientation.w = 1.0
+        m.scale.x = m.scale.y = m.scale.z = 0.025
+        m.color.g = 1.0
+        m.color.a = 1.0
+        return m
+
+    def _label_marker(self, tid: int, x: float, y: float, z: float,
+                      text: str) -> Marker:
+        m = Marker()
+        self._stamp(m)
+        m.ns = 'box_labels'
+        m.id = tid
+        m.type = Marker.TEXT_VIEW_FACING
+        m.action = Marker.ADD
+        m.pose.position.x = x
+        m.pose.position.y = y
+        m.pose.position.z = z + 0.05
+        m.pose.orientation.w = 1.0
+        m.scale.z = 0.025
+        m.color.r = m.color.g = m.color.b = m.color.a = 1.0
+        m.text = text
+        return m
+
+    def _delete_marker(self, ns: str, tid: int) -> Marker:
+        m = Marker()
+        m.ns = ns
+        m.id = tid
+        m.action = Marker.DELETE
+        return m
 
 
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
-    node = FakeDigitalTwinNode()
+    node = DigitalTwinStabilizerNode()
     try:
         rclpy.spin(node)
     finally:

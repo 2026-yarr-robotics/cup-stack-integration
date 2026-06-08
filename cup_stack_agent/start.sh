@@ -15,6 +15,13 @@ OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
 DISTURBANCE_ENABLED="${DISTURBANCE_ENABLED:-false}"
 DISTURBANCE_TRIGGER_SLOT="${DISTURBANCE_TRIGGER_SLOT:-L2_right}"
 DISTURBANCE_REMOVED_SLOT="${DISTURBANCE_REMOVED_SLOT:-L2_left}"
+# Real-vision integration: the exo view is now real perception, not GT.
+# aggregator_node relays the real world state; digital_twin_stabilizer_node
+# median-filters the real point_cloud_node boxes.
+USER_COMMAND="${USER_COMMAND:-3단 피라미드 쌓아줘}"
+STABILIZE_METHOD="${STABILIZE_METHOD:-median}"
+STABILIZE_WINDOW_S="${STABILIZE_WINDOW_S:-1.0}"
+STABILIZE_TRACK_TIMEOUT_S="${STABILIZE_TRACK_TIMEOUT_S:-1.0}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_ID}}"
 
@@ -41,17 +48,23 @@ launch() {
   "$@" > >(tee -a "${LOG_DIR}/${name}.log") 2>&1 &
 }
 
-launch fake_aggregator python3 scripts/fake_aggregator_node.py \
+# Real vision pipeline must be running in its own (sourced) workspace, with:
+#   point_cloud_node  -> /digital_twin/boxes  (raw exo cup positions)
+#                     -> /vision/cups_on_table (-r /cups_on_table:=/vision/cups_on_table)
+#   verifier_node     -> /vision/stack         (-r /stack:=/vision/stack)
+#                     -> /stack_track_ids
+# aggregator relays the real world-state (/vision/*) to /cups_on_table, /stack.
+launch aggregator python3 scripts/fake_aggregator_node.py \
   --ros-args \
-  -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
-  -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
-  -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
-launch fake_digital_twin python3 scripts/fake_digital_twin_node.py \
+  -p user_command:="${USER_COMMAND}"
+# digital_twin_stabilizer median-filters the real /digital_twin/boxes into
+# /digital_twin/boxes_filtered (what plan_executor's coarse move reads).
+launch digital_twin_stabilizer python3 scripts/fake_digital_twin_node.py \
   --ros-args \
-  -p exo_xy_error_m:="${EXO_XY_ERROR_M}" \
-  -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
-  -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
-  -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
+  -p method:="${STABILIZE_METHOD}" \
+  -p window_s:="${STABILIZE_WINDOW_S}" \
+  -p track_timeout_s:="${STABILIZE_TRACK_TIMEOUT_S}"
+# fake_hand_eye stays FAKE (GT /hand_eye/boxes) for pick_node's fine pick.
 launch fake_hand_eye python3 scripts/fake_hand_eye_node.py \
   --ros-args \
   -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \

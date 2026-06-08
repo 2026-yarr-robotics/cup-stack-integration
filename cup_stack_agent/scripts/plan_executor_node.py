@@ -34,7 +34,8 @@ LLM plan steps are still the combined `pyramid` action:
     {"step": 1, "action": "pyramid", "color": "red", "target_slot": "L1_left"}
 
 Color→cup resolution still needs ROS perception (the server exposes neither):
-  * /digital_twin/boxes (MarkerArray) → per-cup pose + color/class labels
+  * /digital_twin/boxes_filtered (MarkerArray) → stabilized per-cup pose +
+    color/class labels (median-filtered real exo view from the stabilizer)
   * /stack_track_ids (Int32MultiArray) → track ids already stacked (excluded)
 
 dry_run:=true logs each POST body and synthesises success without hitting the
@@ -175,7 +176,10 @@ class PlanExecutorNode(Node):
 
         self.declare_parameter('llm_output_topic', '/llm_output')
         self.declare_parameter('move_result_topic', '/move_result')
-        self.declare_parameter('boxes_topic', '/digital_twin/boxes')
+        # Stabilized exo view from digital_twin_stabilizer_node (median-filtered
+        # real point_cloud_node boxes). Falls back to /digital_twin/boxes if the
+        # stabilizer is not running.
+        self.declare_parameter('boxes_topic', '/digital_twin/boxes_filtered')
         self.declare_parameter('stack_track_ids_topic', '/stack_track_ids')
         # Coarse move endpoint (robot base_link). pick_node owns the subsequent
         # fine pick + /api/robot/skill/pyramid call.
