@@ -50,7 +50,9 @@ Skill model:
 
 Rules:
 - If user_command requests an unsupported level (>3), return status="unsupported", plan=null, and error.code="UNSUPPORTED_PATTERN".
-- If available cups cannot satisfy the normalized target or hard color constraints, return status="insufficient_resources", plan=null, and error.code="INSUFFICIENT_RESOURCES".
+- Color choice is free unless user_command states an explicit color constraint. When unconstrained, fill slots with any available cups — using a SINGLE color for every slot is fully valid. Cup-color variety is NEVER required (a 2- or 3-level pyramid does not need 2 or 3 different colors). When unconstrained, prefer the color(s) with the largest counts.
+- Sufficiency is a pure COUNT check, never a color-variety check: you have enough iff — with no color constraint — the TOTAL of all cups_on_table counts >= cup_budget; or — with color constraints — each constrained color has at least as many cups as the slots it must fill. The number of distinct colors present is irrelevant.
+- Return status="insufficient_resources", plan=null, error.code="INSUFFICIENT_RESOURCES" ONLY when that count check fails (or an explicitly requested color has 0 cups). Never return it merely because only one color is available.
 - Each step is one "pyramid" action carrying both "color" and "target_slot".
 - One step per target_slot, in build order, stopping at the normalized target. Step count == cup_budget.
 - Track remaining color counts as your plan consumes cups: each step decrements that color implicitly.
