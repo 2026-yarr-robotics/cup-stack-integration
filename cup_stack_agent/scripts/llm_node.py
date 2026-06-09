@@ -40,10 +40,20 @@ class LLMNode(Node):
         self.declare_parameter('ollama_url', DEFAULT_OLLAMA_URL)
         self.declare_parameter('timeout_seconds', 120)
         self.declare_parameter('prompt_dir', '')  # '' → vendored share/prompts
+        # Cap output tokens per mode. An in-flight decision is a short JSON
+        # ({reasoning, decision, plan}); cold-start carries a full 6-step plan.
+        # Unbounded, the model rambled ~5.5KB / 37s and slipped a raw control
+        # char into the JSON, stalling the loop.
+        self.declare_parameter('cold_num_predict', 1536)
+        self.declare_parameter('inflight_num_predict', 768)
 
         self._model = str(self.get_parameter('model').value)
         self._url = str(self.get_parameter('ollama_url').value)
         self._timeout = int(self.get_parameter('timeout_seconds').value)
+        self._cold_num_predict = int(
+            self.get_parameter('cold_num_predict').value)
+        self._inflight_num_predict = int(
+            self.get_parameter('inflight_num_predict').value)
 
         prompt_dir = self._resolve_prompt_dir(
             str(self.get_parameter('prompt_dir').value))
@@ -84,7 +94,9 @@ class LLMNode(Node):
         for attempt in (1, 2):
             result, ms, err = call_ollama(
                 self._model, prompt, payload,
-                ollama_url=self._url, timeout_seconds=self._timeout)
+                ollama_url=self._url, timeout_seconds=self._timeout,
+                num_predict=(self._cold_num_predict if cold
+                             else self._inflight_num_predict))
             if err:
                 self.get_logger().error(f'LLM call failed: {err}')
                 return  # transport errors are not retried here
@@ -92,7 +104,9 @@ class LLMNode(Node):
             try:
                 parsed = parse_model_json(content)
             except json.JSONDecodeError as e:
-                self.get_logger().warn(f'attempt {attempt}: bad JSON ({e})')
+                self.get_logger().warn(
+                    f'attempt {attempt}: bad JSON ({e}); raw[{len(content)}b] '
+                    f'head={content[:1000]!r} tail={content[-1000:]!r}')
                 continue
             errors = (validate_cold_start(parsed) if cold
                       else validate_inflight(parsed, payload))

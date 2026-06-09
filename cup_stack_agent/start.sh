@@ -2,12 +2,24 @@
 set -euo pipefail
 
 DRY_RUN=true
-API_URL="${API_URL:-https://yarr-api-31.simplyimg.com/api/robot/move}"
+# Robot control API base. Default to localhost (nginx :80 → robot:8001) so the
+# robot pick/place/move calls do NOT traverse the Cloudflare tunnel, which times
+# out at ~60s (HTTP 504/530) on long arm motions. Override with the public host
+# only if running off-box: ROBOT_API_BASE=https://yarr-api-31.simplyimg.com.
+ROBOT_API_BASE="${ROBOT_API_BASE:-http://localhost}"
+API_URL="${API_URL:-${ROBOT_API_BASE}/api/robot/move}"
 API_TIMEOUT_S="${API_TIMEOUT_S:-180.0}"
+# (Post-place arm retreat to HOME is handled server-side in /skill/pyramid_step
+#  via try_move_home — no client-side home move needed here.)
 MOVE_Z="${MOVE_Z:-0.45}"
 EXO_XY_ERROR_M="${EXO_XY_ERROR_M:-0.02}"
 MODEL="${MODEL:-qwen3.6:35b}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
+OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-${OLLAMA_URL%/api/chat}}"
+OLLAMA_BASE_URL="${OLLAMA_BASE_URL%/}"
+OLLAMA_CONNECT_TIMEOUT_S="${OLLAMA_CONNECT_TIMEOUT_S:-45}"
+START_OLLAMA_IF_NEEDED="${START_OLLAMA_IF_NEEDED:-true}"
+OLLAMA_REQUIRE_MODEL="${OLLAMA_REQUIRE_MODEL:-true}"
 # Disturbance off for now — the experiment just verifies the happy-path loop.
 # Robust disturbance recovery (continuous perception → GSP triggers LLM replan
 # on world change) is deferred; the scenario code stays in the fake nodes.
@@ -21,13 +33,182 @@ DISTURBANCE_REMOVED_SLOT="${DISTURBANCE_REMOVED_SLOT:-L2_left}"
 USER_COMMAND="${USER_COMMAND:-3단 피라미드 쌓아줘}"
 STABILIZE_METHOD="${STABILIZE_METHOD:-median}"
 STABILIZE_WINDOW_S="${STABILIZE_WINDOW_S:-1.0}"
-STABILIZE_TRACK_TIMEOUT_S="${STABILIZE_TRACK_TIMEOUT_S:-1.0}"
+# Hold a track this long after its last fresh detection so a brief boxes
+# dropout (e.g. exo depth stutter) doesn't flush all tracks → tracked=0.
+STABILIZE_TRACK_TIMEOUT_S="${STABILIZE_TRACK_TIMEOUT_S:-2.5}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_ID}}"
 
 if [[ "${1:-}" == "--real-api" ]]; then
   DRY_RUN=false
 fi
+
+CLEANUP_STALE_AGENT_PROCESSES="${CLEANUP_STALE_AGENT_PROCESSES:-true}"
+
+cleanup_stale_agent_processes() {
+  if [[ "${CLEANUP_STALE_AGENT_PROCESSES}" != "true" ]]; then
+    echo "[start.sh] stale agent cleanup disabled"
+    return
+  fi
+
+  local patterns=(
+    "bash ./start.sh"
+    "bash start.sh"
+    "bash .*/cup_stack_agent/start.sh"
+    "python3 scripts/fake_aggregator_node.py"
+    "python3 scripts/fake_digital_twin_node.py"
+    "python3 scripts/fake_hand_eye_node.py"
+    "python3 scripts/goal_state_publisher_node.py"
+    "python3 scripts/topic_logger_node.py"
+    "python3 scripts/llm_node.py"
+    "python3 scripts/plan_executor_node.py"
+    "python3 scripts/pick_node.py"
+    "tee -a logs/.*/aggregator.log"
+    "tee -a logs/.*/digital_twin_stabilizer.log"
+    "tee -a logs/.*/fake_hand_eye.log"
+    "tee -a logs/.*/goal_state_publisher.log"
+    "tee -a logs/.*/topic_logger.log"
+    "tee -a logs/.*/llm_node.log"
+    "tee -a logs/.*/plan_executor.log"
+    "tee -a logs/.*/pick_node.log"
+  )
+  local pids=()
+  local pid pattern
+  for pattern in "${patterns[@]}"; do
+    while IFS= read -r pid; do
+      [[ -z "${pid}" || "${pid}" == "$$" ]] && continue
+      pids+=("${pid}")
+    done < <(pgrep -f "${pattern}" 2>/dev/null || true)
+  done
+
+  if [[ ${#pids[@]} -eq 0 ]]; then
+    echo "[start.sh] no stale agent processes found"
+    return
+  fi
+
+  mapfile -t pids < <(printf "%s\n" "${pids[@]}" | sort -u)
+  echo "[start.sh] stopping stale agent processes: ${pids[*]}"
+  kill "${pids[@]}" 2>/dev/null || true
+  sleep 1
+
+  local survivors=()
+  for pid in "${pids[@]}"; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      survivors+=("${pid}")
+    fi
+  done
+  if [[ ${#survivors[@]} -gt 0 ]]; then
+    echo "[start.sh] force-stopping stale agent processes: ${survivors[*]}"
+    kill -9 "${survivors[@]}" 2>/dev/null || true
+  fi
+}
+
+cleanup_stale_agent_processes
+
+
+ollama_tags_url() {
+  printf '%s/api/tags' "${OLLAMA_BASE_URL}"
+}
+
+ollama_ready() {
+  curl -fsS --max-time 2 "$(ollama_tags_url)" >/dev/null 2>&1
+}
+
+start_ollama_if_needed() {
+  if [[ "${START_OLLAMA_IF_NEEDED}" != "true" ]]; then
+    return 1
+  fi
+
+  case "${OLLAMA_BASE_URL}" in
+    http://localhost:*|http://127.0.0.1:*|http://0.0.0.0:*) ;;
+    *)
+      echo "[start.sh] Ollama auto-start skipped for non-local URL: ${OLLAMA_BASE_URL}"
+      return 1
+      ;;
+  esac
+
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl --user start ollama >/dev/null 2>&1; then
+      echo "[start.sh] requested Ollama user service start"
+      return 0
+    fi
+  fi
+
+  if command -v ollama >/dev/null 2>&1; then
+    echo "[start.sh] starting Ollama with: ollama serve"
+    OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}" \
+      ollama serve >>"${LOG_DIR}/ollama.log" 2>&1 &
+    return 0
+  fi
+
+  return 1
+}
+
+ollama_model_available() {
+  local tags
+  tags="$(curl -fsS --max-time 5 "$(ollama_tags_url)")" || return 1
+  MODEL="${MODEL}" python3 -c '
+import json
+import os
+import sys
+wanted = os.environ["MODEL"]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+names = [m.get("name", "") for m in data.get("models", [])]
+accepted = set(names)
+accepted.update(n.split(":", 1)[0] for n in names if n)
+sys.exit(0 if wanted in accepted or wanted.split(":", 1)[0] in accepted else 2)
+' <<<"${tags}"
+}
+
+ollama_available_models() {
+  curl -fsS --max-time 5 "$(ollama_tags_url)" 2>/dev/null | python3 -c '
+import json
+import sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("unknown")
+    sys.exit(0)
+names = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+print(", ".join(names) if names else "none")
+'
+}
+
+wait_for_ollama() {
+  echo "[start.sh] checking Ollama: ${OLLAMA_BASE_URL} model=${MODEL}"
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "[start.sh] ERROR: curl is required to check Ollama" >&2
+    exit 1
+  fi
+
+  if ! ollama_ready; then
+    start_ollama_if_needed || true
+  fi
+
+  local deadline=$((SECONDS + OLLAMA_CONNECT_TIMEOUT_S))
+  while ! ollama_ready; do
+    if (( SECONDS >= deadline )); then
+      echo "[start.sh] ERROR: Ollama did not respond at $(ollama_tags_url) within ${OLLAMA_CONNECT_TIMEOUT_S}s" >&2
+      echo "[start.sh]        Start it manually or set OLLAMA_URL/OLLAMA_BASE_URL to a reachable server." >&2
+      exit 1
+    fi
+    sleep 1
+  done
+
+  if [[ "${OLLAMA_REQUIRE_MODEL}" == "true" ]]; then
+    if ! ollama_model_available; then
+      echo "[start.sh] ERROR: Ollama is reachable, but model '${MODEL}' is not installed." >&2
+      echo "[start.sh]        Available models: $(ollama_available_models)" >&2
+      echo "[start.sh]        Install it with 'ollama pull ${MODEL}' or set MODEL=<available-model>." >&2
+      exit 1
+    fi
+  fi
+
+  echo "[start.sh] Ollama connected: ${OLLAMA_BASE_URL} (${MODEL})"
+}
 
 cleanup() {
   local pids
@@ -41,6 +222,7 @@ trap cleanup EXIT
 mkdir -p "${LOG_DIR}"
 export PYTHONUNBUFFERED=1
 echo "[start.sh] logs: ${LOG_DIR}"
+wait_for_ollama
 
 launch() {
   local name="$1"
@@ -92,6 +274,7 @@ launch plan_executor python3 scripts/plan_executor_node.py \
 if [[ "${DRY_RUN}" == "false" ]]; then
   launch pick_node python3 scripts/pick_node.py \
     --ros-args \
+    -p api_base:="${ROBOT_API_BASE}" \
     -p api_timeout_sec:="${API_TIMEOUT_S}"
 else
   echo "[start.sh] dry-run: pick_node NOT launched (no dry-run; would POST the" \

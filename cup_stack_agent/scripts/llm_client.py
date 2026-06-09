@@ -40,15 +40,15 @@ def load_system_prompt(text: str) -> str:
 def parse_model_json(content: str) -> dict:
     """Parse model output as JSON, tolerating fences / surrounding prose."""
     try:
-        return json.loads(content)
+        return json.loads(content, strict=False)
     except json.JSONDecodeError:
         pass
     fence = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
     if fence:
-        return json.loads(fence.group(1))
+        return json.loads(fence.group(1), strict=False)
     start, end = content.find('{'), content.rfind('}')
     if start != -1 and end > start:
-        return json.loads(content[start:end + 1])
+        return json.loads(content[start:end + 1], strict=False)
     raise json.JSONDecodeError('no JSON object found', content, 0)
 
 
@@ -124,8 +124,12 @@ def _check_pyramid_steps(steps: list) -> list[str]:
 def call_ollama(model: str, system_prompt: str, payload: dict, *,
                 ollama_url: str = DEFAULT_OLLAMA_URL,
                 timeout_seconds: int = 120,
+                num_predict: int | None = None,
                 think: bool = False) -> tuple[dict | None, float, str | None]:
     """POST one chat request. Returns (result_json, elapsed_ms, error_str)."""
+    options = {'temperature': 0}
+    if num_predict is not None:
+        options['num_predict'] = int(num_predict)
     request = {
         'model': model,
         'messages': [
@@ -134,7 +138,11 @@ def call_ollama(model: str, system_prompt: str, payload: dict, *,
              'content': json.dumps(payload, ensure_ascii=False, indent=2)},
         ],
         'stream': False,
-        'options': {'temperature': 0},
+        # Constrain decoding to syntactically valid JSON at the source so a
+        # rambling string cannot emit a raw control char the parser rejects.
+        # parse_model_json strict=False stays as a downstream safety net.
+        'format': 'json',
+        'options': options,
         'think': think,
     }
     data = json.dumps(request).encode('utf-8')

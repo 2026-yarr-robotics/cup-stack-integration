@@ -40,6 +40,7 @@ Replan:
 
 Return JSON only:
 {"reasoning":str,"decision":"continue"|"replan"|"done","plan":null|{"target":object,"steps":[...]}|{"target_pattern":str,"steps":[...]}}
+reasoning MUST be one short sentence, <= 160 characters. Output ONLY the JSON object: no markdown fences, no prose, no chain-of-thought before or after.
 
 Example continue:
 Input:
