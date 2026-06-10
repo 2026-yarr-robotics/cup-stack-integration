@@ -31,11 +31,11 @@ DISTURBANCE_REMOVED_SLOT="${DISTURBANCE_REMOVED_SLOT:-L2_left}"
 # aggregator_node relays the real world state; digital_twin_stabilizer_node
 # median-filters the real point_cloud_node boxes.
 USER_COMMAND="${USER_COMMAND:-3단 피라미드 쌓아줘}"
-STABILIZE_METHOD="${STABILIZE_METHOD:-median}"
+STABILIZE_METHOD="${STABILIZE_METHOD:-ema}"
 STABILIZE_WINDOW_S="${STABILIZE_WINDOW_S:-1.0}"
 # Hold a track this long after its last fresh detection so a brief boxes
 # dropout (e.g. exo depth stutter) doesn't flush all tracks → tracked=0.
-STABILIZE_TRACK_TIMEOUT_S="${STABILIZE_TRACK_TIMEOUT_S:-2.5}"
+STABILIZE_TRACK_TIMEOUT_S="${STABILIZE_TRACK_TIMEOUT_S:-30.0}"
 # Hand-eye source for pick_node's fine pick (/hand_eye/boxes):
 #   real = upright_cup_pose_node (real hand camera YOLO-seg -> base_link /tf)
 #   fake = fake_hand_eye_node (GT). Revert with: HAND_EYE_MODE=fake ./start.sh
