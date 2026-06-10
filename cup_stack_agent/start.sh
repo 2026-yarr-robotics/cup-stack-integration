@@ -36,6 +36,13 @@ STABILIZE_WINDOW_S="${STABILIZE_WINDOW_S:-1.0}"
 # Hold a track this long after its last fresh detection so a brief boxes
 # dropout (e.g. exo depth stutter) doesn't flush all tracks → tracked=0.
 STABILIZE_TRACK_TIMEOUT_S="${STABILIZE_TRACK_TIMEOUT_S:-2.5}"
+# Hand-eye source for pick_node's fine pick (/hand_eye/boxes):
+#   real = upright_cup_pose_node (real hand camera YOLO-seg -> base_link /tf)
+#   fake = fake_hand_eye_node (GT). Revert with: HAND_EYE_MODE=fake ./start.sh
+HAND_EYE_MODE="${HAND_EYE_MODE:-real}"
+HAND_EYE_WEIGHTS="${HAND_EYE_WEIGHTS:-/home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt}"
+HAND_EYE_CALIB="${HAND_EYE_CALIB:-/home/ssu/cup-stack-integration/cup-stack-server/fallen-cup-recovery/dsr_practice/config/T_gripper2camera.npy}"
+HAND_EYE_DEVICE="${HAND_EYE_DEVICE:-cuda}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_ID}}"
 
@@ -56,8 +63,11 @@ cleanup_stale_agent_processes() {
     "bash start.sh"
     "bash .*/cup_stack_agent/start.sh"
     "python3 scripts/fake_aggregator_node.py"
+    "python3 scripts/aggregator_node.py"
     "python3 scripts/fake_digital_twin_node.py"
+    "python3 scripts/digital_twin_stabilizer_node.py"
     "python3 scripts/fake_hand_eye_node.py"
+    "python3 scripts/upright_cup_pose_node.py"
     "python3 scripts/goal_state_publisher_node.py"
     "python3 scripts/topic_logger_node.py"
     "python3 scripts/llm_node.py"
@@ -66,6 +76,7 @@ cleanup_stale_agent_processes() {
     "tee -a logs/.*/aggregator.log"
     "tee -a logs/.*/digital_twin_stabilizer.log"
     "tee -a logs/.*/fake_hand_eye.log"
+    "tee -a logs/.*/upright_cup_pose.log"
     "tee -a logs/.*/goal_state_publisher.log"
     "tee -a logs/.*/topic_logger.log"
     "tee -a logs/.*/llm_node.log"
@@ -230,28 +241,55 @@ launch() {
   "$@" > >(tee -a "${LOG_DIR}/${name}.log") 2>&1 &
 }
 
+# file-only launch (no shared-console echo). For chatty nodes — e.g. the
+# per-frame upright_cup_pose vision log — so they do not drown the
+# LLM-interaction feed on the start.sh console. Full log still goes to file.
+launch_quiet() {
+  local name="$1"
+  shift
+  "$@" >> "${LOG_DIR}/${name}.log" 2>&1 &
+}
+
 # Real vision pipeline must be running in its own (sourced) workspace, with:
 #   point_cloud_node  -> /digital_twin/boxes  (raw exo cup positions)
 #                     -> /vision/cups_on_table (-r /cups_on_table:=/vision/cups_on_table)
 #   verifier_node     -> /vision/stack         (-r /stack:=/vision/stack)
 #                     -> /stack_track_ids
 # aggregator relays the real world-state (/vision/*) to /cups_on_table, /stack.
-launch aggregator python3 scripts/fake_aggregator_node.py \
+launch aggregator python3 scripts/aggregator_node.py \
   --ros-args \
   -p user_command:="${USER_COMMAND}"
 # digital_twin_stabilizer median-filters the real /digital_twin/boxes into
 # /digital_twin/boxes_filtered (what plan_executor's coarse move reads).
-launch digital_twin_stabilizer python3 scripts/fake_digital_twin_node.py \
+launch digital_twin_stabilizer python3 scripts/digital_twin_stabilizer_node.py \
   --ros-args \
   -p method:="${STABILIZE_METHOD}" \
   -p window_s:="${STABILIZE_WINDOW_S}" \
   -p track_timeout_s:="${STABILIZE_TRACK_TIMEOUT_S}"
-# fake_hand_eye stays FAKE (GT /hand_eye/boxes) for pick_node's fine pick.
-launch fake_hand_eye python3 scripts/fake_hand_eye_node.py \
-  --ros-args \
-  -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
-  -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
-  -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
+# hand-eye source for pick_node fine pick (/hand_eye/boxes). HAND_EYE_MODE:
+#   real = upright_cup_pose_node (hand cam YOLO-seg -> base_link via /tf FK)
+#   fake = fake_hand_eye_node (GT)
+if [[ "${HAND_EYE_MODE}" == "real" ]]; then
+  launch_quiet upright_cup_pose python3 scripts/upright_cup_pose_node.py \
+    --ros-args \
+    -p weights_path:="${HAND_EYE_WEIGHTS}" \
+    -p image_topic:=/hand/hand/color/image_raw \
+    -p depth_topic:=/hand/hand/aligned_depth_to_color/image_raw \
+    -p camera_info_topic:=/hand/hand/color/camera_info \
+    -p calib_file:="${HAND_EYE_CALIB}" \
+    -p calib_scale_mm_to_m:=true \
+    -p device:="${HAND_EYE_DEVICE}" \
+    -p imgsz:=1280 \
+    -p conf:=0.35 \
+    -p base_frame:=base_link \
+    -p target_class_name:=upright-cup
+else
+  launch fake_hand_eye python3 scripts/fake_hand_eye_node.py \
+    --ros-args \
+    -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
+    -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
+    -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
+fi
 launch goal_state_publisher python3 scripts/goal_state_publisher_node.py
 launch topic_logger python3 scripts/topic_logger_node.py \
   --ros-args \

@@ -11,7 +11,7 @@ Hand-eye 비전 노드 (cup-stack-integration v1.1).
 컵을 골라 pyramid API 를 호출한다.
 
 좌표 변환 (dsr_practice/stand_fallen_cup.py 검증식 재사용):
-    T_base_ee  = get_ee_matrix(robot)          # link_6 global transform (MoveItPy FK)
+    T_base_ee  = _ee_matrix_from_tf()          # base_link<-link_6 (/tf lookup)
     T_ee_cam   = gripper2cam (npy, mm→m)
     T_base_cam = T_base_ee @ T_ee_cam
     p_base     = (T_base_cam @ [p_cam, 1])[:3] - base_offset
@@ -24,7 +24,7 @@ Output:
   /upright_cup/debug_image : Image (검출/선택 시각화)
 
 전제:
-  - dsr_bringup2_moveit.launch.py 가 떠 있어야 MoveItPy FK 가능.
+  - dsr 가 /tf 로 base_link<-link_6 (TF) 를 방송하고 있어야 FK 가능.
   - hand-eye 캘리브 파일(T_gripper2camera.npy) 이 calib_file 경로에 있어야 함.
 """
 
@@ -38,6 +38,8 @@ import torch
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformListener
 
 from sensor_msgs.msg import Image, CameraInfo
 from visualization_msgs.msg import Marker, MarkerArray
@@ -106,16 +108,21 @@ def as_bool(value):
     return bool(value)
 
 
-# stand_fallen_cup.py 의 get_ee_matrix 와 동일 (link_6 global transform).
+# link_6(EE) 프레임명. base_link<-link_6 FK 는 MoveItPy 대신 /tf 로 얻는다.
 EE_LINK = "link_6"
 
 
-def get_ee_matrix(moveit_robot):
-    """현재 link_6(EE) 의 base_link 기준 4x4 변환 (planning scene read-only)."""
-    psm = moveit_robot.get_planning_scene_monitor()
-    with psm.read_only() as scene:
-        T = scene.current_state.get_global_link_transform(EE_LINK)
-    return np.asarray(T, dtype=float)
+def quat_to_matrix(x, y, z, w):
+    """단위 quaternion(xyzw) -> 3x3 회전행렬."""
+    n = math.sqrt(x * x + y * y + z * z + w * w)
+    if n == 0.0:
+        return np.eye(3)
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w)],
+        [2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)],
+    ], dtype=float)
 
 
 # HSV 기반 단순 색 분류. mask 영역 평균 BGR → 알려진 컵 색 토큰.
@@ -240,11 +247,14 @@ class UprightCupPoseNode(Node):
             self.gripper2cam[:3, 3] /= 1000.0  # mm → m
         self.get_logger().info(f"Hand-Eye 캘리브 로드: {calib_file}")
 
-        # ── MoveItPy (link_6 FK) ────────────────────────────
-        from moveit.planning import MoveItPy
-        self.get_logger().info("MoveItPy 초기화 중…")
-        self.robot = MoveItPy(node_name="upright_cup_pose_moveit_py")
-        self.get_logger().info("MoveItPy 초기화 완료")
+        # ── link_6 FK: /tf lookup (MoveItPy 대신) ────────────
+        # 두 번째 MoveItPy planning-scene-monitor 충돌을 피하려 TF 로 base_link<-
+        # link_6 FK 를 읽는다. dsr 가 이 변환을 /tf 로 방송하므로 read-only FK 로 충분.
+        self.ee_frame = EE_LINK
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
+        self.get_logger().info(
+            f"link_6 FK source: /tf ({self.base_frame} <- {self.ee_frame})")
 
         # ── 카메라 내부 파라미터 / depth ────────────────────
         self.last_depth_m = None
@@ -400,12 +410,27 @@ class UprightCupPoseNode(Node):
         return classify_color_bgr(mean_bgr)
 
     # ── 좌표 변환 (camera optical → base_link) ────────────────
+    def _ee_matrix_from_tf(self):
+        """base_frame <- link_6 4x4 (TF 최신). 미수신/실패 시 None."""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.base_frame, self.ee_frame, Time())
+        except Exception as e:
+            self.get_logger().warn(
+                f"link_6 TF lookup 실패(FK 불가): {e}",
+                throttle_duration_sec=2.0)
+            return None
+        t = tf.transform.translation
+        q = tf.transform.rotation
+        T = np.eye(4)
+        T[:3, :3] = quat_to_matrix(q.x, q.y, q.z, q.w)
+        T[:3, 3] = [t.x, t.y, t.z]
+        return T
+
     def cam_to_base(self, p_cam):
         """p_cam (camera optical frame, m) → base_link (m). 실패 시 None."""
-        try:
-            T_base_ee = get_ee_matrix(self.robot)
-        except Exception as e:
-            self.get_logger().warn(f"get_ee_matrix 실패(FK 불가): {e}")
+        T_base_ee = self._ee_matrix_from_tf()
+        if T_base_ee is None:
             return None
         T_base_cam = T_base_ee @ self.gripper2cam
         p_base = (T_base_cam @ np.append(np.asarray(p_cam, dtype=float), 1.0))[:3]

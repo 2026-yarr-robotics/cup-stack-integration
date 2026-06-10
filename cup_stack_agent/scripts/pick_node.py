@@ -249,10 +249,15 @@ class PickNode(Node):
         log = self.get_logger()
         self._boxes.clear()
 
-        log.info(f"[select] hand-eye 마커 수집 (max {self.box_wait_sec}s)")
+        # 첫 hand-eye 마커(xy)가 들어오는 즉시 선택 — 실제 추론 시간으로 바로
+        # 움직인다. box_wait_sec 은 마커가 영영 안 올 때를 위한 안전 timeout 일 뿐
+        # (예전엔 항상 이 시간을 꽉 채워 인위적으로 대기했음).
+        log.info(f"[select] hand-eye 마커 대기 (timeout {self.box_wait_sec}s)")
         t0 = time.time()
         while rclpy.ok() and time.time() - t0 < self.box_wait_sec:
             rclpy.spin_once(self, timeout_sec=0.05)
+            if any(b.get("xy") is not None for b in self._boxes.values()):
+                break
 
         cands = [(i, b) for i, b in self._boxes.items() if b.get("xy") is not None]
         if not cands:
