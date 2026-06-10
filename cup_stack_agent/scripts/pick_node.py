@@ -105,6 +105,10 @@ class PickNode(Node):
         # API
         self.declare_parameter("api_base", "https://yarr-api-31.simplyimg.com")
         self.declare_parameter("api_path", "/api/robot/skill/pyramid")
+        # NOTE: the post-place arm retreat to HOME is done server-side inside
+        # /skill/pyramid_step (skill_api_node calls try_move_home after the
+        # place, and only then returns), so the exo camera is clear of the arm
+        # by the time we publish /action_result. pick_node does not move home.
         # The pyramid skill runs the real arm (move+pick+place) and the server
         # only responds when it finishes, so this must exceed the skill duration.
         # Too short → pick_node gives up while the skill keeps running, and the
@@ -146,11 +150,14 @@ class PickNode(Node):
             if v.strip()
         ]
 
-        log.info("=== pick_node 시작 ===")
-        log.info(f"  trigger : {self.move_result_topic} (slot 게이트, move 타깃 x,y)")
-        log.info(f"  pick src: {self.hand_eye_boxes_topic} (base_link MarkerArray)")
-        log.info(f"  result  : {self.action_result_topic}")
-        log.info(f"  API     : POST {self.api_url} (timeout {self.api_timeout_sec}s)")
+        # 시작 배너·대기/게이트 로그는 debug 로 — 대시보드 피드에는 pick 시퀀스
+        # (시작~종료) 동안의 로그만 보이도록 한다 (rclpy 기본 레벨 INFO → debug 는
+        # 로그 파일/피드에 안 찍힘).
+        log.debug("=== pick_node 시작 ===")
+        log.debug(f"  trigger : {self.move_result_topic} (slot 게이트, move 타깃 x,y)")
+        log.debug(f"  pick src: {self.hand_eye_boxes_topic} (base_link MarkerArray)")
+        log.debug(f"  result  : {self.action_result_topic}")
+        log.debug(f"  API     : POST {self.api_url} (timeout {self.api_timeout_sec}s)")
 
         # ── HTTP 세션 ──────────────────────────────
         self.http = requests.Session()
@@ -211,7 +218,7 @@ class PickNode(Node):
         if self.trigger_actions:
             action = str(data.get("action", "")).strip().lower()
             if action not in self.trigger_actions:
-                log.info(
+                log.debug(
                     f"[move_result] action={action!r} 가 trigger_actions 에 없음 → 무시")
                 return
 
@@ -219,14 +226,15 @@ class PickNode(Node):
         if self.require_result_success:
             result = str(data.get("result", "")).strip().lower()
             if result not in self.success_values:
-                log.info(f"[move_result] result={result!r} 성공값 아님 → 무시")
+                log.debug(f"[move_result] result={result!r} 성공값 아님 → 무시")
                 return
 
         if self._busy or self._pending is not None:
             log.warn(f"[move_result] 처리 중(busy={self._busy}) — slot={slot} 드롭")
             return
 
-        log.info(f"[move_result] slot={slot} 수신 → pick 시퀀스 예약")
+        # 트리거 수신 로그도 debug — 피드는 "=== pick 시퀀스 시작 ===" 부터 시작.
+        log.debug(f"[move_result] slot={slot} 수신 → pick 시퀀스 예약")
         self._pending = {"slot": slot, "raw": data}
 
     # ── 컵 선택 (hand-eye 마커 → base_link x,y) ────
@@ -348,6 +356,9 @@ class PickNode(Node):
                 return
             x, y = float(p[0]), float(p[1])
 
+            # The skill server homes the arm after placing (clears the exo view)
+            # before returning, so by the time this 200 arrives the scene is
+            # clean — publishing /action_result here is safe for GSP's world wait.
             ok, status, rj, err = self._call_pyramid(x, y, slot)
             self._publish_result(req, x, y, ok, status, rj, err)
         except Exception as e:  # noqa: BLE001 - 어떤 예외든 result 로 보고
@@ -360,7 +371,7 @@ class PickNode(Node):
     # ── 메인 루프 ────────────────────────────────
     def run(self):
         log = self.get_logger()
-        log.info(f"[Init] 대기 중 — {self.move_result_topic} 에 유효 slot 들어오면 동작")
+        log.debug(f"[Init] 대기 중 — {self.move_result_topic} 에 유효 slot 들어오면 동작")
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.05)
             if self._pending is not None and not self._busy:
