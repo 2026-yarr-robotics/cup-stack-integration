@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -245,6 +246,9 @@ class PlanExecutorNode(Node):
         self.declare_parameter('api_timeout_s', 15.0)
         # Fixed approach height so hand-eye can see the cup after the move.
         self.declare_parameter('move_z', 0.45)
+        # how long to wait for perception (boxes_filtered -> _cups) before
+        # failing a move when no matching cup is tracked yet (cold-start race).
+        self.declare_parameter('cup_wait_s', 5.0)
         self.declare_parameter('dry_run', True)
 
         llm_out = str(self.get_parameter('llm_output_topic').value)
@@ -255,6 +259,7 @@ class PlanExecutorNode(Node):
         self._api_url = str(self.get_parameter('api_url_move').value)
         self._timeout = float(self.get_parameter('api_timeout_s').value)
         self._move_z = float(self.get_parameter('move_z').value)
+        self._cup_wait_s = float(self.get_parameter('cup_wait_s').value)
         self._dry_run = bool(self.get_parameter('dry_run').value)
 
         self._state_lock = threading.Lock()
@@ -427,17 +432,33 @@ class PlanExecutorNode(Node):
         if api_slot is None:
             return _MoveOutcome('fail', f'unknown slot {llm_slot!r}')
         canonical = canonical_slot(llm_slot)
-        with self._state_lock:
-            if stack_slot_occupied(self._stack, canonical):
-                return _MoveOutcome(
-                    'fail',
-                    f'target slot {canonical!r} already occupied')
-            chosen = select_cup(self._cups, set(self._stacked_ids), color)
-            tracked, stacked = len(self._cups), len(self._stacked_ids)
-        if chosen is None:
-            return _MoveOutcome('fail', (
-                f'no upright {color} cup available '
-                f'(tracked={tracked}, stacked={stacked})'))
+        # Perception (boxes_filtered -> self._cups) may not have populated
+        # yet when the LLM plan arrives (_execute_next fires the first move
+        # immediately on adopt). Poll up to cup_wait_s for a matching cup
+        # instead of hard-failing the step (which stalls the loop). The lock
+        # is released between tries so _on_boxes can fill self._cups.
+        deadline = time.monotonic() + self._cup_wait_s
+        chosen = None
+        waited = False
+        while True:
+            with self._state_lock:
+                if stack_slot_occupied(self._stack, canonical):
+                    return _MoveOutcome(
+                        'fail',
+                        f'target slot {canonical!r} already occupied')
+                chosen = select_cup(self._cups, set(self._stacked_ids), color)
+                tracked, stacked = len(self._cups), len(self._stacked_ids)
+            if chosen is not None:
+                if waited:
+                    self.get_logger().info(
+                        f'cup ready after wait (tracked={tracked})')
+                break
+            if time.monotonic() >= deadline:
+                return _MoveOutcome('fail', (
+                    f'no upright {color} cup available '
+                    f'(tracked={tracked}, stacked={stacked})'))
+            waited = True
+            time.sleep(0.1)
         tid, (x, y) = chosen
         z = self._move_z
         body = build_move_body(x, y, z)
