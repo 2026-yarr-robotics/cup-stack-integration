@@ -11,10 +11,11 @@ small enough that each perturbed pose stays nearest to its own true cup.
   publish   /hand_eye/boxes   visualization_msgs/MarkerArray
   subscribe /action_result    std_msgs/String JSON   (disturbance sync only)
 
-It shares MEASURED_CUPS and the return-cup disturbance with fake_digital_twin_node
-so both views agree on where every cup is — only the EXO error differs. The topic
-keeps its real name (not a fake_* name) so the real pick_node needs no change when
-a real hand-eye vision node eventually replaces this fake.
+MEASURED_CUPS (the hardcoded GT) lives in this module now — fake_digital_twin_node
+was repurposed as the exo-view stabilizer over the REAL /digital_twin/boxes, so it
+no longer carries cup constants. The topic keeps its real name (not a fake_* name)
+so the real pick_node needs no change when a real hand-eye vision node eventually
+replaces this fake.
 """
 from __future__ import annotations
 
@@ -25,7 +26,25 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
-from fake_digital_twin_node import DISTURBANCE_RETURN_POSES, MEASURED_CUPS
+# Hardcoded ground-truth cup poses for the fine pick. These used to live in
+# fake_digital_twin_node, but that node was repurposed as the exo-view
+# stabilizer (median-filters the REAL /digital_twin/boxes), so the constants
+# now live here — the only remaining consumer. The exo view is real perception
+# in this experiment; hand-eye stays hardcoded GT so the pick loop closes and
+# we can verify exo participation end-to-end.
+#   slot -> (track_id, x, y)  in base_link
+MEASURED_CUPS: dict[str, tuple[int, float, float]] = {
+    'L1_left': (1, 0.250, -0.20),
+    'L1_mid': (2, 0.250, 0.00),
+    'L1_right': (3, 0.250, 0.20),
+    'L2_left': (4, 0.350, -0.20),
+    'L2_right': (5, 0.350, 0.00),
+    'L3_top': (6, 0.350, 0.20),
+}
+# Disturbance scenario (off by default): where a removed cup reappears.
+DISTURBANCE_RETURN_POSES: dict[str, tuple[float, float]] = {
+    'L2_left': (0.250, -0.20),
+}
 
 
 class FakeHandEyeNode(Node):

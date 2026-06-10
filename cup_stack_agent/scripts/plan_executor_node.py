@@ -71,6 +71,13 @@ _LLM_TO_API_SLOT: dict[str, str] = {
     'L3_top':  '3m',
 }
 
+_VERIFIER_TO_CANONICAL_SLOT: dict[str, str] = {
+    'L1_L': 'L1_left', 'L1_M': 'L1_mid', 'L1_R': 'L1_right',
+    'L2_L': 'L2_left', 'L2_R': 'L2_right',
+    'L3_T': 'L3_top',
+}
+_STACK_SLOTS: tuple[str, ...] = tuple(_LLM_TO_API_SLOT)
+
 # Color / class tokens depth_digital_twin writes into box_labels text. Mirror of
 # the skill-manager + perception vocabularies so we agree on pickable cups.
 _KNOWN_COLORS: frozenset[str] = frozenset({
@@ -131,11 +138,58 @@ def parse_label(text: str) -> tuple[str, str, bool]:
     return color, cls, locked
 
 
-def llm_to_api_slot(slot: str | None) -> str | None:
-    """Map a canonical LLM slot (L1_left) to the server API key (1l)."""
+def canonical_slot(slot: str | None) -> str | None:
     if not slot:
         return None
-    return _LLM_TO_API_SLOT.get(slot)
+    return _VERIFIER_TO_CANONICAL_SLOT.get(slot, slot)
+
+
+def normalize_stack(stack: Any) -> dict[str, Any]:
+    out = {slot: None for slot in _STACK_SLOTS}
+    if not isinstance(stack, dict):
+        return out
+    for key, value in stack.items():
+        slot = canonical_slot(str(key))
+        if slot in out:
+            out[slot] = value
+    return out
+
+
+def stack_slot_occupied(stack: dict[str, Any], slot: str | None) -> bool:
+    canonical = canonical_slot(slot)
+    if canonical not in _LLM_TO_API_SLOT:
+        return False
+    value = stack.get(canonical)
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in ('', 'none', 'null', 'empty', 'false')
+    return bool(value)
+
+
+def drop_occupied_steps(
+    steps: list[dict],
+    stack: dict[str, Any],
+) -> tuple[list[dict], list[dict]]:
+    kept = []
+    skipped = []
+    for step in steps:
+        if (
+            step.get('action') == 'pyramid'
+            and stack_slot_occupied(stack, step.get('target_slot'))
+        ):
+            skipped.append(step)
+            continue
+        kept.append(step)
+    return kept, skipped
+
+
+def llm_to_api_slot(slot: str | None) -> str | None:
+    """Map a canonical LLM/verifier slot to the server API key."""
+    canonical = canonical_slot(slot)
+    if not canonical:
+        return None
+    return _LLM_TO_API_SLOT.get(canonical)
 
 
 def select_cup(
@@ -181,6 +235,7 @@ class PlanExecutorNode(Node):
         # stabilizer is not running.
         self.declare_parameter('boxes_topic', '/digital_twin/boxes_filtered')
         self.declare_parameter('stack_track_ids_topic', '/stack_track_ids')
+        self.declare_parameter('stack_topic', '/stack')
         # Coarse move endpoint (robot base_link). pick_node owns the subsequent
         # fine pick + /api/robot/skill/pyramid call.
         self.declare_parameter(
@@ -195,6 +250,7 @@ class PlanExecutorNode(Node):
         move_topic = str(self.get_parameter('move_result_topic').value)
         boxes_topic = str(self.get_parameter('boxes_topic').value)
         stacked_topic = str(self.get_parameter('stack_track_ids_topic').value)
+        stack_topic = str(self.get_parameter('stack_topic').value)
         self._api_url = str(self.get_parameter('api_url_move').value)
         self._timeout = float(self.get_parameter('api_timeout_s').value)
         self._move_z = float(self.get_parameter('move_z').value)
@@ -203,6 +259,7 @@ class PlanExecutorNode(Node):
         self._state_lock = threading.Lock()
         self._cups: dict[int, TrackedCup] = {}
         self._stacked_ids: set[int] = set()
+        self._stack: dict[str, Any] = normalize_stack(None)
         self._plan: list[dict] = []
         self._step_idx: int = 0
         self._busy: bool = False
@@ -213,6 +270,7 @@ class PlanExecutorNode(Node):
             MarkerArray, boxes_topic, self._on_boxes, 10)
         self.create_subscription(
             Int32MultiArray, stacked_topic, self._on_stack_ids, 10)
+        self.create_subscription(String, stack_topic, self._on_stack, 10)
 
         self.get_logger().info(
             f'plan_executor_node: api={self._api_url} '
@@ -243,6 +301,18 @@ class PlanExecutorNode(Node):
     def _on_stack_ids(self, msg) -> None:
         with self._state_lock:
             self._stacked_ids = {int(x) for x in msg.data}
+
+    def _on_stack(self, msg) -> None:
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError as e:
+            self.get_logger().warn(f'/stack invalid JSON: {e}')
+            return
+        if not isinstance(data, dict):
+            self.get_logger().warn('/stack payload is not an object')
+            return
+        with self._state_lock:
+            self._stack = normalize_stack(data)
 
     # ── /llm_output handling ────────────────────────────────────────────────
 
@@ -284,22 +354,42 @@ class PlanExecutorNode(Node):
                 f'/llm_output unknown shape: {list(data.keys())}')
 
     def _adopt_plan(self, steps: list[dict], reason: str) -> None:
+        raw_steps = list(steps) if isinstance(steps, list) else []
         with self._state_lock:
-            self._plan = list(steps)
+            plan, skipped = drop_occupied_steps(raw_steps, self._stack)
+            self._plan = plan
             self._step_idx = 0
-        self.get_logger().info(f'adopt plan ({reason}): {len(steps)} steps')
+        if skipped:
+            self.get_logger().warn(
+                f'adopt plan ({reason}): skipped {len(skipped)} occupied-slot step(s): '
+                f'{[(s.get("step"), s.get("target_slot")) for s in skipped]}')
+        self.get_logger().info(
+            f'adopt plan ({reason}): {len(plan)} executable step(s)')
 
     # ── Step pump ────────────────────────────────────────────────────────────
 
     def _execute_next(self) -> None:
+        skipped = []
         with self._state_lock:
             if self._busy:
                 return
+            while self._step_idx < len(self._plan):
+                step = self._plan[self._step_idx]
+                if (
+                    step.get('action') == 'pyramid'
+                    and stack_slot_occupied(self._stack, step.get('target_slot'))
+                ):
+                    skipped.append((step.get('step'), step.get('target_slot')))
+                    self._step_idx += 1
+                    continue
+                break
             if self._step_idx >= len(self._plan):
                 self.get_logger().info('plan exhausted — awaiting LLM decision')
                 return
             step = self._plan[self._step_idx]
             self._busy = True
+        if skipped:
+            self.get_logger().warn(f'skipped occupied-slot step(s): {skipped}')
         threading.Thread(
             target=self._do_step, args=(step,), daemon=True).start()
 
@@ -335,7 +425,12 @@ class PlanExecutorNode(Node):
         api_slot = llm_to_api_slot(llm_slot)
         if api_slot is None:
             return _MoveOutcome('fail', f'unknown slot {llm_slot!r}')
+        canonical = canonical_slot(llm_slot)
         with self._state_lock:
+            if stack_slot_occupied(self._stack, canonical):
+                return _MoveOutcome(
+                    'fail',
+                    f'target slot {canonical!r} already occupied')
             chosen = select_cup(self._cups, set(self._stacked_ids), color)
             tracked, stacked = len(self._cups), len(self._stacked_ids)
         if chosen is None:
