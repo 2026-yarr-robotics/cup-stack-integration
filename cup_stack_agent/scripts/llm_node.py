@@ -20,6 +20,7 @@ from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from std_msgs.msg import String
 
 from llm_client import (
@@ -68,7 +69,7 @@ class LLMNode(Node):
             String, str(self.get_parameter('llm_input_topic').value),
             self._on_llm_input, 10)
 
-        self.get_logger().info(
+        self.get_logger().debug(
             f'llm_node: model={self._model} url={self._url} '
             f'prompts={prompt_dir}')
 
@@ -133,9 +134,12 @@ def main(args: list[str] | None = None) -> None:
     node = LLMNode()
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

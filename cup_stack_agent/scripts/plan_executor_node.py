@@ -53,6 +53,7 @@ from typing import Any
 try:  # ROS is optional so the pure helpers below stay unit-testable offline.
     import rclpy
     from rclpy.node import Node
+    from rclpy.executors import ExternalShutdownException
     from std_msgs.msg import Int32MultiArray, String
     from visualization_msgs.msg import Marker, MarkerArray
     _HAS_ROS = True
@@ -272,7 +273,7 @@ class PlanExecutorNode(Node):
             Int32MultiArray, stacked_topic, self._on_stack_ids, 10)
         self.create_subscription(String, stack_topic, self._on_stack, 10)
 
-        self.get_logger().info(
+        self.get_logger().debug(
             f'plan_executor_node: api={self._api_url} '
             f'timeout={self._timeout}s move_z={self._move_z} '
             f'dry_run={self._dry_run} move_result={move_topic}')
@@ -530,7 +531,7 @@ def main(args: list[str] | None = None) -> None:
     node = PlanExecutorNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
