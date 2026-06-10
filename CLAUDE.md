@@ -23,8 +23,32 @@ cup-stack-integration/
 - **`cup-stack-server/`** — submodule (`github.com/2026-yarr-robotics/cup-stack-server`)
   holding the robot motion stack: `ros2-cup-stack/` (ROS 2 Humble, MoveIt 2,
   OnRobot gripper), `server/` (FastAPI REST + rosbridge), `frontend/` (React
-  dashboard). It exposes `POST /api/robot/skill/pyramid`, `/api/robot/move`,
-  `/api/robot/config/pyramid`, etc. See its own `CLAUDE.md`.
+  dashboard). It exposes `POST /api/robot/skill/pyramid`,
+  `POST /api/robot/skill/unstack` (the reverse: slot → nested column),
+  `/api/robot/move`, `/api/robot/config/pyramid`, etc. See its own `CLAUDE.md`.
+- **`vision/`** — the real perception submodules: `vision/ros2-depth-point-cloude`
+  (depth_digital_twin: detection + 3D boxes), `vision/ros2-recode-sequence`
+  (RealSense `cameras_only.launch.py`), `vision/vision-node` (cup_stacking_verify:
+  the `/stack` slot verifier).
+
+> ⚠️ **Canonical vision copies live under `vision/` — edit those, not the
+> duplicates.** `vision-node`, `ros2-depth-point-cloude`, and `ros2-recode-sequence`
+> are *also* checked out as nested submodules under
+> `cup-stack-server/yarr-robust-speed-stack/`, but **nothing at runtime uses those
+> nested copies.** The run scripts (`cup-stack-server/server/start.sh`) source
+> `vision/<pkg>/install/setup.bash`, so a change must land in `vision/<pkg>/` (and
+> be `colcon build`-ed there) to take effect. Editing the
+> `yarr-robust-speed-stack/<pkg>` copy is a silent no-op for the live system.
+>
+> Likewise the pyramid **placement** geometry is owned by the FastAPI server
+> (`cup-stack-server/server/server/domains/robot.py`: `PYRAMID_CUP_SPACING`,
+> `PYRAMID_LAYER_HEIGHT`, `DEFAULT_PYRAMID_DEGREE`). The verifier
+> (`vision/vision-node` `verifier_node.py`: `cup_ref_w`, `layer_gap`, `degree`)
+> must mirror those, or judged slots won't line up with where cups are placed.
+> The `yarr-robust-speed-stack/system_state_aggregator/plan_executor_node.py` has
+> its own copy of this geometry but is **not** the runtime executor —
+> `cup_stack_agent/scripts/plan_executor_node.py` is (and it does no pyramid
+> geometry; placement is the FastAPI server's job).
 
 ## Architecture (the closed loop)
 

@@ -88,6 +88,7 @@ Useful environment variables:
 The `cup-stack-server` submodule is the real robot stack and runs independently
 (Docker: nginx + per-domain FastAPI services + rosbridge). It exposes the REST API
 the agent calls — e.g. `POST /api/robot/move`, `POST /api/robot/skill/pyramid`,
+`POST /api/robot/skill/unstack` (reverse: pick a pyramid slot → nest at x,y),
 `GET/POST /api/robot/config/pyramid`. See `cup-stack-server/README` and its
 `CLAUDE.md` / `server/CLAUDE.md` for build, run, and architecture details.
 
