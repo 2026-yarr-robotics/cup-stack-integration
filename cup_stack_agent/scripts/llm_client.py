@@ -54,12 +54,45 @@ def parse_model_json(content: str) -> dict:
 
 # ── Semantic validation (spec §8) ──────────────────────────────────────────
 
-def validate_cold_start(resp: dict) -> list[str]:
-    """Structural + semantic checks for a cold-start planner response (§8.2)."""
+# command alias -> canonical color. Multi-char only: 1-char Korean roots
+# ('파'/'노'/'검') would false-match '파라미드'/'노력'/'검출'.
+_COLOR_ALIASES = {
+    'red': 'red', '레드': 'red', '빨강': 'red', '빨간': 'red',
+    'orange': 'orange', '오렌지': 'orange', '주황': 'orange',
+    'yellow': 'yellow', '옐로': 'yellow', '노랑': 'yellow', '노란': 'yellow',
+    'green': 'green', '그린': 'green', '초록': 'green', '녹색': 'green',
+    'blue': 'blue', '블루': 'blue', '파랑': 'blue', '파란': 'blue',
+    'purple': 'purple', '퍼플': 'purple', '보라': 'purple',
+    'white': 'white', '화이트': 'white', '하얀': 'white', '흰색': 'white',
+    'black': 'black', '블랙': 'black', '검정': 'black', '검은': 'black',
+    'gray': 'gray', 'grey': 'gray', '그레이': 'gray', '회색': 'gray',
+}
+
+
+def validate_cold_start(resp: dict, payload: dict | None = None) -> list[str]:
+    """Structural + semantic checks for a cold-start planner response (§8.2).
+    Partial plans (fewer steps than cup_budget) are allowed; insufficient is
+    rejected when the input has cups and there is no color constraint."""
     errs: list[str] = []
     status = resp.get('status')
     if status not in ('ok', 'unsupported', 'insufficient_resources'):
         errs.append(f'bad status: {status!r}')
+
+    total_available = None
+    cups: dict = {}
+    user_cmd = ''
+    if isinstance(payload, dict):
+        cw = payload.get('current_world_state') or {}
+        raw = cw.get('cups_on_table') or {}
+        if isinstance(raw, dict):
+            cups = {str(k).lower(): int(v) for k, v in raw.items()
+                    if isinstance(v, (int, float))
+                    and not isinstance(v, bool)}     # bool is an int subclass
+            total_available = sum(cups.values())
+        user_cmd = str(payload.get('user_command') or '').lower()
+    requested_colors = {canon for alias, canon in _COLOR_ALIASES.items()
+                        if alias in user_cmd}
+
     if status == 'ok':
         target, plan = resp.get('target'), resp.get('plan')
         if not target or not plan:
@@ -69,14 +102,41 @@ def validate_cold_start(resp: dict) -> list[str]:
         if target.get('cup_budget') != len(slots):
             errs.append('cup_budget != len(target_slots)')
         steps = plan.get('steps') or []
-        if len(steps) != target.get('cup_budget', -1):
-            errs.append('step count != cup_budget')
+        budget = target.get('cup_budget', -1)
+        # PARTIAL plans allowed: 1..min(cup_budget, available cups).
+        if len(steps) < 1:
+            errs.append('status=ok requires at least one step')
+        elif len(steps) > budget:
+            errs.append(f'step count {len(steps)} exceeds cup_budget {budget}')
+        elif (total_available is not None
+              and len(steps) > total_available):
+            errs.append(f'step count {len(steps)} exceeds available cups '
+                        f'{total_available}')
         errs += _check_pyramid_steps(steps)
     else:  # unsupported / insufficient_resources
         if resp.get('plan') is not None:
             errs.append(f'status={status} requires plan=null')
         if not (resp.get('error') or {}).get('code'):
             errs.append(f'status={status} requires error.code')
+        # Semantic guardrail: do NOT accept insufficient when cups are
+        # actually available and there is no color constraint (LLM ignored
+        # e.g. blue:6). A color-constrained command may legitimately be
+        # insufficient (requested color 0), so only reject when unconstrained.
+        if status == 'insufficient_resources' and total_available is not None:
+            if not requested_colors:
+                # no color constraint: any cup means something is buildable
+                if total_available > 0:
+                    errs.append(
+                        f'insufficient_resources but {total_available} cups '
+                        'available with no color constraint')
+            else:
+                # color-constrained: insufficient is valid ONLY if every
+                # requested color has 0 cups; reject if any has cups.
+                avail = sum(cups.get(c, 0) for c in requested_colors)
+                if avail > 0:
+                    errs.append(
+                        f'insufficient_resources but requested color(s) '
+                        f'{sorted(requested_colors)} have {avail} cups')
     return errs
 
 

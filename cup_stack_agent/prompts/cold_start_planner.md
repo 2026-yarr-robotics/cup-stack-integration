@@ -51,10 +51,10 @@ Skill model:
 Rules:
 - If user_command requests an unsupported level (>3), return status="unsupported", plan=null, and error.code="UNSUPPORTED_PATTERN".
 - Color choice is free unless user_command states an explicit color constraint. When unconstrained, fill slots with any available cups — using a SINGLE color for every slot is fully valid. Cup-color variety is NEVER required (a 2- or 3-level pyramid does not need 2 or 3 different colors). When unconstrained, prefer the color(s) with the largest counts.
-- Sufficiency is a pure COUNT check, never a color-variety check: you have enough iff — with no color constraint — the TOTAL of all cups_on_table counts >= cup_budget; or — with color constraints — each constrained color has at least as many cups as the slots it must fill. The number of distinct colors present is irrelevant.
-- Return status="insufficient_resources", plan=null, error.code="INSUFFICIENT_RESOURCES" ONLY when that count check fails (or an explicitly requested color has 0 cups). Never return it merely because only one color is available.
+- COUNT FIRST (pure COUNT check, never a color-variety check): total_cups = the SUM of all cups_on_table values. cups_on_table is a {color: count} map where MOST colors are normally 0 — that is expected; just SUM the counts. The number of distinct or zero-count colors is IRRELEVANT: e.g. {"blue": 6, all others 0} is SIX cups, NOT zero. With a color constraint, count only the constrained color(s).
+- Then build as much as that count allows: if total_cups >= cup_budget, plan the full cup_budget steps; if 0 < total_cups < cup_budget, plan a PARTIAL pyramid of min(cup_budget, total_cups) steps in build order with status="ok" (NEVER refuse for a count shortfall — say in reasoning how many you can build); ONLY if total_cups == 0 (or an explicitly-requested color has 0 cups so not even slot 1 can be filled) return status="insufficient_resources". NEVER return insufficient_resources when total_cups > 0.
 - Each step is one "pyramid" action carrying both "color" and "target_slot".
-- One step per target_slot, in build order, stopping at the normalized target. Step count == cup_budget.
+- One step per target_slot, in build order. Step count = min(cup_budget, available cups); stop early when cups run out (a partial build is fine).
 - Track remaining color counts as your plan consumes cups: each step decrements that color implicitly.
 - Honor color constraints in user_command. A constraint that names a layer/row (e.g. bottom, base, top, N번째 줄/단) applies to EVERY target slot in that layer, not just one. Assign colors layer by layer.
 

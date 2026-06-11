@@ -44,6 +44,7 @@ server — safe before the robot stack is up.
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import urllib.error
@@ -80,6 +81,19 @@ _VERIFIER_TO_CANONICAL_SLOT: dict[str, str] = {
 }
 _STACK_SLOTS: tuple[str, ...] = tuple(_LLM_TO_API_SLOT)
 
+_PYRAMID_CUP_SPACING = 0.078
+_DEFAULT_STACK_CENTER_X = 0.54
+_DEFAULT_STACK_CENTER_Y = 0.0
+_DEFAULT_STACK_DEGREE = 90.0
+_API_SLOT_OFFSETS: dict[str, float] = {
+    "1l": -_PYRAMID_CUP_SPACING,
+    "1m": 0.0,
+    "1r": _PYRAMID_CUP_SPACING,
+    "2l": -_PYRAMID_CUP_SPACING / 2.0,
+    "2r": _PYRAMID_CUP_SPACING / 2.0,
+    "3m": 0.0,
+}
+
 # Color / class tokens depth_digital_twin writes into box_labels text. Mirror of
 # the skill-manager + perception vocabularies so we agree on pickable cups.
 _KNOWN_COLORS: frozenset[str] = frozenset({
@@ -115,6 +129,7 @@ class _MoveOutcome:
     api_slot: str | None = None  # mapped key (1l) pick_node passes to pyramid
     x: float | None = None       # coarse move target XY — pick_node's search center
     y: float | None = None
+    source_tid: int | None = None
 
 
 # ── Pure helpers (no ROS) — unit-tested in test_plan_executor.py ──────────
@@ -155,6 +170,19 @@ def normalize_stack(stack: Any) -> dict[str, Any]:
         if slot in out:
             out[slot] = value
     return out
+
+
+def default_stack_slot_xy(
+    center_x: float = _DEFAULT_STACK_CENTER_X,
+    center_y: float = _DEFAULT_STACK_CENTER_Y,
+    degree: float = _DEFAULT_STACK_DEGREE,
+) -> dict[str, tuple[float, float]]:
+    rad = math.radians(degree)
+    ux, uy = math.cos(rad), math.sin(rad)
+    return {
+        key: (float(center_x) + lat * ux, float(center_y) + lat * uy)
+        for key, lat in _API_SLOT_OFFSETS.items()
+    }
 
 
 def stack_slot_occupied(stack: dict[str, Any], slot: str | None) -> bool:
@@ -198,6 +226,8 @@ def select_cup(
     cups: dict[int, TrackedCup],
     stacked: set[int],
     color: str,
+    excluded_xy: tuple[tuple[float, float], ...] = (),
+    exclude_radius_m: float = 0.0,
 ) -> tuple[int, tuple[float, float]] | None:
     """First upright, non-stacked, located cup of `color` → (track id, (x, y)).
 
@@ -206,6 +236,7 @@ def select_cup(
     interchangeable, so first match (track-id dict order) is fine.
     """
     wanted = color.lower()
+    r2 = max(0.0, exclude_radius_m) ** 2
     for tid, cup in cups.items():
         if cup.cls == 'fallen-cup':
             continue
@@ -215,9 +246,15 @@ def select_cup(
             continue
         if cup.pos is None:
             continue
+        x, y = float(cup.pos[0]), float(cup.pos[1])
+        if r2 > 0.0 and any(
+            (x - sx) * (x - sx) + (y - sy) * (y - sy) <= r2
+            for sx, sy in excluded_xy
+        ):
+            continue
         if cup.color.lower() != wanted:
             continue
-        return tid, (float(cup.pos[0]), float(cup.pos[1]))
+        return tid, (x, y)
     return None
 
 
@@ -238,6 +275,13 @@ class PlanExecutorNode(Node):
         self.declare_parameter('boxes_topic', '/digital_twin/boxes_filtered')
         self.declare_parameter('stack_track_ids_topic', '/stack_track_ids')
         self.declare_parameter('stack_topic', '/stack')
+        self.declare_parameter(
+            "pyramid_config_url",
+            "http://localhost/api/robot/config/pyramid")
+        self.declare_parameter("stack_exclude_radius_m", 0.06)
+        self.declare_parameter("stack_center_x", _DEFAULT_STACK_CENTER_X)
+        self.declare_parameter("stack_center_y", _DEFAULT_STACK_CENTER_Y)
+        self.declare_parameter("stack_degree", _DEFAULT_STACK_DEGREE)
         # Coarse move endpoint (robot base_link). pick_node owns the subsequent
         # fine pick + /api/robot/skill/pyramid call.
         self.declare_parameter(
@@ -249,6 +293,22 @@ class PlanExecutorNode(Node):
         # how long to wait for perception (boxes_filtered -> _cups) before
         # failing a move when no matching cup is tracked yet (cold-start race).
         self.declare_parameter('cup_wait_s', 5.0)
+        # Hand-eye fallback: when exo perception (boxes_filtered) sees no
+        # cup, fall back to /hand_eye/boxes (base_link xy, what pick_node
+        # uses) for the coarse move, and publish its graspable cup counts
+        # (excluding the build/stack area) so the aggregator can supplement
+        # cups_on_table when exo is empty.
+        self.declare_parameter('handeye_fallback', True)
+        self.declare_parameter('hand_eye_boxes_topic', '/hand_eye/boxes')
+        self.declare_parameter('handeye_cups_topic',
+                               '/vision/cups_on_table_handeye')
+        # drop a hand-eye cup this long after its last marker (stale guard:
+        # /hand_eye/boxes stops or misses a DELETE -> no phantom cup).
+        self.declare_parameter('handeye_ttl_s', 1.5)
+        # once exo has been empty this long, use hand-eye immediately
+        # instead of burning the whole cup_wait_s.
+        self.declare_parameter('handeye_fallback_grace_s', 0.5)
+        self.declare_parameter("reserved_track_ttl_s", 45.0)
         self.declare_parameter('dry_run', True)
 
         llm_out = str(self.get_parameter('llm_output_topic').value)
@@ -256,16 +316,38 @@ class PlanExecutorNode(Node):
         boxes_topic = str(self.get_parameter('boxes_topic').value)
         stacked_topic = str(self.get_parameter('stack_track_ids_topic').value)
         stack_topic = str(self.get_parameter('stack_topic').value)
+        self._pyramid_config_url = str(
+            self.get_parameter("pyramid_config_url").value)
+        self._stack_exclude_radius_m = float(
+            self.get_parameter("stack_exclude_radius_m").value)
+        self._handeye_fallback = bool(
+            self.get_parameter('handeye_fallback').value)
+        handeye_boxes_topic = str(
+            self.get_parameter('hand_eye_boxes_topic').value)
+        handeye_cups_topic = str(
+            self.get_parameter('handeye_cups_topic').value)
+        self._handeye_ttl_s = float(self.get_parameter('handeye_ttl_s').value)
+        self._handeye_grace_s = float(
+            self.get_parameter('handeye_fallback_grace_s').value)
+        self._stack_center_x = float(self.get_parameter("stack_center_x").value)
+        self._stack_center_y = float(self.get_parameter("stack_center_y").value)
+        self._stack_degree = float(self.get_parameter("stack_degree").value)
         self._api_url = str(self.get_parameter('api_url_move').value)
         self._timeout = float(self.get_parameter('api_timeout_s').value)
         self._move_z = float(self.get_parameter('move_z').value)
         self._cup_wait_s = float(self.get_parameter('cup_wait_s').value)
+        self._reserved_track_ttl_s = float(
+            self.get_parameter("reserved_track_ttl_s").value)
         self._dry_run = bool(self.get_parameter('dry_run').value)
 
         self._state_lock = threading.Lock()
         self._cups: dict[int, TrackedCup] = {}
+        self._handeye_cups: dict[int, dict] = {}   # /hand_eye/boxes id->{xy,color}
         self._stacked_ids: set[int] = set()
         self._stack: dict[str, Any] = normalize_stack(None)
+        self._stack_slot_xy: dict[str, tuple[float, float]] = default_stack_slot_xy(
+            self._stack_center_x, self._stack_center_y, self._stack_degree)
+        self._reserved_ids: dict[int, float] = {}
         self._plan: list[dict] = []
         self._step_idx: int = 0
         self._busy: bool = False
@@ -277,11 +359,59 @@ class PlanExecutorNode(Node):
         self.create_subscription(
             Int32MultiArray, stacked_topic, self._on_stack_ids, 10)
         self.create_subscription(String, stack_topic, self._on_stack, 10)
+        self._handeye_pub = self.create_publisher(
+            String, handeye_cups_topic, 10)
+        self.create_subscription(
+            MarkerArray, handeye_boxes_topic, self._on_handeye_boxes, 10)
+        self.create_timer(0.5, self._publish_handeye_counts)
+        self.create_timer(2.0, self._refresh_pyramid_slots)
+        self._refresh_pyramid_slots()
 
         self.get_logger().debug(
             f'plan_executor_node: api={self._api_url} '
             f'timeout={self._timeout}s move_z={self._move_z} '
             f'dry_run={self._dry_run} move_result={move_topic}')
+
+    def _active_reserved_ids_unlocked(self) -> set[int]:
+        now = time.monotonic()
+        expired = [tid for tid, until in self._reserved_ids.items() if until <= now]
+        for tid in expired:
+            self._reserved_ids.pop(tid, None)
+        return set(self._reserved_ids)
+
+    def _reserve_source_track(self, tid: int | None) -> None:
+        if tid is None or self._reserved_track_ttl_s <= 0.0:
+            return
+        self._reserved_ids[int(tid)] = time.monotonic() + self._reserved_track_ttl_s
+
+    def _refresh_pyramid_slots(self) -> None:
+        if not self._pyramid_config_url:
+            return
+        try:
+            with urllib.request.urlopen(
+                self._pyramid_config_url,
+                timeout=0.5,
+            ) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            self.get_logger().warn(
+                f"pyramid config refresh failed: {e}",
+                throttle_duration_sec=5.0)
+            return
+        slots = data.get("slots") if isinstance(data, dict) else None
+        if not isinstance(slots, dict):
+            return
+        slot_xy: dict[str, tuple[float, float]] = {}
+        for key, val in slots.items():
+            if not isinstance(val, dict):
+                continue
+            try:
+                slot_xy[str(key)] = (float(val["x"]), float(val["y"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if slot_xy:
+            with self._state_lock:
+                self._stack_slot_xy = slot_xy
 
     # ── Perception tracking ────────────────────────────────────────────────
 
@@ -418,10 +548,74 @@ class PlanExecutorNode(Node):
         self._publish_move_result(step, outcome)
         with self._state_lock:
             if outcome.result == 'success':
+                self._reserve_source_track(outcome.source_tid)
                 self._step_idx += 1
             self._busy = False
 
     # ── pyramid step: resolve color→cup, move arm above it ───────────────────
+
+    # ── Hand-eye fallback (used when exo perception is empty) ──────────────
+    def _on_handeye_boxes(self, msg) -> None:
+        with self._state_lock:
+            for m in msg.markers:
+                if m.action == Marker.DELETEALL:
+                    self._handeye_cups.clear()
+                    continue
+                if m.action == Marker.DELETE:
+                    if m.ns in ('box_top', 'boxes', 'box_labels'):
+                        self._handeye_cups.pop(m.id, None)
+                    continue
+                entry = self._handeye_cups.setdefault(
+                    m.id, {'xy': None, 'color': 'unknown', 'seen_at': 0.0})
+                entry['seen_at'] = time.monotonic()
+                if m.ns == 'box_top':
+                    entry['xy'] = (float(m.pose.position.x),
+                                   float(m.pose.position.y))
+                elif m.ns == 'box_labels':
+                    col, _cls, _lk = parse_label(m.text)
+                    if col != 'unknown':
+                        entry['color'] = col
+
+    def _graspable_handeye_unlocked(self) -> list:
+        """Hand-eye cups OUTSIDE the build/stack area (same exclusion as
+        select_cup) -> [(id, (x,y), color)]. Placed/stacked cups sit at slot
+        positions and are dropped, so we never re-grab a built cup."""
+        slots = tuple(self._stack_slot_xy.values())
+        r2 = self._stack_exclude_radius_m ** 2
+        now = time.monotonic()
+        out = []
+        for hid, c in self._handeye_cups.items():
+            xy = c.get('xy')
+            if xy is None:
+                continue
+            if now - c.get('seen_at', 0.0) > self._handeye_ttl_s:
+                continue   # stale — /hand_eye/boxes stopped or missed DELETE
+            x, y = xy
+            if any((x - sx) ** 2 + (y - sy) ** 2 <= r2 for sx, sy in slots):
+                continue   # inside the build area = placed cup, not graspable
+            out.append((hid, xy, c.get('color') or 'unknown'))
+        out.sort(key=lambda t: t[0])   # deterministic (by marker id)
+        return out
+
+    def _select_handeye_cup(self, color):
+        with self._state_lock:
+            grasp = self._graspable_handeye_unlocked()
+        if not grasp:
+            return None
+        same = [(i, xy) for (i, xy, col) in grasp if col == color]
+        pool = same if same else [(i, xy) for (i, xy, col) in grasp]
+        hid, xy = pool[0]
+        # negative id namespace -> never collides with an exo track id in
+        # the reservation / source_tid space.
+        return (-(int(hid) + 1), xy)
+
+    def _publish_handeye_counts(self) -> None:
+        with self._state_lock:
+            grasp = self._graspable_handeye_unlocked()
+        counts: dict[str, int] = {}
+        for _i, _xy, col in grasp:
+            counts[col] = counts.get(col, 0) + 1
+        self._handeye_pub.publish(String(data=json.dumps(counts)))
 
     def _do_move(
         self, color: str | None, llm_slot: str | None,
@@ -437,7 +631,8 @@ class PlanExecutorNode(Node):
         # immediately on adopt). Poll up to cup_wait_s for a matching cup
         # instead of hard-failing the step (which stalls the loop). The lock
         # is released between tries so _on_boxes can fill self._cups.
-        deadline = time.monotonic() + self._cup_wait_s
+        start = time.monotonic()
+        deadline = start + self._cup_wait_s
         chosen = None
         waited = False
         while True:
@@ -446,14 +641,30 @@ class PlanExecutorNode(Node):
                     return _MoveOutcome(
                         'fail',
                         f'target slot {canonical!r} already occupied')
-                chosen = select_cup(self._cups, set(self._stacked_ids), color)
+                chosen = select_cup(
+                    self._cups,
+                    set(self._stacked_ids) | self._active_reserved_ids_unlocked(),
+                    color,
+                    tuple(self._stack_slot_xy.values()),
+                    self._stack_exclude_radius_m)
                 tracked, stacked = len(self._cups), len(self._stacked_ids)
             if chosen is not None:
                 if waited:
                     self.get_logger().info(
                         f'cup ready after wait (tracked={tracked})')
                 break
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            # hand-eye fallback: once exo has been empty for grace_s, take it
+            # immediately instead of waiting out the full cup_wait_s.
+            if self._handeye_fallback and now - start >= self._handeye_grace_s:
+                he = self._select_handeye_cup(color)
+                if he is not None:
+                    self.get_logger().warn(
+                        f'exo cups empty — hand-eye fallback cup #{he[0]} '
+                        f'at ({he[1][0]:.3f},{he[1][1]:.3f})')
+                    chosen = he
+                    break
+            if now >= deadline:
                 return _MoveOutcome('fail', (
                     f'no upright {color} cup available '
                     f'(tracked={tracked}, stacked={stacked})'))
@@ -467,7 +678,8 @@ class PlanExecutorNode(Node):
             f'→ {llm_slot} (api={api_slot})')
         result, reason = self._post_move(body, source_tid=tid, llm_slot=llm_slot)
         return _MoveOutcome(
-            result, reason, color=color, api_slot=api_slot, x=x, y=y)
+            result, reason, color=color, api_slot=api_slot, x=x, y=y,
+            source_tid=tid)
 
     def _post_move(self, body: dict, *, source_tid: int,
                    llm_slot: str | None) -> tuple[str, str | None]:
@@ -535,6 +747,7 @@ class PlanExecutorNode(Node):
             out['slot'] = outcome.api_slot
             out['x'] = outcome.x   # coarse move target — pick_node's search center
             out['y'] = outcome.y
+            out['source_tid'] = outcome.source_tid
         else:
             out['failure_reason'] = outcome.reason
         try:

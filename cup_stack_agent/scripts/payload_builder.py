@@ -275,6 +275,14 @@ class GoalStateBuilder:
         steps = self._current_plan.get('remaining_steps') or []
         return steps[0] if steps else None
 
+    def remaining_slots(self) -> set:
+        """Canonical target_slots of steps NOT yet executed (future slots)."""
+        if not self._current_plan:
+            return set()
+        steps = self._current_plan.get('remaining_steps') or []
+        return {str(s.get('target_slot')) for s in steps
+                if s.get('target_slot')}
+
     def mode(self) -> str:
         """cold_start while no plan exists, in_flight once a plan is set."""
         return 'cold_start' if self._current_plan is None else 'in_flight'

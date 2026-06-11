@@ -109,7 +109,7 @@ class LLMNode(Node):
                     f'attempt {attempt}: bad JSON ({e}); raw[{len(content)}b] '
                     f'head={content[:1000]!r} tail={content[-1000:]!r}')
                 continue
-            errors = (validate_cold_start(parsed) if cold
+            errors = (validate_cold_start(parsed, payload) if cold
                       else validate_inflight(parsed, payload))
             if errors:
                 self.get_logger().warn(

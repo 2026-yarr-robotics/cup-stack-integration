@@ -233,6 +233,11 @@ trap cleanup EXIT
 
 mkdir -p "${LOG_DIR}"
 export PYTHONUNBUFFERED=1
+# Match the rest of the running stack (cameras/robot/vision run with
+# ROS_LOCALHOST_ONLY=1 on domain 21); without these the agent lands on a
+# different DDS config and cannot discover them.
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-21}"
+export ROS_LOCALHOST_ONLY=1
 echo "[start.sh] logs: ${LOG_DIR}"
 wait_for_ollama
 
@@ -284,7 +289,8 @@ if [[ "${HAND_EYE_MODE}" == "real" ]]; then
     -p imgsz:=1280 \
     -p conf:=0.35 \
     -p base_frame:=base_link \
-    -p target_class_name:=upright-cup
+    -p target_class_name:=upright-cup \
+    -p pick_point_method:=centroid
 else
   launch fake_hand_eye python3 scripts/fake_hand_eye_node.py \
     --ros-args \

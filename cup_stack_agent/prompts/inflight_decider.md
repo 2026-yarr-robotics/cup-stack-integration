@@ -24,7 +24,8 @@ cups_on_table is {color: count}; same-color cups are interchangeable.
 Decision rules:
 - continue if last action succeeded, observed state delta matches it, and current_goal is feasible.
 - replan if last action failed, state changed unexpectedly, current_goal is infeasible, or last action reported success but the observed delta did NOT occur (e.g. pyramid "success" yet target_slot still null and table count unchanged). Trust a success only when state reflects it.
-- done only if all target slots are full, remaining_steps is [], and last action succeeded.
+- done if all target slots are full, remaining_steps is [], and last action succeeded.
+- ALSO done when cups run out before the target is complete: if no color has count > 0 for the next null slot, the build cannot continue — return done (partial build) and say 'out of cups' in reasoning. Do NOT replan into a step that has no available cup.
 
 State deltas:
 - pyramid success => table color count -1, target_slot filled, gripper empty.
@@ -36,7 +37,7 @@ Replan:
 - Preserve current_plan.target when present; otherwise preserve target_pattern.
 - Reset step numbering from 1.
 - Fill ONLY the null slots in current_plan.target.target_slots (skip already-filled slots), one pyramid step per null slot, in build order; if using legacy target_pattern, fill null slots up to that pattern's last slot.
-- Pick only colors with count > 0.
+- Pick only colors with count > 0. If NO color has count > 0, do not replan — return done (out of cups).
 
 Return JSON only:
 {"reasoning":str,"decision":"continue"|"replan"|"done","plan":null|{"target":object,"steps":[...]}|{"target_pattern":str,"steps":[...]}}

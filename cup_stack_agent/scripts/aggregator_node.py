@@ -36,7 +36,8 @@ def _cup_count(payload: str) -> int:
         return 0
     if not isinstance(obj, dict):
         return 0
-    return sum(int(v) for v in obj.values() if isinstance(v, (int, float)))
+    return sum(int(v) for v in obj.values()
+               if isinstance(v, (int, float)) and not isinstance(v, bool))
 
 
 class AggregatorNode(Node):
@@ -57,6 +58,10 @@ class AggregatorNode(Node):
         # converges on the full count before triggering the one-shot cold start.
         self.declare_parameter('command_settle_s', 3.0)
         self.declare_parameter('publish_period_s', 0.5)
+        # hold the last non-empty cups_on_table through a transient exo
+        # flicker-to-0 so a momentary 0 never reaches the LLM as INSUFFICIENT.
+        # Only a SUSTAINED empty (>= zero_debounce_s) publishes 0.
+        self.declare_parameter('zero_debounce_s', 1.0)
 
         self._cups_pub = self.create_publisher(
             String, str(self.get_parameter('cups_out_topic').value), 10)
@@ -72,6 +77,12 @@ class AggregatorNode(Node):
             String, str(self.get_parameter('stack_in_topic').value),
             self._relay_stack, 10)
 
+        self._last_nonzero_data = None
+        self._zero_since = None
+        self._zero_debounce_s = float(
+            self.get_parameter('zero_debounce_s').value)
+        self._command_settle_s = float(
+            self.get_parameter('command_settle_s').value)
         self._command_published = False
         self._started_at = time.monotonic()
         self._cups_seen_at: float | None = None   # first non-empty cups report
@@ -86,14 +97,46 @@ class AggregatorNode(Node):
             f'{self.get_parameter("stack_out_topic").value}')
 
     # ------------------------------------------------------------------
-    def _relay_cups(self, msg: String) -> None:
-        self._cups_pub.publish(msg)
-        if self._cups_seen_at is None and _cup_count(msg.data) > 0:
+    def _mark_cups_seen(self, eff: int) -> None:
+        if self._cups_seen_at is None and eff > 0:
             self._cups_seen_at = time.monotonic()
             self.get_logger().info(
                 'aggregator_node: first non-empty cups_on_table seen '
-                f'({_cup_count(msg.data)} cups) — command gate open in '
-                f'{float(self.get_parameter("command_settle_s").value):.1f}s')
+                f'({eff} cups) — command gate open in '
+                f'{self._command_settle_s:.1f}s')
+
+    def _exo_truly_empty(self) -> bool:
+        """exo has reported 0 for >= zero_debounce_s — a SUSTAINED empty,
+        not a noise flicker. Only then do we publish the empty world."""
+        return (self._zero_since is not None
+                and (time.monotonic() - self._zero_since)
+                >= self._zero_debounce_s)
+
+    def _emit_exo_empty(self, exo_data: str) -> None:
+        # flicker (< debounce): HOLD the last non-empty exo value (exo may be
+        # momentarily noisy). hand-eye is a goal_state decision, not here.
+        if not self._exo_truly_empty():
+            held = (self._last_nonzero_data
+                    if self._last_nonzero_data is not None else exo_data)
+            self._cups_pub.publish(String(data=held))
+            self._mark_cups_seen(_cup_count(held))
+            return
+        # exo SUSTAINED empty -> publish the empty world; goal_state applies
+        # hand-eye at its decision moment if appropriate.
+        self._cups_pub.publish(String(data=exo_data if exo_data else '{}'))
+        self._mark_cups_seen(0)
+
+    def _relay_cups(self, msg: String) -> None:
+        exo = _cup_count(msg.data)
+        if exo > 0:
+            self._zero_since = None
+            self._last_nonzero_data = msg.data
+            self._cups_pub.publish(msg)
+            self._mark_cups_seen(exo)
+            return
+        if self._zero_since is None:
+            self._zero_since = time.monotonic()
+        self._emit_exo_empty(msg.data)
 
     def _relay_stack(self, msg: String) -> None:
         self._stack_pub.publish(msg)

@@ -53,15 +53,62 @@ class GoalStatePublisher(Node):
         # until expected-state simulation lands with the executor integration.
         self.declare_parameter('publish_on_world_change', False)
         self.declare_parameter('strict_json', True)
+        # Freeze the perception world-state while a pyramid action is in
+        # flight (arm in view -> counts fluctuate). Resume on /action_result.
+        # Stops mid-execution noise corrupting the world / spoofing the
+        # action-reflection check.
+        self.declare_parameter('freeze_world_during_action', True)
+        self.declare_parameter('freeze_timeout_s', 60.0)
+        # After /action_result (arm homed) keep the world frozen this much
+        # longer so perception settles (~2s to stabilise) before resuming.
+        self.declare_parameter('unfreeze_settle_s', 1.5)
+        # Hand-eye fallback at the DECISION moment only (cold-start /
+        # post-action unfreeze): if exo cups_on_table is empty THEN, use the
+        # hand-eye counts. Not a continuous supplement.
+        self.declare_parameter('handeye_fallback', True)
+        self.declare_parameter('handeye_cups_topic',
+                               '/vision/cups_on_table_handeye')
+        self.declare_parameter('handeye_ttl_s', 1.5)
+        # Hold a FUTURE step's slot null until its /stack occupancy is stable
+        # this long — a raw-stack false-positive on a not-yet-built slot must
+        # not flip the world to 'all filled' -> premature done. The just-built
+        # slot still reflects immediately; next-step execution is NOT delayed.
+        self.declare_parameter('future_slot_debounce_s', 3.0)
+        # Give up waiting for a fresh /cups_on_table after an action and
+        # advance on the last world if perception stalls this long.
+        self.declare_parameter('pending_fresh_timeout_s', 5.0)
 
         self._strict = bool(self.get_parameter('strict_json').value)
         self._on_world_change = bool(
             self.get_parameter('publish_on_world_change').value)
+        self._freeze_enabled = bool(
+            self.get_parameter('freeze_world_during_action').value)
+        self._freeze_timeout_s = float(
+            self.get_parameter('freeze_timeout_s').value)
+        self._unfreeze_settle_s = float(
+            self.get_parameter('unfreeze_settle_s').value)
+        self._handeye_fallback = bool(
+            self.get_parameter('handeye_fallback').value)
+        self._handeye_ttl_s = float(
+            self.get_parameter('handeye_ttl_s').value)
+        self._handeye_counts: dict = {}
+        self._handeye_seen_at = 0
+        self._future_debounce_s = float(
+            self.get_parameter('future_slot_debounce_s').value)
+        self._pending_future: dict = {}   # slot -> {key, since(ns)}
+        self._next_slot_blocked = False   # next-step slot occupancy unresolved
+        self._pending_fresh_timeout_s = float(
+            self.get_parameter('pending_fresh_timeout_s').value)
+        self._cups_seen_ns = 0            # last APPLIED /cups_on_table (ns)
+        self._pending_action_at_ns = 0    # when the pending action arrived
         out_topic = str(self.get_parameter('llm_input_topic').value)
 
         self._builder = GoalStateBuilder()
         self._pending_action_result = None
         self._pending_action_before_world = None
+        self._action_in_flight = False
+        self._freeze_started_at = None
+        self._unfreeze_at = None   # ns deadline for the post-settle unfreeze
 
         self._pub = self.create_publisher(String, out_topic, 10)
         self.create_subscription(
@@ -82,6 +129,12 @@ class GoalStatePublisher(Node):
         self.create_subscription(
             String, str(self.get_parameter('llm_output_topic').value),
             self._on_llm_output, 10)
+        self.create_subscription(
+            String, str(self.get_parameter('handeye_cups_topic').value),
+            self._on_handeye_cups, 10)
+        # Wall-clock check of the unfreeze deadline / freeze timeout so it
+        # fires even if perception stops (the gate alone is tick-driven).
+        self.create_timer(0.2, self._freeze_tick)
 
         self.get_logger().debug(
             f'goal_state_publisher: out={out_topic} '
@@ -93,7 +146,10 @@ class GoalStatePublisher(Node):
         obj = self._parse(msg.data, '/cups_on_table')
         if obj is None:
             return
+        if self._world_frozen():
+            return  # pyramid in flight — hold the world steady
         self._builder.set_world(obj, None)
+        self._cups_seen_ns = self.get_clock().now().nanoseconds
         if self._maybe_publish_pending_action():
             return
         if self._on_world_change:
@@ -103,6 +159,9 @@ class GoalStatePublisher(Node):
         obj = self._parse(msg.data, '/stack')
         if obj is None:
             return
+        if self._world_frozen():
+            return  # pyramid in flight — hold the world steady
+        obj = self._debounce_future_slots(obj)
         self._builder.set_world(None, obj)
         if self._maybe_publish_pending_action():
             return
@@ -120,6 +179,7 @@ class GoalStatePublisher(Node):
         self.get_logger().info(f'/user_command received: {cmd!r}')
         self._pending_action_result = None
         self._pending_action_before_world = None
+        self._unfreeze_world('new user command')
         self._builder.set_user_command(cmd)
         self._publish()  # cold-start trigger
 
@@ -127,11 +187,13 @@ class GoalStatePublisher(Node):
         obj = self._parse(msg.data, '/action_result')
         if obj is None:
             return
+        self._schedule_unfreeze('post-place home settle')
         before = (self._builder.previous_world_state()
                   or self._builder.current_world_state())
         self._builder.on_action_result(obj)
         if obj.get('result') == 'success' and obj.get('action') == 'pyramid':
             self._pending_action_result = obj
+            self._pending_action_at_ns = self.get_clock().now().nanoseconds
             self._pending_action_before_world = before
             if not self._maybe_publish_pending_action():
                 self.get_logger().info(
@@ -144,15 +206,89 @@ class GoalStatePublisher(Node):
         obj = self._parse(msg.data, '/llm_output')
         if obj is None:
             return
+        decision = obj.get('decision')
         if obj.get('status') == 'ok':
             self._builder.set_plan(obj)
-        elif obj.get('decision') == 'replan' and obj.get('plan') is not None:
+        elif decision == 'replan' and obj.get('plan') is not None:
             self._builder.set_plan(obj.get('plan'))
-        elif obj.get('decision') == 'done':
+        elif decision == 'done':
             self._builder.set_plan(None)
+        # decision == 'continue' (or other): keep the existing plan.
+
+        # Freeze ONLY when a step will actually execute. current_goal() is
+        # the next remaining step (None when empty/done), so this covers
+        # cold-start, replan, an EMPTY replan (no freeze -> no stuck freeze),
+        # AND the normal 'continue' path (plan_executor starts the next step
+        # on 'continue', so the world must be frozen for it too).
+        if decision != 'done' and self._builder.current_goal() is not None:
+            self._freeze_world(f"action dispatched ({decision or 'cold_start'})")
+        else:
+            self._unfreeze_world('no executable step / done')
+
+    # ── World freeze during action execution ──────────────────────────────
+    def _freeze_world(self, reason: str) -> None:
+        if not self._freeze_enabled:
+            return
+        if not self._action_in_flight:
+            self.get_logger().info(f'world FROZEN during action ({reason})')
+        self._action_in_flight = True
+        self._freeze_started_at = self.get_clock().now()
+        self._unfreeze_at = None
+
+    def _unfreeze_world(self, reason: str) -> None:
+        if self._action_in_flight:
+            self.get_logger().info(f'world UNFROZEN ({reason})')
+        self._action_in_flight = False
+        self._freeze_started_at = None
+        self._unfreeze_at = None
+
+    def _schedule_unfreeze(self, reason: str) -> None:
+        """Keep frozen for unfreeze_settle_s more (perception settles after
+        the arm homes), then a perception tick past the deadline resumes."""
+        if not (self._freeze_enabled and self._action_in_flight):
+            return
+        self._unfreeze_at = (self.get_clock().now().nanoseconds
+                             + int(self._unfreeze_settle_s * 1e9))
+        self.get_logger().info(
+            f'world unfreeze in {self._unfreeze_settle_s:.1f}s ({reason})')
+
+    def _freeze_tick(self) -> None:
+        """Wall-clock: release the freeze on the post-settle deadline or the
+        safety timeout, independent of perception ticks."""
+        if not self._action_in_flight:
+            return
+        if (self._unfreeze_at is not None
+                and self.get_clock().now().nanoseconds >= self._unfreeze_at):
+            self._unfreeze_world('post-place settle done')
+            return
+        if self._freeze_started_at is not None:
+            elapsed = (self.get_clock().now()
+                       - self._freeze_started_at).nanoseconds * 1e-9
+            if elapsed > self._freeze_timeout_s:
+                self.get_logger().warn(
+                    'world freeze timed out (no /action_result) — resuming '
+                    'perception')
+                self._unfreeze_world('timeout')
+
+    def _world_frozen(self) -> bool:
+        # Pure gate (no side effects); release timing is the timer's job.
+        return self._freeze_enabled and self._action_in_flight
 
     def _maybe_publish_pending_action(self) -> bool:
         if self._pending_action_result is None:
+            return False
+        # P1: require a fresh /cups_on_table applied since the action (freeze
+        # suppresses cups during execution), time-bounded so a stalled
+        # perception still advances on the last world.
+        if self._cups_seen_ns < self._pending_action_at_ns:
+            age = (self.get_clock().now().nanoseconds
+                   - self._pending_action_at_ns) * 1e-9
+            if age < self._pending_fresh_timeout_s:
+                return False
+            self.get_logger().warn(
+                'no fresh /cups_on_table since action — proceeding on last world')
+        # next step's slot occupancy still debouncing -> hold the decision.
+        if self._next_slot_blocked:
             return False
         current = self._builder.current_world_state()
         if not action_result_reflected(
@@ -185,9 +321,89 @@ class GoalStatePublisher(Node):
 
     # ── Publish ───────────────────────────────────────────────────────────
 
+    def _on_handeye_cups(self, msg: String) -> None:
+        obj = self._parse(msg.data, '/vision/cups_on_table_handeye')
+        if obj is None:
+            return
+        self._handeye_counts = {
+            str(k): int(v) for k, v in obj.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            and int(v) > 0}
+        self._handeye_seen_at = self.get_clock().now().nanoseconds
+
+    def _handeye_fresh(self) -> bool:
+        if not (self._handeye_fallback and self._handeye_counts):
+            return False
+        age = (self.get_clock().now().nanoseconds
+               - self._handeye_seen_at) * 1e-9
+        return age <= self._handeye_ttl_s
+
+    def _apply_handeye_to_payload(self, payload: dict) -> None:
+        """DECISION-moment only: if exo cups_on_table is empty when an
+        llm_input is about to be built, override the PAYLOAD's cups with the
+        hand-eye counts. Overriding the payload (not the builder) keeps the
+        real exo world as the reflection baseline (previous_world_state)."""
+        cw = payload.get('current_world_state')
+        if not isinstance(cw, dict):
+            return
+        cups = cw.get('cups_on_table') or {}
+        total = sum(int(v) for v in cups.values()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool))
+        if total > 0:
+            return
+        if self._handeye_fresh():
+            self.get_logger().info(
+                f'exo empty at decision -> hand-eye fill {self._handeye_counts}')
+            cw['cups_on_table'] = dict(self._handeye_counts)
+
+    def _debounce_future_slots(self, raw_stack: dict) -> dict:
+        """Reflect the just-built slot immediately, but hold a FUTURE step's
+        slot at null until its occupancy is stable for future_slot_debounce_s
+        (transient false-positive -> dropped). Does NOT delay execution."""
+        self._next_slot_blocked = False
+        if not isinstance(raw_stack, dict):
+            return raw_stack
+        future = self._builder.remaining_slots()
+        goal = self._builder.current_goal()
+        next_slot = str(goal.get('target_slot')) if goal else None
+        for slot in list(self._pending_future):
+            if slot not in future:
+                self._pending_future.pop(slot, None)   # executed -> drop
+        if not future:
+            return raw_stack
+        now = self.get_clock().now().nanoseconds
+        out = dict(raw_stack)
+        for slot in future:
+            val = raw_stack.get(slot)
+            if val is None:
+                self._pending_future.pop(slot, None)
+                continue
+            key = val if isinstance(val, str) else json.dumps(val, sort_keys=True)
+            p = self._pending_future.get(slot)
+            if p is None or p['key'] != key:
+                self._pending_future[slot] = {'key': key, 'since': now}
+                p = self._pending_future[slot]
+            stable = (now - p['since']) * 1e-9 >= self._future_debounce_s
+            if slot == next_slot:
+                # NEXT step's slot: a real occupancy here would collide with
+                # the next place, so HOLD the decision until it reverts (false
+                # positive) or stays stable (commit -> LLM replans/done/skip).
+                if stable:
+                    self.get_logger().info(
+                        f'next slot {slot} occupancy stable '
+                        f'{self._future_debounce_s:.0f}s -> commit (LLM replans)')
+                    # leave out[slot] = val (real occupancy)
+                else:
+                    self._next_slot_blocked = True
+            elif not stable:
+                out[slot] = None                       # later future -> mask
+        return out
+
     def _publish(self) -> None:
         try:
             payload = self._builder.build_payload()
+            if self._handeye_fallback:
+                self._apply_handeye_to_payload(payload)
             msg = String()
             msg.data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             self._pub.publish(msg)
