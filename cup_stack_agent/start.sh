@@ -36,6 +36,7 @@ STABILIZE_WINDOW_S="${STABILIZE_WINDOW_S:-1.0}"
 # Hold a track this long after its last fresh detection so a brief boxes
 # dropout (e.g. exo depth stutter) doesn't flush all tracks → tracked=0.
 STABILIZE_TRACK_TIMEOUT_S="${STABILIZE_TRACK_TIMEOUT_S:-30.0}"
+STABILIZE_MERGE_DISTANCE_M="${STABILIZE_MERGE_DISTANCE_M:-0.055}"
 # Hand-eye source for pick_node's fine pick (/hand_eye/boxes):
 #   real = upright_cup_pose_node (real hand camera YOLO-seg -> base_link /tf)
 #   fake = fake_hand_eye_node (GT). Revert with: HAND_EYE_MODE=fake ./start.sh
@@ -265,7 +266,8 @@ launch digital_twin_stabilizer python3 scripts/digital_twin_stabilizer_node.py \
   --ros-args \
   -p method:="${STABILIZE_METHOD}" \
   -p window_s:="${STABILIZE_WINDOW_S}" \
-  -p track_timeout_s:="${STABILIZE_TRACK_TIMEOUT_S}"
+  -p track_timeout_s:="${STABILIZE_TRACK_TIMEOUT_S}" \
+  -p merge_distance_m:="${STABILIZE_MERGE_DISTANCE_M}"
 # hand-eye source for pick_node fine pick (/hand_eye/boxes). HAND_EYE_MODE:
 #   real = upright_cup_pose_node (hand cam YOLO-seg -> base_link via /tf FK)
 #   fake = fake_hand_eye_node (GT)

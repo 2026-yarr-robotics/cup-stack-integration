@@ -48,6 +48,14 @@ def clamp_step(step: tuple[float, float, float],
     return step[0] * scale, step[1] * scale, step[2] * scale
 
 
+def distance(a: tuple[float, float, float],
+             b: tuple[float, float, float]) -> float:
+    return math.sqrt(
+        (a[0] - b[0]) * (a[0] - b[0]) +
+        (a[1] - b[1]) * (a[1] - b[1]) +
+        (a[2] - b[2]) * (a[2] - b[2]))
+
+
 class DigitalTwinStabilizerNode(Node):
     def __init__(self, **kwargs) -> None:
         super().__init__('digital_twin_stabilizer_node', **kwargs)
@@ -64,6 +72,7 @@ class DigitalTwinStabilizerNode(Node):
         self.declare_parameter('smooth_alpha', 0.25)
         self.declare_parameter('momentum_beta', 0.7)
         self.declare_parameter('max_step_m', 0.015)
+        self.declare_parameter('merge_distance_m', 0.055)
         # Deprecated compatibility parameters. They no longer affect output.
         self.declare_parameter('count_window_s', 2.5)
         self.declare_parameter('confirm_frac', 0.5)
@@ -74,9 +83,14 @@ class DigitalTwinStabilizerNode(Node):
         self._alpha = float(self.get_parameter('smooth_alpha').value)
         self._beta = float(self.get_parameter('momentum_beta').value)
         self._max_step_m = float(self.get_parameter('max_step_m').value)
+        self._merge_distance_m = float(
+            self.get_parameter('merge_distance_m').value)
 
         # Pending raw position updates are consumed once per publish tick.
         self._pending_pos: dict[int, tuple[float, float, float]] = {}
+        # Raw detector track id -> canonical stabilized id. This prevents one
+        # physical cup from being held as many cups when upstream reassigns ids.
+        self._aliases: dict[int, int] = {}
         self._labels: dict[int, str] = {}
         self._last_seen: dict[int, float] = {}
         self._smoothed: dict[int, tuple[float, float, float]] = {}
@@ -95,6 +109,7 @@ class DigitalTwinStabilizerNode(Node):
             f'digital_twin_stabilizer: {self._method} '
             f'alpha={self._alpha:.2f} beta={self._beta:.2f} '
             f'max_step={self._max_step_m:.3f}m '
+            f'merge={self._merge_distance_m:.3f}m '
             f'timeout={self._track_timeout_s:.1f}s; '
             f'{self.get_parameter("boxes_in_topic").value} -> '
             f'{self.get_parameter("boxes_out_topic").value}')
@@ -114,17 +129,51 @@ class DigitalTwinStabilizerNode(Node):
             if m.ns == 'box_top':
                 if m.header.frame_id:
                     self._frame_id = m.header.frame_id
-                self._pending_pos[m.id] = (
+                pos = (
                     float(m.pose.position.x),
                     float(m.pose.position.y),
                     float(m.pose.position.z))
-                self._last_seen[m.id] = now
+                tid = self._canonical_id(m.id, pos)
+                self._pending_pos[tid] = pos
+                self._last_seen[tid] = now
+                if tid != m.id:
+                    self._move_label(m.id, tid)
             elif m.ns == 'box_labels':
-                self._labels[m.id] = m.text
-                self._last_seen[m.id] = now
+                tid = self._aliases.get(m.id, m.id)
+                self._labels[tid] = m.text
+                self._last_seen[tid] = now
+
+    def _canonical_id(self, raw_id: int,
+                      pos: tuple[float, float, float]) -> int:
+        mapped = self._aliases.get(raw_id)
+        if mapped is not None:
+            return mapped
+        best_id = raw_id
+        best_dist = self._merge_distance_m
+        candidates = set(self._smoothed) | set(self._pending_pos)
+        for tid in candidates:
+            ref = self._pending_pos.get(tid) or self._smoothed.get(tid)
+            if ref is None:
+                continue
+            d = distance(pos, ref)
+            if d <= best_dist:
+                best_id = tid
+                best_dist = d
+        self._aliases[raw_id] = best_id
+        return best_id
+
+    def _move_label(self, raw_id: int, canonical_id: int) -> None:
+        label = self._labels.pop(raw_id, None)
+        if label is not None:
+            self._labels[canonical_id] = label
+        self._last_seen.pop(raw_id, None)
+        self._pending_pos.pop(raw_id, None)
 
     def _drop(self, track_id: int) -> None:
         self._pending_pos.pop(track_id, None)
+        for raw_id, canonical_id in list(self._aliases.items()):
+            if raw_id == track_id or canonical_id == track_id:
+                self._aliases.pop(raw_id, None)
         self._labels.pop(track_id, None)
         self._last_seen.pop(track_id, None)
         self._smoothed.pop(track_id, None)
