@@ -156,3 +156,16 @@ None 파싱 사망 방지). 검증: `bash -n` + 양그룹 false 스모크런 (Ol
 
 fusion 뷰 통합으로 start_isaac.sh vision-fusion 창을 `rviz:=false`로. launch
 기본값(true)은 실기·수동용으로 유지 (`script/vision_rviz.sh VIEW=fusion`).
+
+### 3) ROS_LOCALHOST_ONLY 비호환 — 2번째 근본 원인
+
+1)의 이식 후에도 relay가 데이터를 못 받았다. upstream start.sh의
+`export ROS_LOCALHOST_ONLY=1`(실기 전 참여자 공통)이 원인 — Isaac 스택의
+다른 창들은 미설정이라 lo-only 참여자에게 데이터 경로가 안 열린다 (토픽
+이름은 보이는데 /vision/* 10Hz가 relay 컨텍스트에서 0Hz; fork start.sh엔
+이 줄 자체가 없어 fork에선 미발현). 기본값으로 완화하고 start_isaac.sh
+vision-relay/agent 창이 `ROS_LOCALHOST_ONLY=0`을 넘긴다.
+
+**라이브 검증** (사용자 세션에서 relay 재기동): Ollama 스킵, YOLO 로드
+(`10.4M params`), `/cups_on_table` 10Hz 중계, `/hand_eye/boxes` 3.9Hz,
+hand 캠 `cups=7 base=7 published=7` — hand-eye 보정 체인 정상.
