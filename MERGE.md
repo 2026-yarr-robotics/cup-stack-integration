@@ -70,3 +70,43 @@ cherry-pick `605581d` 시 `start.sh`에서 충돌. 원인은 **경로 깊이**: 
 서브모듈 → 부모. 서브모듈 피처 브랜치 push로 핀 커밋이 원격에서 도달 가능해진다
 (원하면 각 서브모듈 main으로 ff-merge 후 push — SHA 동일하게 유지). 마지막에
 슈퍼프로젝트 `feat/isaac-integration` push.
+
+---
+
+## 후속 이식 2차 (2026-06-12, A–E 포트 이후 fork 추가분 + main 합류)
+
+A–E 포트(`f7b01e4`) 이후에도 fork와 원본 main 양쪽이 전진해 2차 작업을 수행했다.
+
+### 1) origin/main 합류 (`ea3855d`)
+
+원본 main이 base `07c3d1b`에서 `59f31e8`로 전진 (staged speed-up, hand-eye pick
+robustness). 슈퍼프로젝트 머지 시 gitlink 충돌 2건은 **각 서브모듈 피처 브랜치에
+origin/main을 머지**해 해소 — 브랜치 SHA를 보존하면서 양쪽 작업을 모두 핀:
+
+| 서브모듈 | 충돌 (브랜치 vs main) | 해소 핀 |
+|---|---|---|
+| `ros2-cup-stack` | `c1a3e2f` vs `4fc2983`(fast profiles) | `e45c3c6` (머지, 무충돌) |
+| `server` | `9dbf697` vs `f10e964`(movel speed) | `9bbf7fd` (머지, 무충돌) |
+
+### 2) 포트 이후 fork 추가분 이식 (핀 bump 커밋 1건)
+
+| 서브모듈 | 핀 | 내용 |
+|---|---|---|
+| `yarr-isaac-playground` | `94c293c`→`090f2ff` | isaac 4커밋 cherry-pick `-x`: occlusion reset 렌더 fix(`22022ea`), occlusion_stand reset(`bc5283b`), layer-height seating grid(`a44f6bc`), C++ 브리지 카메라 writer 실시간화(`5fe9fda`, start_isaac.sh auto-merge) |
+| `ros2-depth-point-cloude` | `b79c3e6`→`3ea3984` | origin/main 그대로 (coast-idle republish, YOLO weight path) |
+| `vision-node` | `47f2e79`→`992f778` | origin/main 그대로 (verifier cp 0.450) |
+
+### 3) 1차 포트 누락 수정 (`090f2ff`에 포함)
+
+`config/sim_params.yaml`의 `robot.urdf`가 구구조
+`../cup-stack-server/ros2-cup-stack/...`를 가리키고 있었다 — flatten-paths가
+start/stop_isaac.sh만 재매핑하고 yaml은 놓침. `robot_loader.py`가
+PLAYGROUND_ROOT 기준으로 resolve하므로 신구조에서 URDF 로드 실패였을 것.
+`../ros2-cup-stack/...`로 수정, resolve 확인.
+
+### 검증 / 미검증 (2차)
+
+- ✅ cherry-pick 충돌 없음(`start_isaac.sh` auto-merge 내용 검수), `bash -n` 통과
+- ✅ 머지 파일 `py_compile` 통과 (runtime.py, place_cup_at.py, robot.py)
+- ✅ urdf 경로 신구조에서 resolve 확인
+- ⚠️ **빌드/런타임(colcon, ROS, Isaac Sim) 여전히 미검증**
