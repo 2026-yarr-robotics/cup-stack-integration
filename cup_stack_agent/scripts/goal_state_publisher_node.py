@@ -124,6 +124,14 @@ class GoalStatePublisher(Node):
         # 0.3 s settle wait even begins on a perfectly aligned home return.
         self.declare_parameter('scan_sync_timeout_s', 6.0)
         self.declare_parameter('scan_arm_grace_s', 1.5)
+        # Hard ceiling on the world-reflection hold: action_result_reflected
+        # had NO timeout, so a placed cup the verifier never confirms (vision
+        # miss, drop, geometry mismatch) stalled the loop FOREVER (observed
+        # 2026-06-13: 6+ min stuck after a pyramid place whose track was
+        # identity-hijacked into the neighbour slot). On timeout publish
+        # anyway — the LLM sees the unreflected world and decides
+        # retry/replan, same philosophy as the recovery/cups timeouts.
+        self.declare_parameter('action_reflect_timeout_s', 12.0)
 
         self._strict = bool(self.get_parameter('strict_json').value)
         self._on_world_change = bool(
@@ -174,6 +182,8 @@ class GoalStatePublisher(Node):
         self._scan_event_seen = False   # any event ⇒ scan FSM is alive
         self._scan_frozen_ns = 0        # event-payload 't' of last 'frozen'
         self._scan_capstart_ns = 0      # event-payload 't' of capture_start
+        self._reflect_timeout_s = float(
+            self.get_parameter('action_reflect_timeout_s').value)
 
         self._pub = self.create_publisher(String, out_topic, 10)
         self.create_subscription(
@@ -479,7 +489,14 @@ class GoalStatePublisher(Node):
             self._pending_action_before_world,
             current,
         ):
-            return False
+            age = (self.get_clock().now().nanoseconds
+                   - self._pending_action_at_ns) * 1e-9
+            if age < self._reflect_timeout_s:
+                return False
+            self.get_logger().warn(
+                f'action result NOT reflected in the world after '
+                f'{self._reflect_timeout_s:.0f}s — publishing anyway so the '
+                f'LLM can decide retry/replan: {self._pending_action_result}')
         result = self._pending_action_result
         self._pending_action_result = None
         self._pending_action_before_world = None
