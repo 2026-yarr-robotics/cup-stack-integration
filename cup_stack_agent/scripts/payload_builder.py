@@ -285,10 +285,19 @@ class GoalStateBuilder:
                 self._held_color = None
         if not self._current_plan:
             return
+        if result.get('result') != 'success':
+            return
         steps = self._current_plan.get('remaining_steps') or []
-        if (result.get('result') == 'success' and steps
-                and steps[0].get('step') == result.get('step')):
-            self._current_plan['remaining_steps'] = steps[1:]
+        for i, step in enumerate(steps):
+            if step.get('step') == result.get('step'):
+                # plan_executor silently drops steps whose slot is already
+                # occupied (no action_result is ever emitted for them), so a
+                # success can land mid-list. Consume the skipped steps along
+                # with the matched one — advancing only on an exact head
+                # match would freeze remaining_steps/current_goal for the
+                # rest of the run (stale plan -> LLM emits an invalid done).
+                self._current_plan['remaining_steps'] = steps[i + 1:]
+                break
 
     # ── Derived views ─────────────────────────────────────────────────────
 

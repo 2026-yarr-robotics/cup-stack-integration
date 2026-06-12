@@ -71,6 +71,62 @@ class GoalStateBuilderTest(unittest.TestCase):
         )
         self.assertEqual(len(payload['current_plan']['remaining_steps']), 1)
 
+    def test_success_consumes_skipped_steps(self):
+        # plan_executor drops occupied-slot steps WITHOUT emitting an
+        # action_result, so a success may arrive for a mid-list step. The
+        # builder must consume the skipped steps too, or remaining_steps/
+        # current_goal stay frozen for the rest of the run.
+        builder = GoalStateBuilder()
+        builder.set_plan({
+            'target': {'base_levels': 3, 'cup_budget': 5},
+            'steps': [
+                {'step': 1, 'action': 'pyramid', 'color': 'blue',
+                 'target_slot': 'L1_mid'},     # occupied -> silently skipped
+                {'step': 2, 'action': 'pyramid', 'color': 'blue',
+                 'target_slot': 'L1_right'},
+                {'step': 3, 'action': 'pyramid', 'color': 'blue',
+                 'target_slot': 'L2_left'},
+            ],
+        })
+
+        builder.on_action_result({
+            'step': 2,
+            'action': 'pyramid',
+            'result': 'success',
+            'color': 'blue',
+            'target_slot': 'L1_right',
+        })
+        payload = builder.build_payload()
+
+        self.assertEqual(
+            payload['current_goal'],
+            {'step': 3, 'action': 'pyramid', 'color': 'blue',
+             'target_slot': 'L2_left'},
+        )
+        self.assertEqual(len(payload['current_plan']['remaining_steps']), 1)
+
+    def test_unmatched_or_failed_result_does_not_advance(self):
+        builder = GoalStateBuilder()
+        builder.set_plan({
+            'target': {'base_levels': 3, 'cup_budget': 2},
+            'steps': [
+                {'step': 1, 'action': 'pyramid', 'color': 'red',
+                 'target_slot': 'L1_left'},
+                {'step': 2, 'action': 'pyramid', 'color': 'red',
+                 'target_slot': 'L1_mid'},
+            ],
+        })
+        builder.on_action_result({
+            'step': 9, 'action': 'pyramid', 'result': 'success',
+            'color': 'red', 'target_slot': 'L1_left',
+        })
+        builder.on_action_result({
+            'step': 1, 'action': 'pyramid', 'result': 'fail',
+            'color': 'red', 'target_slot': 'L1_left',
+        })
+        payload = builder.build_payload()
+        self.assertEqual(len(payload['current_plan']['remaining_steps']), 2)
+
     def test_action_result_waits_for_expected_world_delta(self):
         result = {
             'step': 1,
