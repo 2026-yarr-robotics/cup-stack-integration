@@ -23,6 +23,9 @@ RECOVERY_TIMEOUT_S="${RECOVERY_TIMEOUT_S:-240.0}"
 FREEZE_TIMEOUT_S="${FREEZE_TIMEOUT_S:-240.0}"
 EXO_XY_ERROR_M="${EXO_XY_ERROR_M:-0.02}"
 MODEL="${MODEL:-qwen3.6:35b}"
+# LLM 호출 타임아웃(s). GPU 를 Isaac 렌더/YOLO 와 나누는 디지털 트윈에서는
+# 생성이 ~1 tok/s 까지 떨어져 기본 120s 로는 플랜 생성이 끊긴다.
+LLM_TIMEOUT_S="${LLM_TIMEOUT_S:-120}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
 OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-${OLLAMA_URL%/api/chat}}"
 OLLAMA_BASE_URL="${OLLAMA_BASE_URL%/}"
@@ -373,7 +376,8 @@ if [[ "${WITH_LLM}" == "true" ]]; then
   launch llm_node python3 scripts/llm_node.py \
     --ros-args \
     -p model:="${MODEL}" \
-    -p ollama_url:="${OLLAMA_URL}"
+    -p ollama_url:="${OLLAMA_URL}" \
+    -p timeout_seconds:="${LLM_TIMEOUT_S}"
   launch plan_executor python3 scripts/plan_executor_node.py \
     --ros-args \
     -p api_url_move:="${API_URL}" \
