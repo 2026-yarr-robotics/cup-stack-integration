@@ -1,0 +1,1 @@
+../ros2-skill-manager/run_skill_manager.sh

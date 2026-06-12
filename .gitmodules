@@ -20,6 +20,6 @@
 [submodule "ros2-recode-sequence"]
 	path = ros2-recode-sequence
 	url = https://github.com/2026-yarr-robotics/ros2-recode-sequence.git
-[submodule "tools/ros2-skill-manager"]
-	path = tools/ros2-skill-manager
+[submodule "ros2-skill-manager"]
+	path = ros2-skill-manager
 	url = https://github.com/2026-yarr-robotics/ros2-skill-manager.git

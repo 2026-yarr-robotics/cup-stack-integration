@@ -6,49 +6,59 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 `cup-stack-integration` is the top-level integration layer that drives a Doosan
 M0609 cup-stacking robot from a natural-language command through an LLM planning
-loop and a REST control server. It ties two pieces together:
+loop and a REST control server.
+
+> **Layout note (2026-06-12 flatten):** the `cup-stack-server` aggregation layer
+> and the `vision/` directory were **dissolved**. All leaf repos are now
+> submodules at the integration **root** (pinned to each repo's latest tip). The
+> old `yarr-robust-speed-stack` duplicate copies are gone.
 
 ```
 cup-stack-integration/
-├── cup_stack_agent/     # LLM closed-loop ROS 2 experiment (planner → executor)
-├── cup-stack-server/    # git submodule: robot control stack (ROS + FastAPI + web)
-└── docs/                # integration-level docs
+├── cup_stack_agent/           # LLM closed-loop ROS 2 experiment (planner → executor) — own code
+├── server/                    # submodule: FastAPI REST + rosbridge gateway
+├── ros2-cup-stack/            # submodule: ROS 2 Humble, MoveIt 2, OnRobot gripper
+│   └── ros2/src/doosan-robot2 # nested submodule (@yarr-integration): M0609 driver
+├── frontend/                  # submodule: React dashboard
+├── fallen-cup-recovery/       # submodule (@released): fallen-cup recovery skill
+├── ros2-depth-point-cloude/   # submodule: depth_digital_twin (detection + 3D boxes)
+├── ros2-recode-sequence/      # submodule: recode_sequence (cameras) — merge into depth pending
+├── vision-node/               # submodule: cup_stacking_verify (/stack slot verifier)
+├── ros2-skill-manager/        # submodule: operator GUI (Pick/Pyramid/UpdateInput) + run_skill_manager.sh
+├── script/                    # launcher symlinks → server/{start,stop,attach,bringup_real} &
+│                              #   ros2-skill-manager/run_skill_manager.sh; + send_command.sh, vision_rviz.sh
+├── docs/                      # integration-level docs
+└── CLAUDE.md
 ```
+
+> Operational scripts live in their owning submodule (`server/{start,stop,attach,
+> bringup_real_31}.sh`, demo scripts in `server/script/`, `ros2-skill-manager/run_skill_manager.sh`);
+> the root `script/` holds **symlinks** to them plus the integration-owned
+> `send_command.sh` and `vision_rviz.sh`.
 
 - **`cup_stack_agent/`** — ROS 2 Python nodes that turn a user command
   ("3단 피라미드 쌓아줘") into pyramid pick-and-place API calls. Perception is
   faked but emitted over the *same* ROS topics the real pipeline uses, so the
   planner/executor/API path is exercised end-to-end. Full spec:
   `cup_stack_agent/docs/experiment_runbook.md` and the project `README.md`.
-- **`cup-stack-server/`** — submodule (`github.com/2026-yarr-robotics/cup-stack-server`)
-  holding the robot motion stack: `ros2-cup-stack/` (ROS 2 Humble, MoveIt 2,
-  OnRobot gripper), `server/` (FastAPI REST + rosbridge), `frontend/` (React
-  dashboard). It exposes `POST /api/robot/skill/pyramid`,
-  `POST /api/robot/skill/unstack` (the reverse: slot → nested column),
-  `/api/robot/move`, `/api/robot/config/pyramid`, etc. See its own `CLAUDE.md`.
-- **`vision/`** — the real perception submodules: `vision/ros2-depth-point-cloude`
-  (depth_digital_twin: detection + 3D boxes), `vision/ros2-recode-sequence`
-  (RealSense `cameras_only.launch.py`), `vision/vision-node` (cup_stacking_verify:
-  the `/stack` slot verifier).
+- **`server/`** — FastAPI REST + rosbridge gateway. Exposes
+  `POST /api/robot/skill/pyramid`, `POST /api/robot/skill/unstack` (slot → nested
+  column), `/api/robot/move`, `/api/robot/config/pyramid`, etc. `server/start.sh`
+  is the single tmux entrypoint; it sources sibling submodules via `../<pkg>/install/setup.bash`.
+- **`ros2-cup-stack/`** — ROS 2 Humble cup_stack skill + MoveIt 2; nests
+  `doosan-robot2` under `ros2/src/`.
+- **perception** — `ros2-depth-point-cloude` (`depth_digital_twin`: detection + 3D
+  boxes), `ros2-recode-sequence` (`recode_sequence`: cameras; archived upstream —
+  planned to merge into depth), and `vision-node` (`cup_stacking_verify`: the
+  `/stack` slot verifier).
 
-> ⚠️ **Canonical vision copies live under `vision/` — edit those, not the
-> duplicates.** `vision-node`, `ros2-depth-point-cloude`, and `ros2-recode-sequence`
-> are *also* checked out as nested submodules under
-> `cup-stack-server/yarr-robust-speed-stack/`, but **nothing at runtime uses those
-> nested copies.** The run scripts (`cup-stack-server/server/start.sh`) source
-> `vision/<pkg>/install/setup.bash`, so a change must land in `vision/<pkg>/` (and
-> be `colcon build`-ed there) to take effect. Editing the
-> `yarr-robust-speed-stack/<pkg>` copy is a silent no-op for the live system.
->
-> Likewise the pyramid **placement** geometry is owned by the FastAPI server
-> (`cup-stack-server/server/server/domains/robot.py`: `PYRAMID_CUP_SPACING`,
-> `PYRAMID_LAYER_HEIGHT`, `DEFAULT_PYRAMID_DEGREE`). The verifier
-> (`vision/vision-node` `verifier_node.py`: `cup_ref_w`, `layer_gap`, `degree`)
-> must mirror those, or judged slots won't line up with where cups are placed.
-> The `yarr-robust-speed-stack/system_state_aggregator/plan_executor_node.py` has
-> its own copy of this geometry but is **not** the runtime executor —
-> `cup_stack_agent/scripts/plan_executor_node.py` is (and it does no pyramid
-> geometry; placement is the FastAPI server's job).
+> ⚠️ **Pyramid placement geometry is owned by the FastAPI server**
+> (`server/server/domains/robot.py`: `PYRAMID_CUP_SPACING`, `PYRAMID_LAYER_HEIGHT`,
+> `DEFAULT_PYRAMID_DEGREE`). The verifier (`vision-node/.../verifier_node.py`:
+> `cup_ref_w`, `layer_gap`, `degree`) must mirror those, or judged slots won't line
+> up with where cups are placed. The runtime executor is
+> `cup_stack_agent/scripts/plan_executor_node.py` (coarse `/move`, no pyramid
+> geometry; placement is the server's job).
 
 ## Architecture (the closed loop)
 
@@ -87,21 +97,28 @@ bash -n start.sh
 
 ## Submodules & commits
 
-- Hierarchy: `cup-stack-integration` (branch `v1.1`) ▷ `cup-stack-server` (`main`)
-  ▷ `{server, ros2-cup-stack, yarr-robust-speed-stack}`.
-- Changes **inside the `cup-stack-server` tree** (incl. its `server` and
-  `ros2-cup-stack` submodules) are authored as **dwl21 <nggus5@gmail.com>**.
-  The top-level `cup-stack-integration` repo keeps its own author (`sonicwarp`).
-- To advance a submodule pointer: commit/push in the inner repo first, then
-  `git add <submodule>` and commit the pointer bump in the parent. The
-  `yarr-robust-speed-stack` submodule is usually dirty — leave it unstaged.
+- Flat hierarchy: `cup-stack-integration` (`main`) ▷ root submodules
+  `{server, ros2-cup-stack (▷ doosan-robot2), frontend, fallen-cup-recovery,
+  ros2-depth-point-cloude, vision-node, ros2-skill-manager}`. Fresh clone:
+  `git submodule update --init --recursive`.
+- Commits **inside any submodule** (server, ros2-cup-stack, frontend,
+  fallen-cup-recovery, ros2-depth-point-cloude, vision-node, …) are authored as
+  **dwl21 <nggus5@gmail.com>**. The top-level `cup-stack-integration` repo uses the
+  checkout's own git user.
+- Submodule changes go via a `chore/…` branch + PR in the inner repo, then bump
+  the pointer in the parent (`git add <submodule>` → commit). Pointers track each
+  repo's latest default-branch tip (`fallen-cup-recovery` → `released`).
 - Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`).
 
-## Deployment note (the "31" host)
+## Deployment
 
-The live system runs from a **separate checkout** at `/home/ssu/cup-stack`
-(not this integration checkout). `./start.sh` there brings up the `cup-stack`
-tmux session and the Docker stack; the live API is `yarr-api-31.simplyimg.com`.
-To ship a server change: commit/push here, then in `/home/ssu/cup-stack/server`
-`git pull` and `docker compose build robot && docker compose up -d --force-recreate robot`
+See [`docs/deploy_migration_policy.md`](docs/deploy_migration_policy.md) for the
+post-flatten deployment policy. In short: the live "31" host historically ran from
+a **separate `cup-stack-server` checkout** at `/home/ssu/cup-stack`
+(`docker compose` + the `cup-stack` tmux session; live API
+`yarr-api-31.simplyimg.com`). The policy migrates that deploy onto a checkout of
+this flattened integration repo (the `server/start.sh` relative paths were already
+fixed for the root layout). To ship a server change: merge the submodule PR, bump
+the pointer here, then on the deploy host `git pull --recurse-submodules` and
+`docker compose build robot && docker compose up -d --force-recreate robot`
 (`restart` does not pick up image or volume changes).

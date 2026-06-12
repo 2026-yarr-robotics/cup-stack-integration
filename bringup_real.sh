@@ -1,1 +1,0 @@
-cup-stack-server/server/bringup_real_31.sh
