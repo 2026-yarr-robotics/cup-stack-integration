@@ -41,8 +41,8 @@ STABILIZE_MERGE_DISTANCE_M="${STABILIZE_MERGE_DISTANCE_M:-0.055}"
 #   real = upright_cup_pose_node (real hand camera YOLO-seg -> base_link /tf)
 #   fake = fake_hand_eye_node (GT). Revert with: HAND_EYE_MODE=fake ./start.sh
 HAND_EYE_MODE="${HAND_EYE_MODE:-real}"
-HAND_EYE_WEIGHTS="${HAND_EYE_WEIGHTS:-/home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt}"
-HAND_EYE_CALIB="${HAND_EYE_CALIB:-/home/ssu/cup-stack-integration/cup-stack-server/fallen-cup-recovery/dsr_practice/config/T_gripper2camera.npy}"
+HAND_EYE_WEIGHTS="${HAND_EYE_WEIGHTS:-/home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt}"
+HAND_EYE_CALIB="${HAND_EYE_CALIB:-/home/ssu/cup-stack-integration/fallen-cup-recovery/dsr_practice/config/T_gripper2camera.npy}"
 HAND_EYE_DEVICE="${HAND_EYE_DEVICE:-cuda}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_ID}}"

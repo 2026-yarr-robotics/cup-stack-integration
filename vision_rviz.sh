@@ -6,7 +6,7 @@
 # and the /stack slot verifier — independently of full system bring-up.
 #
 # This script is a VIEWER ONLY. It does NOT start cameras or detection nodes —
-# bring those up with cup-stack-server/server/start.sh (or the live system)
+# bring those up with server/start.sh (or the live system)
 # first, then run this to watch their output. (Set LAUNCH_PIPELINE=true to also
 # launch the detection pipeline from here; off by default — see below.)
 #
@@ -49,9 +49,9 @@ fi
 # Canonical vision workspaces (vision/<pkg> — NOT the yarr-robust-speed-stack
 # duplicates). Sourcing these resolves the custom message types and the rviz
 # configs shipped in each package's share/.
-DEPTH_DT_SETUP="$ROOT_DIR/vision/ros2-depth-point-cloude/install/setup.bash"
-VISION_NODE_SETUP="$ROOT_DIR/vision/vision-node/install/setup.bash"
-RECODE_SETUP="$ROOT_DIR/vision/ros2-recode-sequence/install/setup.bash"
+DEPTH_DT_SETUP="$ROOT_DIR/ros2-depth-point-cloude/install/setup.bash"
+VISION_NODE_SETUP="$ROOT_DIR/vision-node/install/setup.bash"
+RECODE_SETUP="$ROOT_DIR/ros2-recode-sequence/install/setup.bash"
 
 # shellcheck disable=SC1090
 source "$ROS_SETUP"
@@ -65,8 +65,8 @@ for ws in "$RECODE_SETUP" "$DEPTH_DT_SETUP" "$VISION_NODE_SETUP"; do
 done
 
 # Locate the .rviz config shipped by the vision packages.
-DT_SHARE="$ROOT_DIR/vision/ros2-depth-point-cloude/install/depth_digital_twin/share/depth_digital_twin/rviz"
-VERIFY_SHARE="$ROOT_DIR/vision/vision-node/install/cup_stacking_verify/share/cup_stacking_verify/rviz"
+DT_SHARE="$ROOT_DIR/ros2-depth-point-cloude/install/depth_digital_twin/share/depth_digital_twin/rviz"
+VERIFY_SHARE="$ROOT_DIR/vision-node/install/cup_stacking_verify/share/cup_stacking_verify/rviz"
 case "$VIEW" in
     digital_twin|boxes|detect) RVIZ_CFG="$DT_SHARE/digital_twin.rviz" ;;
     fusion)                    RVIZ_CFG="$DT_SHARE/fusion.rviz" ;;

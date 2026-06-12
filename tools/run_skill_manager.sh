@@ -18,8 +18,8 @@ ROBOT_API_BASE="${ROBOT_API_BASE:-http://localhost}"
 API_TIMEOUT_S="${API_TIMEOUT_S:-180.0}"
 
 source /opt/ros/humble/setup.bash
-source "$HOME/cup-stack-integration/vision/ros2-depth-point-cloude/install/setup.bash"
-source "$HOME/cup-stack-integration/vision/vision-node/install/setup.bash"
+source "$HOME/cup-stack-integration/ros2-depth-point-cloude/install/setup.bash"
+source "$HOME/cup-stack-integration/vision-node/install/setup.bash"
 source "$HOME/cup-stack-integration/tools/ros2-skill-manager/install/setup.bash"
 
 echo "[skill-manager] api base=${ROBOT_API_BASE}  timeout=${API_TIMEOUT_S}s"

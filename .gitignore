@@ -8,5 +8,3 @@ logs/
 /install/
 /log/
 
-# skill-manager는 별도 도구 clone (nested .git/build/install 추적 금지; wrapper만 커밋)
-/tools/ros2-skill-manager/
