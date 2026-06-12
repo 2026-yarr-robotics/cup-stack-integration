@@ -10,8 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from plan_executor_node import (  # noqa: E402
     TrackedCup,
     build_move_body,
-    fallen_counts,
     llm_to_api_slot,
+    parse_fallen_count,
     parse_label,
     select_cup,
 )
@@ -47,37 +47,23 @@ class PlanExecutorTest(unittest.TestCase):
             {'x': 0.280, 'y': -0.15, 'z': 0.45, 'mode': 'absolute'},
         )
 
-    def test_fallen_counts_only_fallen_class(self):
-        cups = {
-            1: TrackedCup(pos=(0.3, 0.0, 0.0), color='red',
-                          cls='fallen-cup', locked=True),
-            2: TrackedCup(pos=(0.3, 0.1, 0.0), color='red',
-                          cls='upright-cup', locked=True),
-            3: TrackedCup(pos=(0.3, 0.2, 0.0), color='blue',
-                          cls='cup', locked=True),
-            4: TrackedCup(pos=(0.3, 0.3, 0.0), color='red',
-                          cls='fallen-cup', locked=True),
-        }
-        self.assertEqual(fallen_counts(cups, set()), {'red': 2})
+    def test_parse_fallen_count_valid_samples(self):
+        self.assertEqual(parse_fallen_count({'count': 2}), 2)
+        self.assertEqual(parse_fallen_count({'count': 0}), 0)
+        self.assertEqual(parse_fallen_count({'count': '3'}), 3)
 
-    def test_fallen_counts_excludes_stacked_and_posless(self):
-        cups = {
-            1: TrackedCup(pos=(0.3, 0.0, 0.0), color='red',
-                          cls='fallen-cup', locked=True),
-            2: TrackedCup(pos=None, color='blue',
-                          cls='fallen-cup', locked=True),
-            3: TrackedCup(pos=(0.3, 0.2, 0.0), color='green',
-                          cls='fallen-cup', locked=True),
-        }
-        self.assertEqual(
-            fallen_counts(cups, {3}), {'red': 1})
+    def test_parse_fallen_count_unusable_returns_none(self):
+        # A message that is not a valid hand-eye sample must NOT become a
+        # count — a false 0 would fail-fast a recovery whose cup is there.
+        self.assertIsNone(parse_fallen_count(None))
+        self.assertIsNone(parse_fallen_count('garbage'))
+        self.assertIsNone(parse_fallen_count({}))
+        self.assertIsNone(parse_fallen_count({'red': 1}))
+        self.assertIsNone(parse_fallen_count({'count': 'bad'}))
+        self.assertIsNone(parse_fallen_count({'count': True}))
 
-    def test_fallen_counts_empty_when_no_fallen(self):
-        cups = {
-            1: TrackedCup(pos=(0.3, 0.0, 0.0), color='red',
-                          cls='upright-cup', locked=True),
-        }
-        self.assertEqual(fallen_counts(cups, set()), {})
+    def test_parse_fallen_count_clamps_negative(self):
+        self.assertEqual(parse_fallen_count({'count': -1}), 0)
 
 
 if __name__ == '__main__':

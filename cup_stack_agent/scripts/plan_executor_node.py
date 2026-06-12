@@ -263,27 +263,25 @@ def build_move_body(x: float, y: float, z: float, mode: str = 'absolute') -> dic
     return {'x': float(x), 'y': float(y), 'z': float(z), 'mode': mode}
 
 
-def fallen_counts(
-    cups: dict[int, TrackedCup],
-    stacked: set[int],
-) -> dict[str, int]:
-    """Tracked fallen-cup markers per color → ``{color: count}``.
+def parse_fallen_count(obj: Any) -> int | None:
+    """/fallen_cups payload → count, or None when it is not a valid sample.
 
-    Source for the LLM payload's top-level ``fallen`` map: exo digital-twin
-    labels carry both class (`fallen-cup`) and color, which the hand-eye
-    recovery perception (/fallen_cup/*) does not. Stacked track ids and
-    position-less markers are excluded, mirroring select_cup's guards.
+    The hand-eye vision (upright_cup_pose_node) publishes ``{"count": N}``
+    every frame — exo no longer derives fallen state at all. None means
+    "no information" (wrong shape / non-int / bool), which callers must NOT
+    collapse to 0: a false "no fallen cups" would fail-fast a recovery whose
+    cup is really there.
     """
-    counts: dict[str, int] = {}
-    for tid, cup in cups.items():
-        if cup.cls != 'fallen-cup':
-            continue
-        if tid in stacked:
-            continue
-        if cup.pos is None:
-            continue
-        counts[cup.color] = counts.get(cup.color, 0) + 1
-    return counts
+    if not isinstance(obj, dict) or 'count' not in obj:
+        return None
+    val = obj['count']
+    if isinstance(val, bool):
+        return None
+    try:
+        count = int(val)
+    except (TypeError, ValueError):
+        return None
+    return max(0, count)
 
 
 class PlanExecutorNode(Node):
@@ -350,8 +348,10 @@ class PlanExecutorNode(Node):
         # fallen_cup_detect(hand-eye YOLO 서비스)가 떠야 recovery task가 컵을
         # sense 한다. 안 떠 있으면 여기서 start 하고 이 시간까지 기다린다.
         self.declare_parameter('detection_warmup_s', 15.0)
-        # Per-color fallen counts derived from the exo twin (see
-        # fallen_counts) — goal_state_publisher merges this into /llm_input.
+        # Hand-eye fallen count {"count": N} published by
+        # upright_cup_pose_node (goal_state_publisher gates it into
+        # /llm_input). Subscribed here only for the recovery fail-fast: a
+        # fresh count=0 means the hand-eye sees nothing to stand up.
         self.declare_parameter('fallen_cups_topic', '/fallen_cups')
         # Recovery completion goes straight to GSP (pick_node owns the
         # pyramid /action_result; recovery never reaches pick_node).
@@ -408,6 +408,7 @@ class PlanExecutorNode(Node):
         self._plan: list[dict] = []
         self._step_idx: int = 0
         self._busy: bool = False
+        self._last_fallen: tuple[int, float] | None = None  # (count, mono ts)
 
         self._move_pub = self.create_publisher(String, move_topic, 10)
         self.create_subscription(String, llm_out, self._on_llm_output, 10)
@@ -418,12 +419,11 @@ class PlanExecutorNode(Node):
         self.create_subscription(String, stack_topic, self._on_stack, 10)
         self._handeye_pub = self.create_publisher(
             String, handeye_cups_topic, 10)
-        self._fallen_pub = self.create_publisher(String, fallen_topic, 10)
         self._action_pub = self.create_publisher(String, action_topic, 10)
         self.create_subscription(
             MarkerArray, handeye_boxes_topic, self._on_handeye_boxes, 10)
+        self.create_subscription(String, fallen_topic, self._on_fallen_cups, 10)
         self.create_timer(0.5, self._publish_handeye_counts)
-        self.create_timer(0.5, self._publish_fallen_counts)
         self.create_timer(2.0, self._refresh_pyramid_slots)
         self._refresh_pyramid_slots()
 
@@ -523,7 +523,7 @@ class PlanExecutorNode(Node):
             # INTERRUPT (cold-start or in-flight): stand the fallen cup via
             # the server task, leaving _plan/_step_idx untouched — the LLM
             # resumes the existing plan with `continue` once fallen clears.
-            self._execute_fallen_recovery(data.get('fallen_recovery') or {})
+            self._execute_fallen_recovery()
             return
 
         if 'status' in data:  # cold-start
@@ -684,15 +684,20 @@ class PlanExecutorNode(Node):
             counts[col] = counts.get(col, 0) + 1
         self._handeye_pub.publish(String(data=json.dumps(counts)))
 
-    def _publish_fallen_counts(self) -> None:
+    def _on_fallen_cups(self, msg: String) -> None:
+        try:
+            obj = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        count = parse_fallen_count(obj)
+        if count is None:
+            return
         with self._state_lock:
-            counts = fallen_counts(self._cups, set(self._stacked_ids))
-        self._fallen_pub.publish(String(data=json.dumps(counts)))
+            self._last_fallen = (count, time.monotonic())
 
     # ── fallen-cup recovery (LLM interrupt — current plan untouched) ───────
 
-    def _execute_fallen_recovery(self, recovery: dict) -> None:
-        color = str(recovery.get('color') or '').lower() or None
+    def _execute_fallen_recovery(self) -> None:
         with self._state_lock:
             if self._busy:
                 self.get_logger().warn(
@@ -700,21 +705,21 @@ class PlanExecutorNode(Node):
                 return
             self._busy = True
         threading.Thread(
-            target=self._do_fallen_recovery_step,
-            args=(color,), daemon=True).start()
+            target=self._do_fallen_recovery_step, daemon=True).start()
 
-    def _do_fallen_recovery_step(self, color: str | None) -> None:
+    def _do_fallen_recovery_step(self) -> None:
         try:
-            result, reason = self._do_fallen_recovery(color)
+            result, reason = self._do_fallen_recovery()
         except Exception as exc:  # noqa: BLE001
             result, reason = 'fail', f'recovery exception: {exc}'
         # Recovery's completion signal goes straight to GSP. step=null on
         # purpose: it is not a plan step, so GSP never advances the plan on
-        # it, and _step_idx here stays where the interrupt found it.
+        # it, and _step_idx here stays where the interrupt found it. No
+        # color: the hand-eye fallen count carries none, and the recovery
+        # task picks its own target.
         out = {
             'step': None,
             'action': 'fallen_recovery',
-            'color': color,
             'result': result,
             'failure_reason': reason,
         }
@@ -726,22 +731,23 @@ class PlanExecutorNode(Node):
         with self._state_lock:
             self._busy = False
 
-    def _do_fallen_recovery(
-        self, color: str | None,
-    ) -> tuple[str, str | None]:
-        if not color:
-            return 'fail', 'fallen_recovery missing color'
+    def _do_fallen_recovery(self) -> tuple[str, str | None]:
+        # Fail-fast on a FRESH hand-eye count=0 — the LLM decided from a
+        # sample that has since gone stale, or the cup was stood/removed
+        # meanwhile. A stale/absent sample does NOT fail-fast (None != 0):
+        # the recovery task does its own sensing anyway.
         with self._state_lock:
-            counts = fallen_counts(self._cups, set(self._stacked_ids))
-        if counts.get(color, 0) <= 0:
-            return 'fail', f'no fallen {color} cup tracked (fallen={counts})'
+            last = self._last_fallen
+        if last is not None:
+            count, at = last
+            if count <= 0 and time.monotonic() - at <= self._handeye_ttl_s:
+                return 'fail', 'hand-eye sees no fallen cup (count=0)'
         url = f'{self._api_base}/api/robot/fallen-cup/recovery'
         # The recovery task does its OWN hand-eye perception (fallen_cup_detect
         # → /fallen_cup/* grasp pose) — the API takes no coordinates and no
-        # color, so the LLM's color is a pre-check only; the task stands the
-        # nearest fallen cup it sees. multi_cup=false keeps the contract one
-        # interrupt = one cup; remaining fallen cups re-trigger on the next
-        # LLM cycle.
+        # color; the task stands the nearest fallen cup it sees.
+        # multi_cup=false keeps the contract one interrupt = one cup;
+        # remaining fallen cups re-trigger on the next LLM cycle.
         body = {
             'mode': self._recovery_mode,
             'multi_cup': False,

@@ -34,7 +34,9 @@ from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 from std_msgs.msg import String
 
-from payload_builder import GoalStateBuilder, action_result_reflected
+from payload_builder import (
+    GoalStateBuilder, action_result_reflected, normalize_fallen_count,
+)
 
 
 class GoalStatePublisher(Node):
@@ -77,13 +79,22 @@ class GoalStatePublisher(Node):
         # Give up waiting for a fresh /cups_on_table after an action and
         # advance on the last world if perception stalls this long.
         self.declare_parameter('pending_fresh_timeout_s', 5.0)
-        # Fallen-cup map {color: count} derived from the exo twin by
-        # plan_executor — merged into the payload top-level `fallen` field.
+        # Hand-eye fallen count {"count": N} published every frame by
+        # upright_cup_pose_node (same camera/inference as /hand_eye/boxes).
+        # Gated into the payload top-level `fallen_count` at the DECISION
+        # moment only, and ONLY when no graspable upright cup remains (exo
+        # AND hand-eye fill both empty) — upright cups always win, because
+        # recovery is physically impossible with upright cups nearby. The
+        # hand-eye never feeds cups_on_table/stack (exo owns the world;
+        # double-count hazard).
         self.declare_parameter('fallen_cups_topic', '/fallen_cups')
-        # After a fallen_recovery success, hold the in-flight /llm_input
-        # until the recovered color's fallen count actually drops (otherwise
-        # the LLM sees the stale map and re-issues the same recovery). On
-        # timeout publish anyway so the LLM can decide retry/replan.
+        self.declare_parameter('fallen_ttl_s', 1.5)
+        # After a fallen_recovery result, hold the in-flight /llm_input until
+        # a hand-eye fallen sample taken AFTER the recovery lands (frozen-
+        # period samples are rejected, so the first accepted one is post-
+        # settle, arm at HOME). Publishing earlier would gate fallen_count on
+        # the stale pre-recovery sample. On timeout publish anyway so the LLM
+        # can decide retry/replan.
         self.declare_parameter('recovery_clear_timeout_s', 8.0)
 
         self._strict = bool(self.get_parameter('strict_json').value)
@@ -113,6 +124,9 @@ class GoalStatePublisher(Node):
 
         self._recovery_clear_timeout_s = float(
             self.get_parameter('recovery_clear_timeout_s').value)
+        self._fallen_ttl_s = float(self.get_parameter('fallen_ttl_s').value)
+        self._fallen_count_sample = 0   # last accepted /fallen_cups count
+        self._fallen_seen_ns = 0        # when that sample was accepted (ns)
 
         self._builder = GoalStateBuilder()
         self._pending_action_result = None
@@ -120,8 +134,8 @@ class GoalStatePublisher(Node):
         self._action_in_flight = False
         self._freeze_started_at = None
         self._unfreeze_at = None   # ns deadline for the post-settle unfreeze
-        # fallen_recovery success awaiting its fallen-map clear before the
-        # next /llm_input: {'result', 'before' (fallen snapshot), 'at_ns'}.
+        # fallen_recovery result awaiting a post-recovery hand-eye sample
+        # before the next /llm_input: {'at_ns'}.
         self._pending_recovery = None
 
         self._pub = self.create_publisher(String, out_topic, 10)
@@ -192,11 +206,12 @@ class GoalStatePublisher(Node):
 
     def _on_fallen_cups(self, msg: String) -> None:
         obj = self._parse(msg.data, '/fallen_cups')
-        if obj is None:
+        if obj is None or 'count' not in obj:
             return
         if self._world_frozen():
-            return  # arm in view — same gate as cups/stack (transient class flips)
-        self._builder.set_fallen(obj)
+            return  # arm mid-action — only at-HOME hand-eye reads may land
+        self._fallen_count_sample = normalize_fallen_count(obj.get('count'))
+        self._fallen_seen_ns = self.get_clock().now().nanoseconds
         self._maybe_publish_pending_recovery()
 
     def _on_user_command(self, msg: String) -> None:
@@ -217,20 +232,17 @@ class GoalStatePublisher(Node):
         if obj.get('action') == 'fallen_recovery':
             self._schedule_unfreeze('fallen recovery finished')
             self._builder.on_action_result(obj)  # plan NOT advanced (interrupt)
-            if obj.get('result') == 'success':
-                # Hold the in-flight trigger until the recovered color's
-                # fallen count drops — publishing with the stale map would
-                # make the LLM re-issue the same recovery.
-                self._pending_recovery = {
-                    'result': obj,
-                    'before': self._builder.fallen(),
-                    'at_ns': self.get_clock().now().nanoseconds,
-                }
-                self.get_logger().info(
-                    f'recovery success — waiting for fallen map to clear '
-                    f'(before={self._pending_recovery["before"]})')
-            else:
-                self._publish()  # fail → LLM decides retry/HITL immediately
+            # Success or fail, hold the in-flight trigger until a hand-eye
+            # sample taken AFTER the recovery lands. Publishing on the stale
+            # pre-recovery sample would mis-gate fallen_count both ways:
+            # re-issue after a success, or report 0 (-> wrong done) after a
+            # fail whose cup is still down.
+            self._pending_recovery = {
+                'at_ns': self.get_clock().now().nanoseconds,
+            }
+            self.get_logger().info(
+                f"recovery {obj.get('result')} — waiting for a fresh "
+                'hand-eye fallen sample')
             return
         self._schedule_unfreeze('post-place home settle')
         before = (self._builder.previous_world_state()
@@ -331,33 +343,28 @@ class GoalStatePublisher(Node):
         return self._freeze_enabled and self._action_in_flight
 
     def _maybe_publish_pending_recovery(self, timed_out: bool = False) -> bool:
-        """Publish the post-recovery /llm_input once fallen actually cleared.
+        """Publish the post-recovery /llm_input once a hand-eye fallen sample
+        taken AFTER the recovery has landed.
 
-        Cleared = the recovered color's count dropped below its pre-recovery
-        snapshot (taken at /action_result; the freeze kept it stable during
-        the arm motion). On timeout publish anyway — the LLM then sees the
-        still-fallen map and decides retry/HITL.
+        Frozen-period samples are rejected by _on_fallen_cups, so the first
+        accepted one is post-settle with the arm back at the shared sense
+        HOME — the only camera pose whose fallen reading means anything. On
+        timeout publish anyway — the gate then sees a stale sample (-> 0) and
+        the LLM decides from the world state alone.
         """
         if self._pending_recovery is None:
             return False
-        result = self._pending_recovery['result']
-        before = self._pending_recovery['before'] or {}
-        color = str(result.get('color') or '')
-        fallen = self._builder.fallen()
-        if color:
-            cleared = fallen.get(color, 0) < before.get(color, 0)
-        else:
-            cleared = not fallen
-        if not (cleared or timed_out):
+        fresh = self._fallen_seen_ns > self._pending_recovery['at_ns']
+        if not (fresh or timed_out):
             return False
-        if cleared:
+        if fresh:
             self.get_logger().info(
-                f'fallen {color!r} cleared after recovery: '
-                f'{before} -> {fallen}')
+                'post-recovery hand-eye sample landed: '
+                f'fallen count={self._fallen_count_sample}')
         else:
             self.get_logger().warn(
-                f'recovery clear-wait timed out — fallen still {fallen}; '
-                'publishing for LLM retry')
+                'recovery sample-wait timed out — publishing without a '
+                'post-recovery hand-eye sample')
         self._pending_recovery = None
         self._publish()
         return True
@@ -444,6 +451,39 @@ class GoalStatePublisher(Node):
                 f'exo empty at decision -> hand-eye fill {self._handeye_counts}')
             cw['cups_on_table'] = dict(self._handeye_counts)
 
+    def _fallen_fresh(self) -> bool:
+        if not self._fallen_seen_ns:
+            return False
+        age = (self.get_clock().now().nanoseconds
+               - self._fallen_seen_ns) * 1e-9
+        return age <= self._fallen_ttl_s
+
+    def _apply_fallen_to_payload(self, payload: dict) -> None:
+        """DECISION-moment gate (runs AFTER the hand-eye cups fill): the
+        hand-eye fallen count enters the payload ONLY when no graspable
+        upright cup remains anywhere — exo said 0 and the hand-eye fill had
+        nothing to add. Upright cups always win: recovery is physically
+        impossible with upright cups nearby, so the LLM must never see
+        fallen_count > 0 while a pickable cup exists. A stale sample (arm
+        not parked at the sense HOME recently) gates to 0 — never block on
+        the fallen path."""
+        payload['fallen_count'] = 0
+        cw = payload.get('current_world_state')
+        if not isinstance(cw, dict):
+            return   # no world yet -> no recovery decision either
+        cups = cw.get('cups_on_table') or {}
+        total = sum(int(v) for v in cups.values()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool))
+        if total > 0:
+            return
+        if not self._fallen_fresh():
+            return
+        if self._fallen_count_sample > 0:
+            self.get_logger().info(
+                'no graspable cups at decision -> hand-eye '
+                f'fallen_count={self._fallen_count_sample}')
+        payload['fallen_count'] = self._fallen_count_sample
+
     def _debounce_future_slots(self, raw_stack: dict) -> dict:
         """Reflect the just-built slot immediately, but hold a FUTURE step's
         slot at null until its occupancy is stable for future_slot_debounce_s
@@ -492,6 +532,7 @@ class GoalStatePublisher(Node):
             payload = self._builder.build_payload()
             if self._handeye_fallback:
                 self._apply_handeye_to_payload(payload)
+            self._apply_fallen_to_payload(payload)
             msg = String()
             msg.data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             self._pub.publish(msg)

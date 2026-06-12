@@ -136,38 +136,28 @@ class GoalStateBuilderTest(unittest.TestCase):
             {'blue': 5},
         )
 
-    # ── fallen-cup map / recovery interrupt ───────────────────────────────
+    # ── fallen-cup count / recovery interrupt ─────────────────────────────
 
-    def test_fallen_defaults_to_empty(self):
+    def test_fallen_count_defaults_to_zero(self):
         builder = GoalStateBuilder()
-        self.assertEqual(builder.build_payload()['fallen'], {})
+        self.assertEqual(builder.build_payload()['fallen_count'], 0)
 
-    def test_set_fallen_normalizes_counts(self):
+    def test_set_fallen_count_normalizes(self):
         builder = GoalStateBuilder()
-        builder.set_fallen({
-            'red': 1,
-            'blue': 0,        # zero -> dropped
-            'green': -2,      # negative -> dropped
-            'purple': '2',    # int-coercible string -> kept
-            'gray': 'bad',    # non-coercible -> dropped
-            'white': True,    # bool -> dropped
-        })
-        self.assertEqual(
-            builder.build_payload()['fallen'], {'red': 1, 'purple': 2})
+        for raw, expected in (
+                (2, 2), ('3', 3), (-1, 0), (None, 0), ('bad', 0), (True, 0)):
+            builder.set_fallen_count(raw)
+            self.assertEqual(
+                builder.build_payload()['fallen_count'], expected,
+                f'raw={raw!r}')
 
-    def test_set_fallen_non_dict_clears(self):
+    def test_fallen_count_survives_user_command_reset(self):
         builder = GoalStateBuilder()
-        builder.set_fallen({'red': 1})
-        builder.set_fallen(None)
-        self.assertEqual(builder.build_payload()['fallen'], {})
-
-    def test_fallen_survives_user_command_reset(self):
-        builder = GoalStateBuilder()
-        builder.set_fallen({'red': 1})
+        builder.set_fallen_count(1)
         builder.set_user_command('3단 피라미드 쌓아줘')
         payload = builder.build_payload()
         self.assertEqual(payload['mode'], 'cold_start')
-        self.assertEqual(payload['fallen'], {'red': 1})
+        self.assertEqual(payload['fallen_count'], 1)
 
     def test_fallen_recovery_result_does_not_advance_plan(self):
         builder = GoalStateBuilder()
@@ -183,7 +173,6 @@ class GoalStateBuilderTest(unittest.TestCase):
         builder.on_action_result({
             'step': None,
             'action': 'fallen_recovery',
-            'color': 'red',
             'result': 'success',
             'failure_reason': None,
         })

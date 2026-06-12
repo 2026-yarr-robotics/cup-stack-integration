@@ -9,6 +9,11 @@ nearest cup it sees here — which is the true cup, because the EXO error is kep
 small enough that each perturbed pose stays nearest to its own true cup.
 
   publish   /hand_eye/boxes   visualization_msgs/MarkerArray
+  publish   /fallen_cups      std_msgs/String JSON {"count": N}
+            (real counterpart: upright_cup_pose_node counts fallen-cup
+             detections per frame; here the `fallen_count` parameter, default
+             0, keeps the loop running robot-free and lets a test inject a
+             fallen interrupt)
   subscribe /action_result    std_msgs/String JSON   (disturbance sync only)
 
 MEASURED_CUPS (the hardcoded GT) lives in this module now — fake_digital_twin_node
@@ -57,6 +62,11 @@ class FakeHandEyeNode(Node):
         self.declare_parameter('disturbance_enabled', True)
         self.declare_parameter('disturbance_trigger_slot', 'L2_right')
         self.declare_parameter('disturbance_removed_slot', 'L2_left')
+        # Fake fallen-cup count for /fallen_cups (real: counted from the
+        # hand-eye YOLO frame). 0 = no fallen cups; set >0 to exercise the
+        # fallen_recovery interrupt without a robot.
+        self.declare_parameter('fallen_count', 0)
+        self.declare_parameter('fallen_count_topic', '/fallen_cups')
 
         self._cup_positions: dict[str, tuple[float, float]] = {
             slot: (x, y) for slot, (_, x, y) in MEASURED_CUPS.items()
@@ -64,6 +74,8 @@ class FakeHandEyeNode(Node):
         self._disturbance_applied = False
         self._boxes_pub = self.create_publisher(
             MarkerArray, str(self.get_parameter('boxes_topic').value), 10)
+        self._fallen_pub = self.create_publisher(
+            String, str(self.get_parameter('fallen_count_topic').value), 10)
         self.create_subscription(
             String,
             str(self.get_parameter('action_result_topic').value),
@@ -117,6 +129,8 @@ class FakeHandEyeNode(Node):
             markers.markers.append(self._box_top_marker(track_id, x, y))
             markers.markers.append(self._label_marker(track_id, slot))
         self._boxes_pub.publish(markers)
+        count = max(0, int(self.get_parameter('fallen_count').value))
+        self._fallen_pub.publish(String(data=json.dumps({'count': count})))
 
     def _box_top_marker(self, track_id: int, x: float, y: float) -> Marker:
         marker = Marker()

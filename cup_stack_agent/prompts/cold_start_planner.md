@@ -43,10 +43,10 @@ Normalize target from user_command (level / 단 / cup count). Default to base_le
 Requests for 4 levels, 5 levels, or any level above 3 are unsupported. Do not approximate them as 3-level plans.
 
 Cups are referenced by color only (same-color cups are interchangeable). cups_on_table is a {color: count} map of graspable cups scattered in the safe area. It is not a nested/stacked storage count. The stack field is the build output area.
-fallen is a TOP-LEVEL {color: count} map of tipped-over cups, separate from current_world_state. Missing/absent or 0 = none fallen. Fallen cups are not in cups_on_table and cannot be picked.
+fallen_count is a TOP-LEVEL integer: how many tipped-over cups the hand-eye camera sees (color unknown), separate from current_world_state. Missing/absent or 0 = none fallen. Fallen cups are not in cups_on_table and cannot be picked. The system reports fallen_count > 0 only when NO graspable upright cup remains anywhere (upright cups always take priority; recovery is impossible while one is nearby), so fallen_count > 0 implies cups_on_table is all zeros.
 
-FALLEN INTERRUPT (checked BEFORE planning): if fallen has ANY color with count > 0, do NOT produce a plan. Output ONLY:
-{"reasoning":"<one sentence>","decision":"fallen_recovery","fallen_recovery":{"color":<a fallen color>,"count":1},"plan":null}
+FALLEN INTERRUPT (checked BEFORE planning): if fallen_count > 0, do NOT produce a plan. Output ONLY:
+{"reasoning":"<one sentence>","decision":"fallen_recovery","plan":null}
 The robot stands the cup up first; you will be asked to plan again afterwards with the same user_command.
 
 Skill model:
@@ -104,7 +104,7 @@ Output:
 
 Few-shot example 6 (fallen interrupt — recover before planning):
 Input:
-{"user_command":"3단 피라미드 쌓아줘","current_world_state":{"cups_on_table":{"red":3,"blue":2},"stack":{"L1_left":null,"L1_mid":null,"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":0,"total_slots":6},"fallen":{"blue":1}}
+{"user_command":"3단 피라미드 쌓아줘","current_world_state":{"cups_on_table":{"red":0,"blue":0},"stack":{"L1_left":null,"L1_mid":null,"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":0,"total_slots":6},"fallen_count":1}
 Output:
-{"reasoning":"A blue cup is fallen, so it must be recovered before planning the pyramid.","decision":"fallen_recovery","fallen_recovery":{"color":"blue","count":1},"plan":null}
+{"reasoning":"A cup is fallen, so it must be recovered before planning the pyramid.","decision":"fallen_recovery","plan":null}
 ```

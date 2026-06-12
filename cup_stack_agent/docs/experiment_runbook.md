@@ -377,31 +377,56 @@ bash -n start.sh
 
 ## Fallen-Cup Recovery (LLM interrupt)
 
-LLM 입력에 top-level `fallen` `{color: count}` 맵이 추가됐다. plan_executor가
-exo 트랙(`/digital_twin/boxes_filtered`)의 `fallen-cup` class 마커를 색상별로
-세어 `/fallen_cups`(JSON)로 0.5s마다 발행하고, GSP가 payload에 싣는다.
+LLM 입력에 top-level `fallen_count`(정수)가 추가됐다. **fallen 판단은
+hand-eye 전담**이다 (exo의 fallen-cup class는 자세에 따라 미검출이 잦아
+폐기 — exo는 upright 개수만 책임진다). 상시 감시가 아니라 **"집을 upright가
+하나도 없을 때"만 보는** 지연 평가다:
 
-`fallen`이 비어있지 않으면 LLM은 continue/replan/done 대신
-`decision="fallen_recovery"`(top-level interrupt, `plan=null`)를 출력한다.
-plan_executor는 **기존 plan/step을 건드리지 않고**:
+- `upright_cup_pose_node`(hand-eye YOLO, `/hand_eye/boxes` 발행자)가 **같은
+  추론 프레임에서** fallen-cup class 개수를 세어 `/fallen_cups`에
+  `{"count": N}`을 매 프레임(0 포함) 발행한다. 0도 발행해야 구독자가
+  신선도(TTL)로 "fallen 없음"과 "노드 안 돎"을 구분한다. dry-run 대응물은
+  fake_hand_eye_node(`fallen_count` 파라미터, 기본 0).
+- skill_api의 HOME joint 자세가 fallen recovery의 sense HOME과 **통일**돼
+  있어, 시작 시(bringup move_home)와 매 pyramid place 후 팔이 항상 hand
+  카메라가 테이블을 보는 자세로 복귀한다. GSP는 freeze 중 샘플을 무시하므로
+  LLM에 닿는 샘플은 항상 "팔이 HOME에 정지한 시점"의 읽기다.
+- **decision-moment 게이트**: GSP는 `/llm_input`을 만드는 순간, exo
+  `cups_on_table`이 0이고 hand-eye graspable fallback
+  (`/vision/cups_on_table_handeye`)도 채울 게 없을 때**만** 신선한
+  (`fallen_ttl_s` 1.5s) `/fallen_cups` 샘플을 payload `fallen_count`로
+  싣는다. 집을 upright가 하나라도 있으면 fallen_count는 항상 0 — upright
+  우선이 LLM 바깥에서 보장된다 (recovery는 주변에 upright가 있으면 물리적으로
+  불가능하기도 하다).
+- **hand-eye fallen은 cups_on_table/stack(world_state)에 절대 관여하지
+  않는다** — exo와 이중 카운트되기 때문. count만. 기존 hand-eye graspable
+  fallback과 pick_node의 fine-pick(`/hand_eye/boxes`) 경로는 그대로다.
 
-1. `fallen_cup_detect`(hand-eye YOLO 서비스) 미기동 시
+`fallen_count > 0`이면 LLM은 continue/replan/done 대신
+`decision="fallen_recovery"`(top-level interrupt, `plan=null`, color 없음)를
+출력한다. plan_executor는 **기존 plan/step을 건드리지 않고**:
+
+1. 신선한 `/fallen_cups` 샘플이 0이면 fail-fast (stale/부재 샘플은 통과 —
+   recovery task가 자체 sensing을 하므로).
+2. `fallen_cup_detect`(hand-eye YOLO 서비스) 미기동 시
    `POST {ROBOT_API_BASE}/api/robot/fallen-cup/detection/start` 후 대기
    (`detection_warmup_s`, 기본 15s).
-2. `POST {ROBOT_API_BASE}/api/robot/fallen-cup/recovery`
+3. `POST {ROBOT_API_BASE}/api/robot/fallen-cup/recovery`
    `{"mode":"place","multi_cup":false}` — 좌표/색상은 보내지 않는다
-   (recovery task가 자체 hand-eye 인식으로 grasp pose를 구한다. LLM color는
-   exo 트랙 사전 검증용).
-3. 비동기 task이므로 `GET /api/robot/status`의 `tasks[]`에서
+   (recovery task가 자체 hand-eye 인식으로 가장 가까운 fallen cup을 세운다).
+4. 비동기 task이므로 `GET /api/robot/status`의 `tasks[]`에서
    `fallen_cup_recovery`가 `running`을 벗어날 때까지 폴링
    (`recovery_timeout_s`, 기본 240s). `idle`=success, `failed`=fail.
-4. `/action_result` `{"step":null,"action":"fallen_recovery",...}` 발행.
+5. `/action_result` `{"step":null,"action":"fallen_recovery",...}` 발행
+   (color 키 없음).
 
-GSP는 recovery success 후 해당 색 fallen count가 실제로 줄 때까지
-`/llm_input` 발행을 보류한다(`recovery_clear_timeout_s`, 기본 8s; 타임아웃 시
-그냥 발행 → LLM이 재시도 판단). fallen이 비고 current_goal이 유효하면 LLM은
-`continue`로 기존 plan에 복귀한다 — recovery 후 자동 replan은 하지 않는다
-(stack slot이 무너진 경우에만 replan).
+GSP는 recovery 결과(성공/실패 모두) 후 **recovery 이후에 찍힌 hand-eye 샘플이
+도착할 때까지** `/llm_input` 발행을 보류한다(`recovery_clear_timeout_s`, 기본
+8s; 타임아웃 시 그냥 발행 — 게이트가 stale 샘플을 0으로 떨어뜨린다). 세워진
+컵은 upright가 되어 exo(또는 hand-eye fallback)의 cups_on_table로 복귀하고,
+게이트에 의해 fallen_count는 0이 되므로 LLM은 `continue`로 기존 plan에
+복귀한다 — recovery 후 자동 replan은 하지 않는다(stack slot이 무너진 경우에만
+replan). 실패 시엔 다음 샘플에서 fallen_count > 0이 다시 실려 재시도된다.
 
 주의:
 

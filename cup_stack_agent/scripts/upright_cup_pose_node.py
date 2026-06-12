@@ -22,12 +22,18 @@ Output:
         ns="box_top"    id=i  pose.position=(x,y,z)  ← base_link 좌표
         ns="box_labels" id=i  text="#i_c=<color>_upright-cup"
   /upright_cup/debug_image : Image (검출/선택 시각화)
+  /fallen_cups : std_msgs/String JSON {"count": N}
+      - 같은 YOLO 추론에서 fallen-cup 클래스 검출 개수. 매 프레임 발행 (0 포함 —
+        구독자는 신선도(TTL)로 "fallen 없음"과 "노드 안 돎"을 구분).
+      - 좌표/색 없음. world_state(cups_on_table/stack)에는 절대 불관여 — exo 와의
+        이중 카운트 방지. GSP 가 decision 시점에만 payload fallen_count 로 게이트.
 
 전제:
   - dsr 가 /tf 로 base_link<-link_6 (TF) 를 방송하고 있어야 FK 가능.
   - hand-eye 캘리브 파일(T_gripper2camera.npy) 이 calib_file 경로에 있어야 함.
 """
 
+import json
 import math
 import time
 
@@ -42,6 +48,7 @@ from rclpy.time import Time
 from tf2_ros import Buffer, TransformListener
 
 from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from ultralytics import YOLO
@@ -184,6 +191,15 @@ class UprightCupPoseNode(Node):
         self.declare_parameter("target_class_name", "upright-cup")
         self.declare_parameter("min_mask_area", 300.0)
 
+        # ── fallen-cup count (같은 추론, 별도 채널) ──────────
+        # 같은 YOLO 프레임에서 fallen-cup 클래스 검출 개수만 세서
+        # /fallen_cups 에 {"count": N} 으로 매 프레임(0 포함) 발행한다.
+        # goal_state_publisher 가 decision 시점(집을 upright 이 하나도 없을
+        # 때)에만 payload 의 fallen_count 로 게이트해 싣는다. /hand_eye/boxes
+        # (pick 좌표 경로)와 world_state 에는 절대 관여하지 않는다 — count 만.
+        self.declare_parameter("fallen_class_name", "fallen-cup")
+        self.declare_parameter("fallen_count_topic", "/fallen_cups")
+
         # -- pick point method ----------------------------
         # A standing cup seen from above shows its rim circle; if the seg
         # mask also catches the side wall and elongates, the moments centroid
@@ -236,6 +252,10 @@ class UprightCupPoseNode(Node):
 
         self.target_class_name = str(self.get_parameter("target_class_name").value)
         self.min_mask_area = float(self.get_parameter("min_mask_area").value)
+        self.fallen_class_name = str(
+            self.get_parameter("fallen_class_name").value)
+        self.fallen_count_topic = str(
+            self.get_parameter("fallen_count_topic").value)
         self.pick_point_method = str(
             self.get_parameter("pick_point_method").value).strip().lower()
         if self.pick_point_method not in (
@@ -331,6 +351,8 @@ class UprightCupPoseNode(Node):
 
         self.boxes_pub = self.create_publisher(
             MarkerArray, self.boxes_topic, 10)
+        self.fallen_pub = self.create_publisher(
+            String, self.fallen_count_topic, 10)
         self.debug_pub = self.create_publisher(
             Image, self.debug_image_topic, 10)
 
@@ -338,6 +360,9 @@ class UprightCupPoseNode(Node):
         self.get_logger().info(f"  image_topic : {self.image_topic}")
         self.get_logger().info(f"  boxes_topic : {self.boxes_topic} ({self.base_frame})")
         self.get_logger().info(f"  target_class: '{self.target_class_name}'")
+        self.get_logger().info(
+            f"  fallen count: '{self.fallen_class_name}' -> "
+            f"{self.fallen_count_topic}")
         self.get_logger().info(f"  model classes: {getattr(self.model, 'names', None)}")
 
     # ── Depth / camera info ──────────────────────────────────
@@ -673,6 +698,15 @@ class UprightCupPoseNode(Node):
         detections = self.extract_detections(results[0], frame_bgr, h, w)
         targets = self.filter_target_detections(detections)
 
+        # fallen-cup 개수 — 같은 추론 결과에서 세서 매 프레임(0 포함) 발행.
+        # 0 도 발행해야 구독자가 "fallen 없음"과 "노드 안 돎"을 신선도(TTL)로
+        # 구분한다. 좌표/색은 싣지 않는다 (count 만 — world 불관여).
+        fallen_n = sum(
+            1 for d in detections
+            if d.get("cls_name") == self.fallen_class_name)
+        self.fallen_pub.publish(
+            String(data=json.dumps({"count": int(fallen_n)})))
+
         cups = []  # [{"xy_base":(x,y), "z_base":z, "color":str, "center":(u,v)}]
         for det in targets:
             u, v = det["center"]
@@ -712,14 +746,14 @@ class UprightCupPoseNode(Node):
         cv2.putText(
             debug,
             f"upright cups={len(targets)} published={len(cups)} "
-            f"pick={self.pick_point_method}",
+            f"fallen={fallen_n} pick={self.pick_point_method}",
             (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         self.publish_debug(debug, msg.header)
 
         elapsed = (time.time() - start) * 1000.0
         self.get_logger().info(
             f"upright cups={len(targets)} published(base)={len(cups)} "
-            f"time={elapsed:.1f} ms")
+            f"fallen={fallen_n} time={elapsed:.1f} ms")
 
     # ── Publish ───────────────────────────────────────────────
     def publish_boxes(self, cups):

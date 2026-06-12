@@ -7,7 +7,7 @@ and asks it for the 7-field LLM input payload defined in
     {
       "user_command":         str | null,
       "current_world_state":  WorldState | null,
-      "fallen":               {color: count},   # tipped-over cups (interrupt trigger)
+      "fallen_count":         int,              # tipped-over cups (interrupt trigger)
       "previous_world_state": WorldState | null,
       "robot_state":          RobotState,
       "current_plan":         Plan | null,
@@ -84,26 +84,21 @@ def normalize_stack(stack: dict | None) -> dict[str, Any]:
     return out
 
 
-def normalize_fallen(fallen: Any) -> dict[str, int]:
-    """Coerce a fallen-cup map into ``{color: positive int count}``.
+def normalize_fallen_count(value: Any) -> int:
+    """Coerce a fallen-cup count into a non-negative int.
 
-    None / non-dict → ``{}``. Non-string keys, bool values, non-int-coercible
-    or non-positive counts are dropped, so ``{} == no fallen cups`` always
-    holds for downstream consumers (LLM decision rule, recovery clear-wait).
+    The hand-eye vision (/fallen_cups {"count": N}) reports a bare count —
+    no color. Bools / non-int-coercible / negative values → 0, so
+    ``0 == no fallen cups`` always holds for downstream consumers (LLM
+    decision rule).
     """
-    if not isinstance(fallen, dict):
-        return {}
-    out: dict[str, int] = {}
-    for key, val in fallen.items():
-        if not isinstance(key, str) or isinstance(val, bool):
-            continue
-        try:
-            count = int(val)
-        except (TypeError, ValueError):
-            continue
-        if count > 0:
-            out[key] = count
-    return out
+    if isinstance(value, bool):
+        return 0
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, count)
 
 
 def normalize_robot_state(robot_state: dict | None) -> dict[str, Any]:
@@ -200,10 +195,11 @@ class GoalStateBuilder:
         # Snapshot of current_world_state sent in the *previous* /llm_input.
         self._prev_world_state: dict | None = None
         self._plan_counter: int = 0
-        # Fallen-cup map {color: count} from perception (/fallen_cups). Kept
+        # Fallen-cup count from the hand-eye vision (/fallen_cups). Kept
         # OUTSIDE current_world_state: it is the LLM's interrupt trigger, not
-        # part of the buildable-world contract.
-        self._fallen: dict[str, int] = {}
+        # part of the buildable-world contract — the hand-eye must NEVER feed
+        # cups_on_table/stack (it would double-count cups the exo also sees).
+        self._fallen_count: int = 0
 
     # ── Inputs ────────────────────────────────────────────────────────────
 
@@ -217,17 +213,17 @@ class GoalStateBuilder:
     def set_robot_state(self, robot_state: dict | None) -> None:
         self._robot_state = robot_state
 
-    def set_fallen(self, fallen: dict | None) -> None:
-        """Update the fallen-cup map from perception.
+    def set_fallen_count(self, count: Any) -> None:
+        """Update the fallen-cup count from the hand-eye vision (/fallen_cups).
 
         Deliberately NOT cleared by set_user_command(): fallen is perception
         state (a cup is physically tipped over), independent of plan resets.
         """
-        self._fallen = normalize_fallen(fallen)
+        self._fallen_count = normalize_fallen_count(count)
 
-    def fallen(self) -> dict[str, int]:
-        """Current fallen-cup map ({} when none)."""
-        return dict(self._fallen)
+    def fallen_count(self) -> int:
+        """Current fallen-cup count (0 when none)."""
+        return self._fallen_count
 
     def set_user_command(self, command: str | None) -> None:
         """A new user command starts a fresh task: cold-start mode.
@@ -360,7 +356,7 @@ class GoalStateBuilder:
         return {
             'user_command': self._user_command if cold else None,
             'current_world_state': cws,
-            'fallen': dict(self._fallen),
+            'fallen_count': self._fallen_count,
             'previous_world_state': None if cold else self._prev_world_state,
             'robot_state': self._robot_state_payload(),
             'current_plan': self._current_plan,
