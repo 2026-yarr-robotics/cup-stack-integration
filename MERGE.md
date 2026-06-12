@@ -188,6 +188,32 @@ wobble STAND 샘플 → **직립 (0.315,0.172,z=0.003) kinematic** → HOME 복�
    mouth-down 166°로 끝남 — sim_cup_yaw/그립 방향 계약 확인 필요
    (outcome 확률 모델이 최종 포즈를 보정하므로 결과는 정상).
 
+### 검증 1 — "3단 쌓아줘" agent 폐루프: **기계 체인 검증 완료**
+
+qwen3.6:35b 미설치 → qwen2.5-coder:14b + LLM_TIMEOUT_S=600 (GPU 를 Isaac
+렌더와 공유, 생성 ~1 tok/s → decide 1회 5~6.5분).
+
+관찰된 동작 (씬: 검증 0 의 recovery 팔 스윕이 만든 난장판 — 직립 3·전도 3):
+- cold_start 플랜(3스텝) 채택 → coarse /move → hand-eye fine pick →
+  **slot 1l 정시팅** `released cup_4 seated at (0.450,-0.078,0.003)` —
+  서버 lazy skill_api(bringup-agent 경유) 포함 전 체인 ✓
+- step fail → **in_flight replan** → 새 플랜으로 계속 ✓ (폐루프)
+- 매달린 컵의 off-grid release(z=145mm, 격자이탈 41mm>tol 35) →
+  **비상 divert 가드 작동** `emergency seating → (0.343,0.344)` ✓
+- 두 번째 placement **slot 1r 정시팅** (0.450,+0.078,0.003) ✓
+
+**정체 지점 (후속 작업)**: verifier 의 슬롯 라벨이 비전 y-바이어스
+(~30-40mm)로 한 칸 어긋남 (실제 1l/1r → /stack L1_L/L1_M) → GSP 의
+`action_result_reflected` 게이트(정확한 슬롯 요구, 무한 대기)가 안 풀려
+루프가 멈춤. + LLM decide 가 GPU 경합으로 분 단위 — 풀 6컵 빌드는
+비현실적. 재현/관찰엔 충분, 완주엔 vision 바이어스 튜닝 + 전용 LLM 필요.
+
+### 수정 항목 검증
+- **upright 랜덤 yaw**: spawn/reset 모두 적용 — hand 캠 캡처에서 로고
+  방향 제각각 확인 ✓
+- **GT 씬**: `gt` 모드/버튼 — 6컵이 MEASURED_CUPS 좌표
+  (0.25/0.35 × ±0.2/0)에 정확 배치 확인 ✓
+
 ### 3) ROS_LOCALHOST_ONLY 비호환 — 2번째 근본 원인
 
 1)의 이식 후에도 relay가 데이터를 못 받았다. upstream start.sh의
