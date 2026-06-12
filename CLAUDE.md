@@ -104,9 +104,14 @@ bash -n start.sh
   fallen-cup-recovery, ros2-depth-point-cloude, vision-node, …) are authored as
   **dwl21 <nggus5@gmail.com>**. The top-level `cup-stack-integration` repo uses the
   checkout's own git user.
-- Submodule changes go via a `chore/…` branch + PR in the inner repo, then bump
-  the pointer in the parent (`git add <submodule>` → commit). Pointers track each
-  repo's latest default-branch tip (`fallen-cup-recovery` → `released`).
+- Submodule changes go via a branch in the inner repo whose prefix matches the
+  Conventional Commit type of the change (`feat/…`, `fix/…`, `docs/…`, `chore/…`
+  — not always `chore/`), then bump the pointer in the parent
+  (`git add <submodule>` → commit). Pointers track each repo's latest
+  default-branch tip (`fallen-cup-recovery` → `released`).
+- New feature work: create a branch, then merge to `main` and push directly.
+  **No PR by default** — open one only for large/risky changes, and ask the user
+  first before creating it.
 - Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`).
 
 ## Deployment
