@@ -157,6 +157,37 @@ None 파싱 사망 방지). 검증: `bash -n` + 양그룹 false 스모크런 (Ol
 fusion 뷰 통합으로 start_isaac.sh vision-fusion 창을 `rviz:=false`로. launch
 기본값(true)은 실기·수동용으로 유지 (`script/vision_rviz.sh VIEW=fusion`).
 
+---
+
+## 4차 (2026-06-13 새벽) — fallen-cup-recovery Isaac 통합 + E2E 검증
+
+### 통합 구현 (Task #1)
+
+| 리포 | 브랜치 | 내용 |
+|---|---|---|
+| fallen-cup-recovery | `feat/sim-gripper-topic-backend` (신규) | `gripper_backend` 파라미터(onrobot/topic/none, sim 플래그와 분리) + TopicRG(/gripper/target_width, 1/10mm→mm); one-shot 종료를 `os._exit`로 (MoveItPy teardown 크래시가 성공을 failed로 뒤집던 실측 버그) |
+| ros2-cup-stack | `feat/sim-gripper-backend` | recovery wrapper launch에 env-기본값 패스스루: gripper_backend / place_cup_tilt_deg / pyramid_config_url(ROBOT_API_BASE 핀) / avoid_upright_cups / sim_cup_* |
+| server | `feat/vision-relay-llm-split` | bringup_agent: colcon install 경로 폴백(ros2/install), task rc 레이스 수정(stdout EOF 직후 poll()=None→failed 오판); compose FALLEN_CUP_WEIGHTS 패스스루 |
+| playground | `fix/flatten-paths` | bridge 기울기 조건부 attach(yaw 보존)+2-경로 release+wobble 연출(확률 샘플, 물리 미개입); skill-api 창→bringup-agent 창(:8099, lazy skill_api + recovery 전 stop = MoveItPy 경합 해소); 랜덤 yaw; GT 씬; fallen_clear; verify_recovery.py |
+
+### 검증 0 — recovery E2E: **PASS** (`tools/verify_recovery.py`)
+
+전도(ArUco 밖 0.29,0.20, z=0.038) → fallen-pose attach(tilt 97°, 스냅 없음)
+→ FixedJoint 캐리(z 최대 1.0m) → stand 모션 → tilted release(166°) →
+wobble STAND 샘플 → **직립 (0.315,0.172,z=0.003) kinematic** → HOME 복귀
+→ task=idle. 그리퍼는 TopicRG(`[topic-gripper] target_width 70.0mm`) 경로.
+
+**알려진 한계 2건 (후속 작업):**
+1. **YOLO sim 도메인 갭**: 가용 .pt 전부가 시뮬 렌더의 전도 컵을
+   fallen-cup으로 분류 못함 (직립 분류는 정상; 0609_exo가 가장 근접하나
+   hand 뷰에서 빨간 직립 컵을 fallen으로 오검). 검증 툴은 GT-주입 모드
+   (sim_cup_*)로 인식만 우회 — **sim 캡처 파인튜닝 필요**. 같은 이유로
+   /hand_eye/boxes(3class)의 과검출이 유령 upright 장애물을 만들어
+   planning을 깨므로 Isaac은 FALLEN_CUP_AVOID_UPRIGHT=false.
+2. **stand release 기울기 충실도**: 실기 기대(~20°)와 달리 release가
+   mouth-down 166°로 끝남 — sim_cup_yaw/그립 방향 계약 확인 필요
+   (outcome 확률 모델이 최종 포즈를 보정하므로 결과는 정상).
+
 ### 3) ROS_LOCALHOST_ONLY 비호환 — 2번째 근본 원인
 
 1)의 이식 후에도 relay가 데이터를 못 받았다. upstream start.sh의
