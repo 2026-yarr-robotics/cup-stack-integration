@@ -282,9 +282,12 @@ mkdir -p "${LOG_DIR}"
 export PYTHONUNBUFFERED=1
 # Match the rest of the running stack (cameras/robot/vision run with
 # ROS_LOCALHOST_ONLY=1 on domain 21); without these the agent lands on a
-# different DDS config and cannot discover them.
+# different DDS config and cannot discover them. Overridable: the Isaac
+# digital-twin stack runs WITHOUT localhost-only (bridge/fusion/verifier
+# windows), and a localhost-only participant gets no data from them —
+# start_isaac.sh passes ROS_LOCALHOST_ONLY=0.
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-21}"
-export ROS_LOCALHOST_ONLY=1
+export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-1}"
 echo "[start.sh] logs: ${LOG_DIR}"
 echo "[start.sh] groups: WITH_VISION=${WITH_VISION} WITH_LLM=${WITH_LLM}"
 if [[ "${WITH_LLM}" == "true" ]]; then
