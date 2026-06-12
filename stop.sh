@@ -1,1 +1,0 @@
-cup-stack-server/server/stop.sh

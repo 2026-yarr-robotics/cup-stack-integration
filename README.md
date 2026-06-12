@@ -9,17 +9,26 @@ an LLM planning loop on top of a REST robot-control server.
         │
         ▼
   LLM planner ──▶ plan executor ──▶  POST /api/robot/skill/pyramid
- (cup_stack_agent, ROS 2)            (cup-stack-server, FastAPI → ROS 2 → robot)
+ (cup_stack_agent, ROS 2)            (server, FastAPI → ROS 2 → robot)
 ```
 
 ## Repository layout
 
+As of 2026-06-12 the submodules are **flattened to the repo root** (the old
+`cup-stack-server/` aggregation layer and `vision/` directory were dissolved):
+
 | Path | What it is |
 |------|------------|
-| `cup_stack_agent/` | LLM closed-loop ROS 2 experiment — fake perception + planner + executor that POSTs the robot API |
-| `cup-stack-server/` | **git submodule** — robot control stack: `ros2-cup-stack/` (ROS 2 Humble + MoveIt 2 + OnRobot gripper), `server/` (FastAPI REST + rosbridge), `frontend/` (React dashboard) |
-| `docs/` | integration-level docs |
-| `CLAUDE.md` | guidance for AI/code agents working in this repo |
+| `cup_stack_agent/` | LLM closed-loop ROS 2 experiment — fake perception + planner + executor that POSTs the robot API (own code) |
+| `server/` | **submodule** — FastAPI REST + rosbridge gateway (`server/start.sh` = tmux entrypoint) |
+| `ros2-cup-stack/` | **submodule** — ROS 2 Humble + MoveIt 2 + OnRobot gripper (nests `ros2/src/doosan-robot2`) |
+| `frontend/` | **submodule** — React dashboard |
+| `fallen-cup-recovery/` | **submodule** (`released`) — fallen-cup recovery skill |
+| `ros2-depth-point-cloude/` | **submodule** — `depth_digital_twin` (3D boxes) + `recode_sequence` (cameras, merged from the archived repo) |
+| `vision-node/` | **submodule** — `cup_stacking_verify` (`/stack` slot verifier) |
+| `ros2-skill-manager/` | **submodule** — operator GUI + `run_skill_manager.sh` |
+| `script/` | launcher symlinks (→ `server/*`, `ros2-skill-manager/run_skill_manager.sh`) + `send_command.sh`, `vision_rviz.sh` |
+| `docs/`, `CLAUDE.md` | integration docs + agent guidance |
 
 Clone with submodules:
 
@@ -85,12 +94,13 @@ Useful environment variables:
 
 ## Robot control server
 
-The `cup-stack-server` submodule is the real robot stack and runs independently
+The `server/` submodule is the real robot stack and runs independently
 (Docker: nginx + per-domain FastAPI services + rosbridge). It exposes the REST API
 the agent calls — e.g. `POST /api/robot/move`, `POST /api/robot/skill/pyramid`,
 `POST /api/robot/skill/unstack` (reverse: pick a pyramid slot → nest at x,y),
-`GET/POST /api/robot/config/pyramid`. See `cup-stack-server/README` and its
-`CLAUDE.md` / `server/CLAUDE.md` for build, run, and architecture details.
+`GET/POST /api/robot/config/pyramid`. `server/start.sh` is the single tmux
+entrypoint and sources sibling submodules via `../<pkg>/install/setup.bash`. See
+`server/CLAUDE.md` and [`docs/deploy_migration_policy.md`](docs/deploy_migration_policy.md).
 
 ## Tests
 
@@ -103,8 +113,9 @@ bash -n start.sh
 
 ## Conventions
 
-- Branch: `v1.1`. Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`).
-- Changes inside the `cup-stack-server` tree are authored as **dwl21**; advance
-  the submodule pointer with a `chore:` commit in the parent. See `CLAUDE.md`.
+- Branch: `main`. Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`).
+- Changes inside any submodule are authored as **dwl21**; land them via a
+  `chore/…` branch + PR, then advance the submodule pointer with a `chore:` commit
+  in the parent. See `CLAUDE.md`.
 - Keep the fake experiment's I/O identical to the real ROS pipeline — do not add
   alternate topics or pass coordinates through CLI/params.
