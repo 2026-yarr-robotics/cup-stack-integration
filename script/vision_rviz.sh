@@ -29,7 +29,7 @@ set -e
 # Resolve our real path (robust to being run via a symlink), then derive the
 # integration repo root that holds the canonical vision/ submodules.
 SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-ROOT_DIR="$SCRIPT_DIR"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 ROS_SETUP="/opt/ros/humble/setup.bash"
 
@@ -51,7 +51,7 @@ fi
 # configs shipped in each package's share/.
 DEPTH_DT_SETUP="$ROOT_DIR/ros2-depth-point-cloude/install/setup.bash"
 VISION_NODE_SETUP="$ROOT_DIR/vision-node/install/setup.bash"
-RECODE_SETUP="$ROOT_DIR/ros2-recode-sequence/install/setup.bash"
+RECODE_SETUP="$ROOT_DIR/ros2-depth-point-cloude/install/setup.bash"
 
 # shellcheck disable=SC1090
 source "$ROS_SETUP"

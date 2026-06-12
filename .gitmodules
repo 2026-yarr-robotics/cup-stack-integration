@@ -17,9 +17,6 @@
 [submodule "vision-node"]
 	path = vision-node
 	url = https://github.com/2026-yarr-robotics/vision-node.git
-[submodule "ros2-recode-sequence"]
-	path = ros2-recode-sequence
-	url = https://github.com/2026-yarr-robotics/ros2-recode-sequence.git
 [submodule "ros2-skill-manager"]
 	path = ros2-skill-manager
 	url = https://github.com/2026-yarr-robotics/ros2-skill-manager.git

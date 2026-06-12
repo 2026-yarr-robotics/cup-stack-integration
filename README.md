@@ -24,8 +24,7 @@ As of 2026-06-12 the submodules are **flattened to the repo root** (the old
 | `ros2-cup-stack/` | **submodule** — ROS 2 Humble + MoveIt 2 + OnRobot gripper (nests `ros2/src/doosan-robot2`) |
 | `frontend/` | **submodule** — React dashboard |
 | `fallen-cup-recovery/` | **submodule** (`released`) — fallen-cup recovery skill |
-| `ros2-depth-point-cloude/` | **submodule** — `depth_digital_twin` (detection + 3D boxes) |
-| `ros2-recode-sequence/` | **submodule** — `recode_sequence` (cameras); merge into depth pending |
+| `ros2-depth-point-cloude/` | **submodule** — `depth_digital_twin` (3D boxes) + `recode_sequence` (cameras, merged from the archived repo) |
 | `vision-node/` | **submodule** — `cup_stacking_verify` (`/stack` slot verifier) |
 | `ros2-skill-manager/` | **submodule** — operator GUI + `run_skill_manager.sh` |
 | `script/` | launcher symlinks (→ `server/*`, `ros2-skill-manager/run_skill_manager.sh`) + `send_command.sh`, `vision_rviz.sh` |

@@ -21,8 +21,7 @@ cup-stack-integration/
 │   └── ros2/src/doosan-robot2 # nested submodule (@yarr-integration): M0609 driver
 ├── frontend/                  # submodule: React dashboard
 ├── fallen-cup-recovery/       # submodule (@released): fallen-cup recovery skill
-├── ros2-depth-point-cloude/   # submodule: depth_digital_twin (detection + 3D boxes)
-├── ros2-recode-sequence/      # submodule: recode_sequence (cameras) — merge into depth pending
+├── ros2-depth-point-cloude/   # submodule: depth_digital_twin (3D boxes) + recode_sequence (cameras)
 ├── vision-node/               # submodule: cup_stacking_verify (/stack slot verifier)
 ├── ros2-skill-manager/        # submodule: operator GUI (Pick/Pyramid/UpdateInput) + run_skill_manager.sh
 ├── script/                    # launcher symlinks → server/{start,stop,attach,bringup_real} &
@@ -48,9 +47,9 @@ cup-stack-integration/
 - **`ros2-cup-stack/`** — ROS 2 Humble cup_stack skill + MoveIt 2; nests
   `doosan-robot2` under `ros2/src/`.
 - **perception** — `ros2-depth-point-cloude` (`depth_digital_twin`: detection + 3D
-  boxes), `ros2-recode-sequence` (`recode_sequence`: cameras; archived upstream —
-  planned to merge into depth), and `vision-node` (`cup_stacking_verify`: the
-  `/stack` slot verifier).
+  boxes, **and** the `recode_sequence` camera package — merged in from the former
+  archived `ros2-recode-sequence` repo) and `vision-node` (`cup_stacking_verify`:
+  the `/stack` slot verifier).
 
 > ⚠️ **Pyramid placement geometry is owned by the FastAPI server**
 > (`server/server/domains/robot.py`: `PYRAMID_CUP_SPACING`, `PYRAMID_LAYER_HEIGHT`,
