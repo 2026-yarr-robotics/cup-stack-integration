@@ -53,9 +53,19 @@ HAND_EYE_MODE="${HAND_EYE_MODE:-real}"
 HAND_EYE_WEIGHTS="${HAND_EYE_WEIGHTS:-/home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt}"
 HAND_EYE_CALIB="${HAND_EYE_CALIB:-/home/ssu/cup-stack-integration/fallen-cup-recovery/dsr_practice/config/T_gripper2camera.npy}"
 HAND_EYE_DEVICE="${HAND_EYE_DEVICE:-cuda}"
-# pick point 선택 방식. top_ellipse = hand_pick 최신 (윗면 타원 + 내부구멍
-# 제약 — 몸통/그림자 오선택 제거). 구 동작으로 되돌리려면 centroid.
-HAND_EYE_PICK_METHOD="${HAND_EYE_PICK_METHOD:-top_ellipse}"
+# pick point 선택 방식. centroid = 검증된 기본 (마스크 무게중심 — 솔리드
+# 영역이라 depth 가 항상 유효). top_ellipse(hand_pick 최신)는 pick 픽셀이
+# 컵 윗면 구멍/림 엣지에 앉아 depth invalid → base 변환 탈락이 잦았음
+# (20260612_184748 런: cups=4 base=2 — 조준 컵이 후보에서 빠져 뒷줄 오픽).
+# depth 샘플링을 마스크 솔리드 영역으로 보완하기 전까지 centroid 유지.
+HAND_EYE_PICK_METHOD="${HAND_EYE_PICK_METHOD:-centroid}"
+# 색 tie-break: coarse 타깃 최근접 +4cm 윈도 안에서 step color 우선
+# (pick_node filter_by_color). 후보가 2mm 차이로 갈릴 때 색이 결정.
+PICK_FILTER_BY_COLOR="${PICK_FILTER_BY_COLOR:-true}"
+# base_link 시간 평활/트래킹(CupTracker). outlier 무시(연속 4프레임 재획득)가
+# 이동 직후 정확한 측정을 ~0.7s 거부할 수 있음 — pick_node 의 ignore 0.3s +
+# settle 0.5s 와 아슬아슬하게 겹친다. stale 좌표 픽이 재발하면 false 로.
+HAND_EYE_SMOOTHING="${HAND_EYE_SMOOTHING:-true}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_ID}}"
 
@@ -302,7 +312,8 @@ if [[ "${HAND_EYE_MODE}" == "real" ]]; then
     -p conf:=0.35 \
     -p base_frame:=base_link \
     -p target_class_name:=upright-cup \
-    -p pick_point_method:="${HAND_EYE_PICK_METHOD}"
+    -p pick_point_method:="${HAND_EYE_PICK_METHOD}" \
+    -p enable_temporal_smoothing:="${HAND_EYE_SMOOTHING}"
 else
   launch fake_hand_eye python3 scripts/fake_hand_eye_node.py \
     --ros-args \
@@ -338,7 +349,8 @@ if [[ "${DRY_RUN}" == "false" ]]; then
   launch pick_node python3 scripts/pick_node.py \
     --ros-args \
     -p api_base:="${ROBOT_API_BASE}" \
-    -p api_timeout_sec:="${API_TIMEOUT_S}"
+    -p api_timeout_sec:="${API_TIMEOUT_S}" \
+    -p filter_by_color:="${PICK_FILTER_BY_COLOR}"
 else
   echo "[start.sh] dry-run: pick_node NOT launched (no dry-run; would POST the" \
        "real pyramid API). Loop stays open. Use --real-api to close it."
