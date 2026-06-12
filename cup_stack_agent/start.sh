@@ -12,6 +12,15 @@ API_TIMEOUT_S="${API_TIMEOUT_S:-180.0}"
 # (Post-place arm retreat to HOME is handled server-side in /skill/pyramid_step
 #  via try_move_home — no client-side home move needed here.)
 MOVE_Z="${MOVE_Z:-0.45}"
+# Fallen-cup recovery (LLM interrupt): plan_executor POSTs the server's async
+# task API {ROBOT_API_BASE}/api/robot/fallen-cup/recovery and polls
+# /api/robot/status until the task finishes. mode=place stands the cup at a
+# clear spot so it becomes a pick candidate again.
+RECOVERY_MODE="${RECOVERY_MODE:-place}"
+RECOVERY_TIMEOUT_S="${RECOVERY_TIMEOUT_S:-240.0}"
+# GSP world-freeze ceiling. Must exceed the longest single action — the
+# recovery task (sense+pick+stand+home) can run past the old 60s default.
+FREEZE_TIMEOUT_S="${FREEZE_TIMEOUT_S:-240.0}"
 EXO_XY_ERROR_M="${EXO_XY_ERROR_M:-0.02}"
 MODEL="${MODEL:-qwen3.6:35b}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/chat}"
@@ -298,7 +307,9 @@ else
     -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
     -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
 fi
-launch goal_state_publisher python3 scripts/goal_state_publisher_node.py
+launch goal_state_publisher python3 scripts/goal_state_publisher_node.py \
+  --ros-args \
+  -p freeze_timeout_s:="${FREEZE_TIMEOUT_S}"
 launch topic_logger python3 scripts/topic_logger_node.py \
   --ros-args \
   -p log_dir:="${LOG_DIR}"
@@ -311,6 +322,9 @@ launch plan_executor python3 scripts/plan_executor_node.py \
   -p api_url_move:="${API_URL}" \
   -p api_timeout_s:="${API_TIMEOUT_S}" \
   -p move_z:="${MOVE_Z}" \
+  -p api_base_robot:="${ROBOT_API_BASE}" \
+  -p recovery_mode:="${RECOVERY_MODE}" \
+  -p recovery_timeout_s:="${RECOVERY_TIMEOUT_S}" \
   -p dry_run:="${DRY_RUN}"
 
 # pick_node closes the loop (/move_result -> hand-eye fine pick ->

@@ -43,6 +43,11 @@ Normalize target from user_command (level / 단 / cup count). Default to base_le
 Requests for 4 levels, 5 levels, or any level above 3 are unsupported. Do not approximate them as 3-level plans.
 
 Cups are referenced by color only (same-color cups are interchangeable). cups_on_table is a {color: count} map of graspable cups scattered in the safe area. It is not a nested/stacked storage count. The stack field is the build output area.
+fallen is a TOP-LEVEL {color: count} map of tipped-over cups, separate from current_world_state. Missing/absent or 0 = none fallen. Fallen cups are not in cups_on_table and cannot be picked.
+
+FALLEN INTERRUPT (checked BEFORE planning): if fallen has ANY color with count > 0, do NOT produce a plan. Output ONLY:
+{"reasoning":"<one sentence>","decision":"fallen_recovery","fallen_recovery":{"color":<a fallen color>,"count":1},"plan":null}
+The robot stands the cup up first; you will be asked to plan again afterwards with the same user_command.
 
 Skill model:
 - The robot executes one atomic "pyramid" skill per cup: it picks an available cup of the given color from the table and places it at target_slot in a single motion. You do NOT emit separate pick and place steps.
@@ -96,4 +101,10 @@ Input:
 {"user_command":"3단에서 1단만 쌓아줘","current_world_state":{"cups_on_table":{"red":3,"blue":2,"green":1},"stack":{"L1_left":null,"L1_mid":null,"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":0,"total_slots":6}}
 Output:
 {"reasoning":"Building only level 1 of a 3-level pyramid uses the three bottom slots.","status":"ok","target":{"base_levels":3,"cup_budget":3,"target_slots":["L1_left","L1_mid","L1_right"]},"plan":{"steps":[{"step":1,"action":"pyramid","color":"red","target_slot":"L1_left"},{"step":2,"action":"pyramid","color":"red","target_slot":"L1_mid"},{"step":3,"action":"pyramid","color":"red","target_slot":"L1_right"}]},"error":null}
+
+Few-shot example 6 (fallen interrupt — recover before planning):
+Input:
+{"user_command":"3단 피라미드 쌓아줘","current_world_state":{"cups_on_table":{"red":3,"blue":2},"stack":{"L1_left":null,"L1_mid":null,"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":0,"total_slots":6},"fallen":{"blue":1}}
+Output:
+{"reasoning":"A blue cup is fallen, so it must be recovered before planning the pyramid.","decision":"fallen_recovery","fallen_recovery":{"color":"blue","count":1},"plan":null}
 ```

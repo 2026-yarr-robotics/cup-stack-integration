@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from plan_executor_node import (  # noqa: E402
     TrackedCup,
     build_move_body,
+    fallen_counts,
     llm_to_api_slot,
     parse_label,
     select_cup,
@@ -45,6 +46,38 @@ class PlanExecutorTest(unittest.TestCase):
             build_move_body(0.280, -0.15, 0.45),
             {'x': 0.280, 'y': -0.15, 'z': 0.45, 'mode': 'absolute'},
         )
+
+    def test_fallen_counts_only_fallen_class(self):
+        cups = {
+            1: TrackedCup(pos=(0.3, 0.0, 0.0), color='red',
+                          cls='fallen-cup', locked=True),
+            2: TrackedCup(pos=(0.3, 0.1, 0.0), color='red',
+                          cls='upright-cup', locked=True),
+            3: TrackedCup(pos=(0.3, 0.2, 0.0), color='blue',
+                          cls='cup', locked=True),
+            4: TrackedCup(pos=(0.3, 0.3, 0.0), color='red',
+                          cls='fallen-cup', locked=True),
+        }
+        self.assertEqual(fallen_counts(cups, set()), {'red': 2})
+
+    def test_fallen_counts_excludes_stacked_and_posless(self):
+        cups = {
+            1: TrackedCup(pos=(0.3, 0.0, 0.0), color='red',
+                          cls='fallen-cup', locked=True),
+            2: TrackedCup(pos=None, color='blue',
+                          cls='fallen-cup', locked=True),
+            3: TrackedCup(pos=(0.3, 0.2, 0.0), color='green',
+                          cls='fallen-cup', locked=True),
+        }
+        self.assertEqual(
+            fallen_counts(cups, {3}), {'red': 1})
+
+    def test_fallen_counts_empty_when_no_fallen(self):
+        cups = {
+            1: TrackedCup(pos=(0.3, 0.0, 0.0), color='red',
+                          cls='upright-cup', locked=True),
+        }
+        self.assertEqual(fallen_counts(cups, set()), {})
 
 
 if __name__ == '__main__':

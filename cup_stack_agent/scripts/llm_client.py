@@ -165,6 +165,36 @@ def validate_inflight(resp: dict, payload: dict) -> list[str]:
     return errs
 
 
+def validate_fallen_recovery(resp: dict, payload: dict | None = None) -> list[str]:
+    """Checks for the decision="fallen_recovery" interrupt (any mode).
+
+    The interrupt must NOT carry a plan (it never replaces current_plan), and
+    its color must exist in the payload's top-level ``fallen`` map — the LLM
+    cannot invent a cup to recover.
+    """
+    errs: list[str] = []
+    if resp.get('plan') is not None:
+        errs.append('decision=fallen_recovery requires plan=null')
+    rec = resp.get('fallen_recovery')
+    if not isinstance(rec, dict):
+        errs.append('decision=fallen_recovery requires a fallen_recovery object')
+        return errs
+    color = rec.get('color')
+    if not color:
+        errs.append('fallen_recovery missing color')
+        return errs
+    if isinstance(payload, dict):
+        fallen = payload.get('fallen') or {}
+        try:
+            count = int(fallen.get(str(color), 0) or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count <= 0:
+            errs.append(
+                f'fallen_recovery color {color!r} not present in fallen map')
+    return errs
+
+
 def _check_pyramid_steps(steps: list) -> list[str]:
     """Each step is one atomic `pyramid` action with color + target_slot."""
     errs: list[str] = []
