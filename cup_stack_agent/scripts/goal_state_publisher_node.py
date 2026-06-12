@@ -109,7 +109,21 @@ class GoalStatePublisher(Node):
         # scan FSM ⇒ no event ⇒ no added latency); timeout publishes anyway.
         self.declare_parameter('scan_event_topic', '/digital_twin/scan_event')
         self.declare_parameter('wait_scan_after_action', True)
-        self.declare_parameter('scan_sync_timeout_s', 8.0)
+        # Two-stage wait: a capture only happens if the arm actually parks
+        # inside the scan-home sphere. If NO capture_start arrives within
+        # scan_arm_grace_s of the action result (arm stopped elsewhere /
+        # missed the 20 mm tolerance), waiting longer cannot help — proceed.
+        # Only an IN-FLIGHT capture (capture_start newer than the action)
+        # justifies waiting the full timeout for its 'frozen'. The old
+        # single 8 s timeout charged every step the full penalty whenever
+        # the loop's return pose missed the scan home.
+        # NOTE an EMPTY scan costs nothing: 'frozen' fires even with 0 cups
+        # (scan ran, the world is what it is) and releases the gate
+        # immediately. The grace below is only the window for a capture to
+        # START — it cannot be 0 or the gate would release before the
+        # 0.3 s settle wait even begins on a perfectly aligned home return.
+        self.declare_parameter('scan_sync_timeout_s', 6.0)
+        self.declare_parameter('scan_arm_grace_s', 1.5)
 
         self._strict = bool(self.get_parameter('strict_json').value)
         self._on_world_change = bool(
@@ -155,8 +169,11 @@ class GoalStatePublisher(Node):
             self.get_parameter('wait_scan_after_action').value)
         self._scan_sync_timeout_s = float(
             self.get_parameter('scan_sync_timeout_s').value)
+        self._scan_arm_grace_s = float(
+            self.get_parameter('scan_arm_grace_s').value)
         self._scan_event_seen = False   # any event ⇒ scan FSM is alive
         self._scan_frozen_ns = 0        # event-payload 't' of last 'frozen'
+        self._scan_capstart_ns = 0      # event-payload 't' of capture_start
 
         self._pub = self.create_publisher(String, out_topic, 10)
         self.create_subscription(
@@ -249,11 +266,15 @@ class GoalStatePublisher(Node):
         if obj is None:
             return
         self._scan_event_seen = True
-        if obj.get('event') == 'frozen':
-            try:
-                self._scan_frozen_ns = int(float(obj.get('t', 0.0)) * 1e9)
-            except (TypeError, ValueError):
-                return
+        try:
+            t_ns = int(float(obj.get('t', 0.0)) * 1e9)
+        except (TypeError, ValueError):
+            return
+        ev = obj.get('event')
+        if ev == 'capture_start':
+            self._scan_capstart_ns = t_ns
+        elif ev == 'frozen':
+            self._scan_frozen_ns = t_ns
             self._maybe_publish_pending_action()
 
     def _on_user_command(self, msg: String) -> None:
@@ -426,17 +447,29 @@ class GoalStatePublisher(Node):
                 'no fresh /cups_on_table since action — proceeding on last world')
         # P1b: agent-scan sync — the decision must see the POST-action hand
         # scan ([S] refresh at the home pose). Engages only when the scan FSM
-        # is alive (≥1 event seen); time-bounded so a missed arrival/capture
-        # still advances the loop.
+        # is alive (≥1 event seen). Two-stage: a capture can only start if
+        # the arm actually parked inside the scan-home sphere, so without a
+        # capture_start within the SHORT grace the scan is not coming —
+        # waiting the full timeout would just stall every step (observed:
+        # the loop's return pose missed the 20 mm home tolerance and every
+        # decision ate the whole timeout). An in-flight capture
+        # (capture_start newer than the action) earns the full timeout for
+        # its 'frozen'.
         if (self._wait_scan and self._scan_event_seen
                 and self._scan_frozen_ns <= self._pending_action_at_ns):
             age = (self.get_clock().now().nanoseconds
                    - self._pending_action_at_ns) * 1e-9
-            if age < self._scan_sync_timeout_s:
+            capture_running = (
+                self._scan_capstart_ns > self._pending_action_at_ns)
+            limit = (self._scan_sync_timeout_s if capture_running
+                     else self._scan_arm_grace_s)
+            if age < limit:
                 return False
+            why = ('capture started but never froze' if capture_running
+                   else 'no capture started — arm missed the scan home?')
             self.get_logger().warn(
-                f'no post-action scan freeze within '
-                f'{self._scan_sync_timeout_s:.1f}s — proceeding without it')
+                f'no post-action scan freeze within {limit:.1f}s ({why}) '
+                f'— proceeding without it')
         # next step's slot occupancy still debouncing -> hold the decision.
         if self._next_slot_blocked:
             return False
