@@ -109,4 +109,22 @@ PLAYGROUND_ROOT 기준으로 resolve하므로 신구조에서 URDF 로드 실패
 - ✅ cherry-pick 충돌 없음(`start_isaac.sh` auto-merge 내용 검수), `bash -n` 통과
 - ✅ 머지 파일 `py_compile` 통과 (runtime.py, place_cup_at.py, robot.py)
 - ✅ urdf 경로 신구조에서 resolve 확인
-- ⚠️ **빌드/런타임(colcon, ROS, Isaac Sim) 여전히 미검증**
+- ✅ **colcon 빌드**: ros2-cup-stack ws 26패키지 + depth(3)/vision-node(1)/skill-manager(1)
+  전부 성공 (stderr는 doosan 벤더 deprecation 경고뿐)
+- ✅ **Isaac Sim 통합 런타임 1회 실행** (`script/start_isaac.sh`, 2026-06-12):
+  - Isaac 실시간 동기 유지 (`lag≈0s`, render 19–24ms, phys 3–4ms, `cam=C++writers`)
+  - URDF 신구조 경로 로드 성공 (3)의 수정 없이는 로드 실패였음
+  - 토픽 계약 정상: `aligned_depth_to_color/image_raw` 16UC1 4.3Hz (depth-noise 창),
+    `/digital_twin/boxes` 10Hz, `/vision/stack` 14Hz, `/gripper/{target_width,width}` (SimRG)
+  - DRCF 에뮬레이터 + 컨트롤러 3종 active, `GET /api/robot/position` 응답 정상
+  - 비고: dsr_moveit_controller 이중 spawner의 "can not be configured from 'active'"
+    에러 1회 — 최종 상태 active, 무해 (스크립트+런치 양쪽 spawn에 의한 기존 동작)
+- ✅ cup_stack_agent 단위테스트 25/26 — 실패 1건(`test_stabilizer`의 `aggregate`
+  import)은 origin/main 기존 결함 (`494e529` 리팩토링 때 심볼 제거, 본 통합과 무관)
+- ⚠️ server pytest는 로컬 환경 문제로 미실행 (httpx2 부재, pytest 6.2.5 ↔ anyio 4.13 비호환)
+
+### main 머지 전 참고
+
+- 떠 있던 docker compose 스택이 rename 이전 경로에서 기동된 상태였음 → 검증 중
+  `up -d`로 신구조 경로 기준으로 재생성됨 (nginx/robot 재생성, handineye/handtoeye 유지)
+- origin/main의 `test_stabilizer` import 결함은 별도 수정 권장
