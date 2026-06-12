@@ -62,8 +62,10 @@ class GoalStatePublisher(Node):
         self.declare_parameter('freeze_world_during_action', True)
         self.declare_parameter('freeze_timeout_s', 60.0)
         # After /action_result (arm homed) keep the world frozen this much
-        # longer so perception settles (~2s to stabilise) before resuming.
-        self.declare_parameter('unfreeze_settle_s', 1.5)
+        # longer so perception settles before resuming. 0.5s keeps the loop
+        # tight now that the arm parks at the exact joint HOME (no lifted-
+        # home drift to wait out); raise it if post-place counts flicker.
+        self.declare_parameter('unfreeze_settle_s', 0.5)
         # Hand-eye fallback at the DECISION moment only (cold-start /
         # post-action unfreeze): if exo cups_on_table is empty THEN, use the
         # hand-eye counts. Not a continuous supplement.
