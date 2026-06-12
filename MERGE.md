@@ -128,3 +128,31 @@ PLAYGROUND_ROOT 기준으로 resolve하므로 신구조에서 URDF 로드 실패
 - 떠 있던 docker compose 스택이 rename 이전 경로에서 기동된 상태였음 → 검증 중
   `up -d`로 신구조 경로 기준으로 재생성됨 (nginx/robot 재생성, handineye/handtoeye 유지)
 - origin/main의 `test_stabilizer` import 결함은 별도 수정 권장
+
+---
+
+## 후속 이식 3차 (2026-06-12 밤) — A–E 포트 누락 1건 + fusion.rviz 정리
+
+### 1) cup_stack_agent start.sh WITH_VISION/WITH_LLM 분리 누락 (`6faab74`)
+
+**증상**: start_isaac.sh의 vision-relay 창(WITH_LLM=false)이 Ollama 모델
+체크(`qwen3.6:35b` 미설치)에서 ERROR 종료 → hand-eye 보정 노드
+(`upright_cup_pose`)가 아예 뜨지 않음. "hand 보정이 YOLO 모델을 못 찾는다"로
+보였던 문제의 실체 (2차 런타임 검증에서도 vision-relay 창은 미점검 — 누락).
+
+**원인**: fork `cee9dea`(그룹 분리 + vision-only Ollama 스킵)가
+**cup_stack_agent — 통합 리포 자체 코드 — 를 건드려 서브모듈 중심의 A–E 포트
+에서 빠짐**. YOLO 경로 자체는 정상이었다: detection_node의 stat 불가 절대경로
+폴스루 fix는 depth 핀 `3ea3984`에 포함, start_isaac.sh의 HAND_EYE_WEIGHTS
+로컬 명시 경로도 유효(가중치 .pt는 git 추적 파일).
+
+**이식**: upstream start.sh가 독립 전진(centroid pick, 색 tie-break,
+recovery/freeze, DDS export)해 cherry-pick 충돌 → 수동 포트로 양쪽 보존.
+aggregator `user_command` 작은따옴표 yaml 트릭도 함께 (USER_COMMAND=' ' →
+None 파싱 사망 방지). 검증: `bash -n` + 양그룹 false 스모크런 (Ollama 스킵
+확인, exit 0).
+
+### 2) fusion.rviz 비활성화 (`25d8ea2`→핀 bump `c98ec1a`)
+
+fusion 뷰 통합으로 start_isaac.sh vision-fusion 창을 `rviz:=false`로. launch
+기본값(true)은 실기·수동용으로 유지 (`script/vision_rviz.sh VIEW=fusion`).
