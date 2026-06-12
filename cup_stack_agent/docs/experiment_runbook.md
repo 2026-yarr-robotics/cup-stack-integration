@@ -374,3 +374,40 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile scripts/*.py launch/agent.launch.py
 bash -n start.sh
 ```
+
+## Fallen-Cup Recovery (LLM interrupt)
+
+LLM 입력에 top-level `fallen` `{color: count}` 맵이 추가됐다. plan_executor가
+exo 트랙(`/digital_twin/boxes_filtered`)의 `fallen-cup` class 마커를 색상별로
+세어 `/fallen_cups`(JSON)로 0.5s마다 발행하고, GSP가 payload에 싣는다.
+
+`fallen`이 비어있지 않으면 LLM은 continue/replan/done 대신
+`decision="fallen_recovery"`(top-level interrupt, `plan=null`)를 출력한다.
+plan_executor는 **기존 plan/step을 건드리지 않고**:
+
+1. `fallen_cup_detect`(hand-eye YOLO 서비스) 미기동 시
+   `POST {ROBOT_API_BASE}/api/robot/fallen-cup/detection/start` 후 대기
+   (`detection_warmup_s`, 기본 15s).
+2. `POST {ROBOT_API_BASE}/api/robot/fallen-cup/recovery`
+   `{"mode":"place","multi_cup":false}` — 좌표/색상은 보내지 않는다
+   (recovery task가 자체 hand-eye 인식으로 grasp pose를 구한다. LLM color는
+   exo 트랙 사전 검증용).
+3. 비동기 task이므로 `GET /api/robot/status`의 `tasks[]`에서
+   `fallen_cup_recovery`가 `running`을 벗어날 때까지 폴링
+   (`recovery_timeout_s`, 기본 240s). `idle`=success, `failed`=fail.
+4. `/action_result` `{"step":null,"action":"fallen_recovery",...}` 발행.
+
+GSP는 recovery success 후 해당 색 fallen count가 실제로 줄 때까지
+`/llm_input` 발행을 보류한다(`recovery_clear_timeout_s`, 기본 8s; 타임아웃 시
+그냥 발행 → LLM이 재시도 판단). fallen이 비고 current_goal이 유효하면 LLM은
+`continue`로 기존 plan에 복귀한다 — recovery 후 자동 replan은 하지 않는다
+(stack slot이 무너진 경우에만 replan).
+
+주의:
+
+- 서버는 recovery 시작 전 자기가 관리하는 skill_api를 내리고 다음
+  pick/pyramid 호출 때 lazy 재시작한다(MoveItPy 초기화 최대 ~90s).
+  pick_node `api_timeout_sec`(180s)가 이를 흡수한다.
+- recovery 모션은 freeze 기본 60s를 넘길 수 있어 start.sh가 GSP
+  `freeze_timeout_s`를 240s로 올린다 (`FREEZE_TIMEOUT_S` env).
+- dry-run에서는 recovery POST 없이 success를 합성한다.

@@ -25,7 +25,8 @@ from std_msgs.msg import String
 
 from llm_client import (
     DEFAULT_MODEL, DEFAULT_OLLAMA_URL, call_ollama, load_system_prompt,
-    parse_model_json, validate_cold_start, validate_inflight)
+    parse_model_json, validate_cold_start, validate_fallen_recovery,
+    validate_inflight)
 
 COLD_PROMPT = 'cold_start_planner.md'
 INFLIGHT_PROMPT = 'inflight_decider.md'
@@ -109,8 +110,14 @@ class LLMNode(Node):
                     f'attempt {attempt}: bad JSON ({e}); raw[{len(content)}b] '
                     f'head={content[:1000]!r} tail={content[-1000:]!r}')
                 continue
-            errors = (validate_cold_start(parsed, payload) if cold
-                      else validate_inflight(parsed, payload))
+            # fallen_recovery is a mode-independent interrupt: both prompts
+            # may emit it (cold-start included), so route it before the
+            # mode-specific schema validation.
+            if parsed.get('decision') == 'fallen_recovery':
+                errors = validate_fallen_recovery(parsed, payload)
+            else:
+                errors = (validate_cold_start(parsed, payload) if cold
+                          else validate_inflight(parsed, payload))
             if errors:
                 self.get_logger().warn(
                     f'attempt {attempt}: validation failed: {errors}')

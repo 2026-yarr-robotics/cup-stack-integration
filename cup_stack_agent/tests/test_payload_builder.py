@@ -136,6 +136,64 @@ class GoalStateBuilderTest(unittest.TestCase):
             {'blue': 5},
         )
 
+    # ── fallen-cup map / recovery interrupt ───────────────────────────────
+
+    def test_fallen_defaults_to_empty(self):
+        builder = GoalStateBuilder()
+        self.assertEqual(builder.build_payload()['fallen'], {})
+
+    def test_set_fallen_normalizes_counts(self):
+        builder = GoalStateBuilder()
+        builder.set_fallen({
+            'red': 1,
+            'blue': 0,        # zero -> dropped
+            'green': -2,      # negative -> dropped
+            'purple': '2',    # int-coercible string -> kept
+            'gray': 'bad',    # non-coercible -> dropped
+            'white': True,    # bool -> dropped
+        })
+        self.assertEqual(
+            builder.build_payload()['fallen'], {'red': 1, 'purple': 2})
+
+    def test_set_fallen_non_dict_clears(self):
+        builder = GoalStateBuilder()
+        builder.set_fallen({'red': 1})
+        builder.set_fallen(None)
+        self.assertEqual(builder.build_payload()['fallen'], {})
+
+    def test_fallen_survives_user_command_reset(self):
+        builder = GoalStateBuilder()
+        builder.set_fallen({'red': 1})
+        builder.set_user_command('3단 피라미드 쌓아줘')
+        payload = builder.build_payload()
+        self.assertEqual(payload['mode'], 'cold_start')
+        self.assertEqual(payload['fallen'], {'red': 1})
+
+    def test_fallen_recovery_result_does_not_advance_plan(self):
+        builder = GoalStateBuilder()
+        builder.set_plan({
+            'steps': [
+                {'step': 1, 'action': 'pyramid', 'color': 'blue',
+                 'target_slot': 'L1_left'},
+                {'step': 2, 'action': 'pyramid', 'color': 'blue',
+                 'target_slot': 'L1_mid'},
+            ],
+        })
+
+        builder.on_action_result({
+            'step': None,
+            'action': 'fallen_recovery',
+            'color': 'red',
+            'result': 'success',
+            'failure_reason': None,
+        })
+
+        payload = builder.build_payload()
+        self.assertEqual(len(payload['current_plan']['remaining_steps']), 2)
+        self.assertEqual(payload['current_goal']['step'], 1)
+        self.assertEqual(
+            payload['last_action_result']['action'], 'fallen_recovery')
+
 
 if __name__ == '__main__':
     unittest.main()

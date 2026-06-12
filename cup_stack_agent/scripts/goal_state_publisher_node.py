@@ -77,6 +77,14 @@ class GoalStatePublisher(Node):
         # Give up waiting for a fresh /cups_on_table after an action and
         # advance on the last world if perception stalls this long.
         self.declare_parameter('pending_fresh_timeout_s', 5.0)
+        # Fallen-cup map {color: count} derived from the exo twin by
+        # plan_executor — merged into the payload top-level `fallen` field.
+        self.declare_parameter('fallen_cups_topic', '/fallen_cups')
+        # After a fallen_recovery success, hold the in-flight /llm_input
+        # until the recovered color's fallen count actually drops (otherwise
+        # the LLM sees the stale map and re-issues the same recovery). On
+        # timeout publish anyway so the LLM can decide retry/replan.
+        self.declare_parameter('recovery_clear_timeout_s', 8.0)
 
         self._strict = bool(self.get_parameter('strict_json').value)
         self._on_world_change = bool(
@@ -103,12 +111,18 @@ class GoalStatePublisher(Node):
         self._pending_action_at_ns = 0    # when the pending action arrived
         out_topic = str(self.get_parameter('llm_input_topic').value)
 
+        self._recovery_clear_timeout_s = float(
+            self.get_parameter('recovery_clear_timeout_s').value)
+
         self._builder = GoalStateBuilder()
         self._pending_action_result = None
         self._pending_action_before_world = None
         self._action_in_flight = False
         self._freeze_started_at = None
         self._unfreeze_at = None   # ns deadline for the post-settle unfreeze
+        # fallen_recovery success awaiting its fallen-map clear before the
+        # next /llm_input: {'result', 'before' (fallen snapshot), 'at_ns'}.
+        self._pending_recovery = None
 
         self._pub = self.create_publisher(String, out_topic, 10)
         self.create_subscription(
@@ -132,6 +146,9 @@ class GoalStatePublisher(Node):
         self.create_subscription(
             String, str(self.get_parameter('handeye_cups_topic').value),
             self._on_handeye_cups, 10)
+        self.create_subscription(
+            String, str(self.get_parameter('fallen_cups_topic').value),
+            self._on_fallen_cups, 10)
         # Wall-clock check of the unfreeze deadline / freeze timeout so it
         # fires even if perception stops (the gate alone is tick-driven).
         self.create_timer(0.2, self._freeze_tick)
@@ -173,12 +190,22 @@ class GoalStatePublisher(Node):
         if obj is not None:
             self._builder.set_robot_state(obj)
 
+    def _on_fallen_cups(self, msg: String) -> None:
+        obj = self._parse(msg.data, '/fallen_cups')
+        if obj is None:
+            return
+        if self._world_frozen():
+            return  # arm in view — same gate as cups/stack (transient class flips)
+        self._builder.set_fallen(obj)
+        self._maybe_publish_pending_recovery()
+
     def _on_user_command(self, msg: String) -> None:
         # Plain text, not JSON. Empty string clears the command.
         cmd = msg.data.strip() or None
         self.get_logger().info(f'/user_command received: {cmd!r}')
         self._pending_action_result = None
         self._pending_action_before_world = None
+        self._pending_recovery = None
         self._unfreeze_world('new user command')
         self._builder.set_user_command(cmd)
         self._publish()  # cold-start trigger
@@ -186,6 +213,24 @@ class GoalStatePublisher(Node):
     def _on_action_result(self, msg: String) -> None:
         obj = self._parse(msg.data, '/action_result')
         if obj is None:
+            return
+        if obj.get('action') == 'fallen_recovery':
+            self._schedule_unfreeze('fallen recovery finished')
+            self._builder.on_action_result(obj)  # plan NOT advanced (interrupt)
+            if obj.get('result') == 'success':
+                # Hold the in-flight trigger until the recovered color's
+                # fallen count drops — publishing with the stale map would
+                # make the LLM re-issue the same recovery.
+                self._pending_recovery = {
+                    'result': obj,
+                    'before': self._builder.fallen(),
+                    'at_ns': self.get_clock().now().nanoseconds,
+                }
+                self.get_logger().info(
+                    f'recovery success — waiting for fallen map to clear '
+                    f'(before={self._pending_recovery["before"]})')
+            else:
+                self._publish()  # fail → LLM decides retry/HITL immediately
             return
         self._schedule_unfreeze('post-place home settle')
         before = (self._builder.previous_world_state()
@@ -207,6 +252,12 @@ class GoalStatePublisher(Node):
         if obj is None:
             return
         decision = obj.get('decision')
+        if decision == 'fallen_recovery':
+            # Interrupt: current_plan/current_goal stay untouched. The
+            # recovery arm motion crosses the exo view, so freeze the world
+            # exactly like a pyramid action (released by its /action_result).
+            self._freeze_world('fallen recovery dispatched')
+            return
         if obj.get('status') == 'ok':
             self._builder.set_plan(obj)
         elif decision == 'replan' and obj.get('plan') is not None:
@@ -255,6 +306,11 @@ class GoalStatePublisher(Node):
     def _freeze_tick(self) -> None:
         """Wall-clock: release the freeze on the post-settle deadline or the
         safety timeout, independent of perception ticks."""
+        if self._pending_recovery is not None:
+            age = (self.get_clock().now().nanoseconds
+                   - self._pending_recovery['at_ns']) * 1e-9
+            if age >= self._recovery_clear_timeout_s:
+                self._maybe_publish_pending_recovery(timed_out=True)
         if not self._action_in_flight:
             return
         if (self._unfreeze_at is not None
@@ -273,6 +329,38 @@ class GoalStatePublisher(Node):
     def _world_frozen(self) -> bool:
         # Pure gate (no side effects); release timing is the timer's job.
         return self._freeze_enabled and self._action_in_flight
+
+    def _maybe_publish_pending_recovery(self, timed_out: bool = False) -> bool:
+        """Publish the post-recovery /llm_input once fallen actually cleared.
+
+        Cleared = the recovered color's count dropped below its pre-recovery
+        snapshot (taken at /action_result; the freeze kept it stable during
+        the arm motion). On timeout publish anyway — the LLM then sees the
+        still-fallen map and decides retry/HITL.
+        """
+        if self._pending_recovery is None:
+            return False
+        result = self._pending_recovery['result']
+        before = self._pending_recovery['before'] or {}
+        color = str(result.get('color') or '')
+        fallen = self._builder.fallen()
+        if color:
+            cleared = fallen.get(color, 0) < before.get(color, 0)
+        else:
+            cleared = not fallen
+        if not (cleared or timed_out):
+            return False
+        if cleared:
+            self.get_logger().info(
+                f'fallen {color!r} cleared after recovery: '
+                f'{before} -> {fallen}')
+        else:
+            self.get_logger().warn(
+                f'recovery clear-wait timed out — fallen still {fallen}; '
+                'publishing for LLM retry')
+        self._pending_recovery = None
+        self._publish()
+        return True
 
     def _maybe_publish_pending_action(self) -> bool:
         if self._pending_action_result is None:

@@ -263,6 +263,29 @@ def build_move_body(x: float, y: float, z: float, mode: str = 'absolute') -> dic
     return {'x': float(x), 'y': float(y), 'z': float(z), 'mode': mode}
 
 
+def fallen_counts(
+    cups: dict[int, TrackedCup],
+    stacked: set[int],
+) -> dict[str, int]:
+    """Tracked fallen-cup markers per color → ``{color: count}``.
+
+    Source for the LLM payload's top-level ``fallen`` map: exo digital-twin
+    labels carry both class (`fallen-cup`) and color, which the hand-eye
+    recovery perception (/fallen_cup/*) does not. Stacked track ids and
+    position-less markers are excluded, mirroring select_cup's guards.
+    """
+    counts: dict[str, int] = {}
+    for tid, cup in cups.items():
+        if cup.cls != 'fallen-cup':
+            continue
+        if tid in stacked:
+            continue
+        if cup.pos is None:
+            continue
+        counts[cup.color] = counts.get(cup.color, 0) + 1
+    return counts
+
+
 class PlanExecutorNode(Node):
     def __init__(self) -> None:
         super().__init__('plan_executor_node')
@@ -310,6 +333,29 @@ class PlanExecutorNode(Node):
         self.declare_parameter('handeye_fallback_grace_s', 0.5)
         self.declare_parameter("reserved_track_ttl_s", 45.0)
         self.declare_parameter('dry_run', True)
+        # ── Fallen-cup recovery (LLM interrupt) ────────────────────────────
+        # Robot dashboard server base (nginx :80 → FastAPI robot:8001) for the
+        # recovery task endpoints. Recovery is an ASYNC server task: POST
+        # /api/robot/fallen-cup/recovery returns at task START; completion is
+        # polled on /api/robot/status until the task leaves "running"
+        # (idle=clean exit / failed). The server stops its skill_api before
+        # the task (MoveItPy controller contention) and lazily restarts it on
+        # the next pick/pyramid call — pick_node's long api_timeout covers
+        # that restart.
+        self.declare_parameter('api_base_robot', 'http://localhost')
+        # lift 후 동작: place(옮겨 세움 — 세운 컵이 pick 후보로 재사용 가능).
+        self.declare_parameter('recovery_mode', 'place')
+        self.declare_parameter('recovery_timeout_s', 240.0)
+        self.declare_parameter('recovery_poll_s', 2.0)
+        # fallen_cup_detect(hand-eye YOLO 서비스)가 떠야 recovery task가 컵을
+        # sense 한다. 안 떠 있으면 여기서 start 하고 이 시간까지 기다린다.
+        self.declare_parameter('detection_warmup_s', 15.0)
+        # Per-color fallen counts derived from the exo twin (see
+        # fallen_counts) — goal_state_publisher merges this into /llm_input.
+        self.declare_parameter('fallen_cups_topic', '/fallen_cups')
+        # Recovery completion goes straight to GSP (pick_node owns the
+        # pyramid /action_result; recovery never reaches pick_node).
+        self.declare_parameter('action_result_topic', '/action_result')
 
         llm_out = str(self.get_parameter('llm_output_topic').value)
         move_topic = str(self.get_parameter('move_result_topic').value)
@@ -339,6 +385,17 @@ class PlanExecutorNode(Node):
         self._reserved_track_ttl_s = float(
             self.get_parameter("reserved_track_ttl_s").value)
         self._dry_run = bool(self.get_parameter('dry_run').value)
+        self._api_base = str(
+            self.get_parameter('api_base_robot').value).rstrip('/')
+        self._recovery_mode = str(self.get_parameter('recovery_mode').value)
+        self._recovery_timeout_s = float(
+            self.get_parameter('recovery_timeout_s').value)
+        self._recovery_poll_s = max(0.5, float(
+            self.get_parameter('recovery_poll_s').value))
+        self._detection_warmup_s = float(
+            self.get_parameter('detection_warmup_s').value)
+        fallen_topic = str(self.get_parameter('fallen_cups_topic').value)
+        action_topic = str(self.get_parameter('action_result_topic').value)
 
         self._state_lock = threading.Lock()
         self._cups: dict[int, TrackedCup] = {}
@@ -361,9 +418,12 @@ class PlanExecutorNode(Node):
         self.create_subscription(String, stack_topic, self._on_stack, 10)
         self._handeye_pub = self.create_publisher(
             String, handeye_cups_topic, 10)
+        self._fallen_pub = self.create_publisher(String, fallen_topic, 10)
+        self._action_pub = self.create_publisher(String, action_topic, 10)
         self.create_subscription(
             MarkerArray, handeye_boxes_topic, self._on_handeye_boxes, 10)
         self.create_timer(0.5, self._publish_handeye_counts)
+        self.create_timer(0.5, self._publish_fallen_counts)
         self.create_timer(2.0, self._refresh_pyramid_slots)
         self._refresh_pyramid_slots()
 
@@ -457,6 +517,13 @@ class PlanExecutorNode(Node):
             data = json.loads(msg.data)
         except json.JSONDecodeError as e:
             self.get_logger().error(f'/llm_output invalid JSON: {e}')
+            return
+
+        if data.get('decision') == 'fallen_recovery':
+            # INTERRUPT (cold-start or in-flight): stand the fallen cup via
+            # the server task, leaving _plan/_step_idx untouched — the LLM
+            # resumes the existing plan with `continue` once fallen clears.
+            self._execute_fallen_recovery(data.get('fallen_recovery') or {})
             return
 
         if 'status' in data:  # cold-start
@@ -616,6 +683,158 @@ class PlanExecutorNode(Node):
         for _i, _xy, col in grasp:
             counts[col] = counts.get(col, 0) + 1
         self._handeye_pub.publish(String(data=json.dumps(counts)))
+
+    def _publish_fallen_counts(self) -> None:
+        with self._state_lock:
+            counts = fallen_counts(self._cups, set(self._stacked_ids))
+        self._fallen_pub.publish(String(data=json.dumps(counts)))
+
+    # ── fallen-cup recovery (LLM interrupt — current plan untouched) ───────
+
+    def _execute_fallen_recovery(self, recovery: dict) -> None:
+        color = str(recovery.get('color') or '').lower() or None
+        with self._state_lock:
+            if self._busy:
+                self.get_logger().warn(
+                    'fallen_recovery ignored — executor busy')
+                return
+            self._busy = True
+        threading.Thread(
+            target=self._do_fallen_recovery_step,
+            args=(color,), daemon=True).start()
+
+    def _do_fallen_recovery_step(self, color: str | None) -> None:
+        try:
+            result, reason = self._do_fallen_recovery(color)
+        except Exception as exc:  # noqa: BLE001
+            result, reason = 'fail', f'recovery exception: {exc}'
+        # Recovery's completion signal goes straight to GSP. step=null on
+        # purpose: it is not a plan step, so GSP never advances the plan on
+        # it, and _step_idx here stays where the interrupt found it.
+        out = {
+            'step': None,
+            'action': 'fallen_recovery',
+            'color': color,
+            'result': result,
+            'failure_reason': reason,
+        }
+        try:
+            self._action_pub.publish(String(data=json.dumps(out)))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f'/action_result publish failed: {exc}')
+        self.get_logger().info(f'/action_result {result}: {out}')
+        with self._state_lock:
+            self._busy = False
+
+    def _do_fallen_recovery(
+        self, color: str | None,
+    ) -> tuple[str, str | None]:
+        if not color:
+            return 'fail', 'fallen_recovery missing color'
+        with self._state_lock:
+            counts = fallen_counts(self._cups, set(self._stacked_ids))
+        if counts.get(color, 0) <= 0:
+            return 'fail', f'no fallen {color} cup tracked (fallen={counts})'
+        url = f'{self._api_base}/api/robot/fallen-cup/recovery'
+        # The recovery task does its OWN hand-eye perception (fallen_cup_detect
+        # → /fallen_cup/* grasp pose) — the API takes no coordinates and no
+        # color, so the LLM's color is a pre-check only; the task stands the
+        # nearest fallen cup it sees. multi_cup=false keeps the contract one
+        # interrupt = one cup; remaining fallen cups re-trigger on the next
+        # LLM cycle.
+        body = {
+            'mode': self._recovery_mode,
+            'multi_cup': False,
+            'dry_run': False,
+            'sim': False,
+        }
+        if self._dry_run:
+            self.get_logger().info(f'[dry-run] POST {url} {body}')
+            return 'success', None
+        if not self._ensure_fallen_detection():
+            return 'fail', 'fallen_cup_detect service unavailable'
+        self.get_logger().info(f'POST {url} {body}')
+        res = self._http_post_json(url, body)
+        if not res.ok:
+            return 'fail', f'recovery start failed: {res.detail}'
+        return self._wait_recovery_task()
+
+    def _ensure_fallen_detection(self) -> bool:
+        """Start the hand-eye fallen_cup_detect service if it is not running.
+
+        Service start loads YOLO weights, so poll detection_running up to
+        detection_warmup_s. The recovery task still does its own topic
+        sensing with retries, so "running" (not "publishing") is enough here.
+        """
+        state_url = f'{self._api_base}/api/robot/fallen-cup/state'
+        res = self._http_get_json(state_url)
+        if res.ok and (res.data or {}).get('detection_running'):
+            return True
+        start = self._http_post_json(
+            f'{self._api_base}/api/robot/fallen-cup/detection/start', {})
+        if not start.ok and 'HTTP 409' not in start.detail:
+            self.get_logger().warn(
+                f'fallen detection start failed: {start.detail}')
+            return False
+        deadline = time.monotonic() + self._detection_warmup_s
+        while time.monotonic() < deadline:
+            res = self._http_get_json(state_url)
+            if res.ok and (res.data or {}).get('detection_running'):
+                return True
+            time.sleep(1.0)
+        return False
+
+    def _wait_recovery_task(self) -> tuple[str, str | None]:
+        """Poll /api/robot/status until fallen_cup_recovery leaves running.
+
+        LaunchManager marks the one-shot task idle on exit code 0 and failed
+        otherwise; transient poll errors are retried until the deadline.
+        """
+        url = f'{self._api_base}/api/robot/status'
+        deadline = time.monotonic() + self._recovery_timeout_s
+        while time.monotonic() < deadline:
+            time.sleep(self._recovery_poll_s)
+            res = self._http_get_json(url)
+            if not res.ok:
+                continue
+            status = None
+            for task in (res.data or {}).get('tasks') or []:
+                if task.get('name') == 'fallen_cup_recovery':
+                    status = str(task.get('status') or '')
+                    break
+            if status in ('running', 'stopping'):
+                continue
+            if status == 'idle':
+                return 'success', None
+            if status == 'failed':
+                return 'fail', ('fallen_cup_recovery task failed '
+                                '(see /api/robot/task/log)')
+            return 'fail', 'fallen_cup_recovery task not found on server'
+        return 'fail', (
+            f'recovery timed out after {self._recovery_timeout_s:.0f}s')
+
+    def _http_get_json(self, url: str) -> _HTTPResult:
+        try:
+            req = urllib.request.Request(
+                url, method='GET',
+                headers={'Accept': 'application/json',
+                         'User-Agent': 'curl/7.81.0'})
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                body = resp.read().decode('utf-8', 'replace')
+        except urllib.error.HTTPError as e:
+            return _HTTPResult(
+                ok=False,
+                detail=f'HTTP {e.code}: '
+                       f'{e.read().decode("utf-8", "replace")[:200]}')
+        except urllib.error.URLError as e:
+            return _HTTPResult(ok=False, detail=f'network: {e.reason}')
+        except Exception as e:  # noqa: BLE001
+            return _HTTPResult(ok=False, detail=f'transport: {e}')
+        try:
+            return _HTTPResult(ok=True, data=json.loads(body))
+        except ValueError:
+            return _HTTPResult(
+                ok=False, detail=f'non-JSON response: {body[:200]}')
 
     def _do_move(
         self, color: str | None, llm_slot: str | None,
