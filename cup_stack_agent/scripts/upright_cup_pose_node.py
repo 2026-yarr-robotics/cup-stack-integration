@@ -159,6 +159,89 @@ def classify_color_bgr(mean_bgr):
     return "red"
 
 
+class CupTracker:
+    """base_link 공간 컵 트래커 — 프레임 간 매칭 후 EMA 평활 + outlier 제거.
+
+    정지 컵은 base_link 에서 좌표가 고정이므로(카메라가 움직여도), base 공간에서
+    평활하면 카메라 모션과 무관하게 per-frame 튐(볼트구멍 오선택 등)을 걸러낸다.
+    단발 outlier 는 무시(평활값 유지), 같은 방향으로 연속되면 컵이 실제로 옮겨진
+    것으로 보고 재획득한다. 트랙 id 는 안정적으로 유지해 마커 id 로도 쓴다.
+    """
+
+    def __init__(self, match_dist, alpha, outlier_dist, reacquire_frames,
+                 timeout_sec, min_hits):
+        self.match_dist = float(match_dist)
+        self.alpha = float(alpha)
+        self.outlier_dist = float(outlier_dist)
+        self.reacquire_frames = int(reacquire_frames)
+        self.timeout_sec = float(timeout_sec)
+        self.min_hits = int(min_hits)
+        self.tracks = []          # 각 트랙: dict(id,xyz,color,last_seen,hits,outliers)
+        self._next_id = 0
+
+    def update(self, cups, now_sec):
+        """cups: [{"xy_base":(x,y),"z_base":z,"color":str,...}] → 평활된 cups 반환."""
+        meas = [np.array([c["xy_base"][0], c["xy_base"][1], c["z_base"]], float)
+                for c in cups]
+
+        # ── 그리디 최근접 매칭 (xy 거리 ≤ match_dist) ──
+        pairs = []
+        for mi, p in enumerate(meas):
+            for ti, tr in enumerate(self.tracks):
+                d = math.hypot(p[0] - tr["xyz"][0], p[1] - tr["xyz"][1])
+                if d <= self.match_dist:
+                    pairs.append((d, mi, ti))
+        pairs.sort(key=lambda x: x[0])
+        m_used, t_used = set(), set()
+        for d, mi, ti in pairs:
+            if mi in m_used or ti in t_used:
+                continue
+            m_used.add(mi); t_used.add(ti)
+            self._update_track(self.tracks[ti], meas[mi], cups[mi], now_sec)
+
+        # ── 매칭 안 된 측정 → 새 트랙 ──
+        for mi, p in enumerate(meas):
+            if mi in m_used:
+                continue
+            self.tracks.append({
+                "id": self._next_id, "xyz": p.copy(),
+                "color": cups[mi]["color"], "last_seen": now_sec,
+                "hits": 1, "outliers": 0,
+            })
+            self._next_id += 1
+
+        # ── 오래된 트랙 폐기 ──
+        self.tracks = [t for t in self.tracks
+                       if now_sec - t["last_seen"] <= self.timeout_sec]
+
+        # ── 이번 프레임에 관측되고 충분히 확인된 트랙만 발행 ──
+        out = []
+        for t in self.tracks:
+            if t["last_seen"] == now_sec and t["hits"] >= self.min_hits:
+                out.append({
+                    "xy_base": (float(t["xyz"][0]), float(t["xyz"][1])),
+                    "z_base": float(t["xyz"][2]),
+                    "color": t["color"], "id": int(t["id"]),
+                })
+        return out
+
+    def _update_track(self, tr, p, cup, now_sec):
+        resid = math.hypot(p[0] - tr["xyz"][0], p[1] - tr["xyz"][1])
+        if resid > self.outlier_dist:
+            # 단발 outlier 는 무시(평활값 유지). 연속되면 컵이 실제 이동 → 재획득.
+            tr["outliers"] += 1
+            if tr["outliers"] >= self.reacquire_frames:
+                tr["xyz"] = p.copy()
+                tr["outliers"] = 0
+        else:
+            a = self.alpha
+            tr["xyz"] = (1.0 - a) * tr["xyz"] + a * p
+            tr["outliers"] = 0
+        tr["color"] = cup["color"]
+        tr["last_seen"] = now_sec
+        tr["hits"] += 1
+
+
 class UprightCupPoseNode(Node):
     """hand-eye 카메라 → base_link 변환까지 떠안고 /hand_eye/boxes 를 내는 비전 노드.
 
@@ -199,30 +282,58 @@ class UprightCupPoseNode(Node):
         # (pick 좌표 경로)와 world_state 에는 절대 관여하지 않는다 — count 만.
         self.declare_parameter("fallen_class_name", "fallen-cup")
         self.declare_parameter("fallen_count_topic", "/fallen_cups")
+        # 중복 검출 제거: pick point 가 이 거리(px) 안인 같은 클래스 검출은
+        # conf 높은 것만 남긴다. 0 이하면 비활성. (YOLO NMS 가 못 거른 겹침 정리)
+        self.declare_parameter("dedup_min_dist_px", 25.0)
 
-        # -- pick point method ----------------------------
-        # A standing cup seen from above shows its rim circle; if the seg
-        # mask also catches the side wall and elongates, the moments centroid
-        # drifts off the rim center. We re-detect the "circle part" instead.
-        #   top_hole  : top-face donut hole (dark central hole) center -- precise
-        #               pick into the cup mouth / through-hole
-        #   inscribed : distance-transform max = largest inscribed circle (robust default)
-        #   hough     : HoughCircles rim detection on the image
-        #   centroid  : original moments centroid (unchanged)
+        # ── 시간 평활/트래킹 (base_link 공간) ────────────────
+        # 검출 컵을 프레임 간 추적해 EMA 평활 + outlier(볼트구멍 오선택 등) 제거.
+        # hand-eye 카메라가 움직여도 정지 컵은 base_link 에서 고정이라 base 공간에서
+        # 평활하면 카메라 모션과 무관하게 튐을 걸러낸다.
+        self.declare_parameter("enable_temporal_smoothing", True)
+        # match_dist 는 컵 간격(≈0.10m)보다 작고 outlier_dist 보다는 커야 한다
+        # (outlier 측정이 트랙에 붙어서 게이트로 걸러지도록).
+        self.declare_parameter("track_match_dist", 0.08)     # 같은 컵 매칭 거리(m)
+        self.declare_parameter("smoothing_alpha", 0.4)        # EMA 계수(클수록 빠름)
+        self.declare_parameter("track_outlier_dist", 0.04)    # 이 이상 튀면 outlier(m)
+        self.declare_parameter("track_reacquire_frames", 4)   # 연속 outlier 시 재획득
+        self.declare_parameter("track_timeout_sec", 0.5)      # 미검출 트랙 폐기(s)
+        self.declare_parameter("track_min_hits", 2)           # 발행 전 최소 관측수
+
+        # ── pick point 산출 방식 ────────────────────────────
+        # 똑바로 선 컵을 위에서 보면 윗면 원(rim)이 보이는데, seg mask 에 옆면이
+        # 같이 잡혀 길쭉해지면 moments 무게중심이 원 중심에서 벗어난다. 그래서
+        # mask 에서 "원 부분"만 다시 잡아 그 중심을 pick point 로 쓴다.
+        #   top_ellipse : 입구(내부 구멍)에 타원 피팅 → 중심. 기운 컵에 가장 정확.
+        #   top_hole  : 입구(내부 구멍) 무게중심 — 컵 입구/관통홀 정밀 pick
+        #   inscribed : distance transform 최댓값 위치 = 가장 큰 내접원 중심 (강건 기본)
+        #   hough     : 이미지에서 HoughCircles 로 rim 원을 직접 검출
+        #   centroid  : 기존 moments 무게중심 (변경 없음)
         self.declare_parameter("pick_point_method", "inscribed")
-        # hough tuning (radius ratio is relative to contour bbox short side).
+        # hough 전용 튜닝값 (반지름 비율은 contour bbox 짧은 변 기준).
         self.declare_parameter("hough_dp", 1.2)
         self.declare_parameter("hough_param1", 100.0)
         self.declare_parameter("hough_param2", 25.0)
         self.declare_parameter("hough_min_radius_ratio", 0.25)
         self.declare_parameter("hough_max_radius_ratio", 0.75)
-        # top_hole tuning. brightness threshold uses Otsu (lighting-adaptive)
-        # by default; dark_percentile is a safety cap when Otsu misbehaves.
-        self.declare_parameter("top_hole_face_ratio", 0.95)
-        self.declare_parameter("top_hole_min_circularity", 0.45)
-        self.declare_parameter("top_hole_dark_percentile", 35.0)
-        self.declare_parameter("top_hole_min_area_frac", 0.01)
-        self.declare_parameter("top_hole_max_area_frac", 0.7)
+        # top_hole 튜닝값. 밝기 임계는 Otsu(조명 자동적응)를 기본으로 쓰고
+        # dark_percentile 은 Otsu 가 비정상일 때의 안전 상한이다.
+        # 탐색 반경 = 내접원 r×이값. 기운 컵은 입구 중심이 내접원(몸통쪽 치우침)에서
+        # 멀어 작게 잡으면 입구가 후보에서 빠진다 → 넉넉히(>=2) 둬 입구를 포함시킨다.
+        self.declare_parameter("top_hole_face_ratio", 2.5)
+        self.declare_parameter("top_hole_min_circularity", 0.45)  # 원형도 하한(그림자 제거)
+        self.declare_parameter("top_hole_dark_percentile", 35.0)  # Otsu 안전 상한(%)
+        self.declare_parameter("top_hole_min_area_frac", 0.01)    # 윗면 대비 홀 최소 면적비
+        self.declare_parameter("top_hole_max_area_frac", 0.7)     # 윗면 대비 홀 최대 면적비
+        # 선택 점수 = 면적 × (1 − penalty·(dist/face_r)²). 0 이면 순수 최대 면적,
+        # 클수록 가장자리(볼트홀/그림자) 감점 ↑. 면적 지배로 center 구멍을 고른다.
+        self.declare_parameter("top_hole_centrality_penalty", 0.4)
+        # 내부 구멍 제약: 어두운 영역이 실루엣 가장자리에 둘레의 이 비율 이상 닿으면
+        # 몸통 그림자로 보고 제외. 입구(rim 둘러싸인 내부 구멍)만 남긴다.
+        self.declare_parameter("top_hole_enclosed_only", True)
+        self.declare_parameter("top_hole_border_touch_ratio", 0.10)
+        # top_ellipse: 타원 축비(장축/단축)가 이 값 초과면 저신뢰 → inscribed 폴백.
+        self.declare_parameter("top_ellipse_max_axis_ratio", 3.0)
 
         # ── 좌표 변환 (camera → base_link) ──────────────────
         self.declare_parameter("base_frame", "base_link")
@@ -256,10 +367,24 @@ class UprightCupPoseNode(Node):
             self.get_parameter("fallen_class_name").value)
         self.fallen_count_topic = str(
             self.get_parameter("fallen_count_topic").value)
+        self.dedup_min_dist_px = float(
+            self.get_parameter("dedup_min_dist_px").value)
+
+        self.enable_temporal_smoothing = as_bool(
+            self.get_parameter("enable_temporal_smoothing").value)
+        self.tracker = CupTracker(
+            match_dist=float(self.get_parameter("track_match_dist").value),
+            alpha=float(self.get_parameter("smoothing_alpha").value),
+            outlier_dist=float(self.get_parameter("track_outlier_dist").value),
+            reacquire_frames=int(self.get_parameter("track_reacquire_frames").value),
+            timeout_sec=float(self.get_parameter("track_timeout_sec").value),
+            min_hits=int(self.get_parameter("track_min_hits").value),
+        )
+
         self.pick_point_method = str(
             self.get_parameter("pick_point_method").value).strip().lower()
         if self.pick_point_method not in (
-                "top_hole", "inscribed", "hough", "centroid"):
+                "top_ellipse", "top_hole", "inscribed", "hough", "centroid"):
             self.get_logger().warn(
                 f"unknown pick_point_method '{self.pick_point_method}', "
                 f"falling back to 'inscribed'")
@@ -281,6 +406,14 @@ class UprightCupPoseNode(Node):
             self.get_parameter("top_hole_min_area_frac").value)
         self.top_hole_max_area_frac = float(
             self.get_parameter("top_hole_max_area_frac").value)
+        self.top_hole_centrality_penalty = float(
+            self.get_parameter("top_hole_centrality_penalty").value)
+        self.top_hole_enclosed_only = as_bool(
+            self.get_parameter("top_hole_enclosed_only").value)
+        self.top_hole_border_touch_ratio = float(
+            self.get_parameter("top_hole_border_touch_ratio").value)
+        self.top_ellipse_max_axis_ratio = float(
+            self.get_parameter("top_ellipse_max_axis_ratio").value)
 
         self.base_frame = str(self.get_parameter("base_frame").value)
         calib_file = str(self.get_parameter("calib_file").value)
@@ -444,7 +577,7 @@ class UprightCupPoseNode(Node):
             cy = float(M["m01"] / M["m00"])
             centroid = np.array([cx, cy], dtype=np.float32)
 
-            # re-detect the rim "circle" / top-hole center from the mask.
+            # 옆면이 같이 잡혀 길쭉해진 mask 에서 "원(rim)" 중심을 다시 잡는다.
             center, radius = self.compute_pick_point(
                 frame_bgr, binary, contour, centroid)
 
@@ -454,41 +587,69 @@ class UprightCupPoseNode(Node):
                 "mask": binary,
                 "contour": contour,
                 "area": area,
-                "center": center,        # pick point (circle / hole center)
-                "centroid": centroid,    # original moments centroid (debug compare)
-                "pick_radius": radius,   # detected circle radius (px) or None
+                "center": center,        # pick point (원 중심)
+                "centroid": centroid,    # 기존 무게중심 (debug 비교용)
+                "pick_radius": radius,   # 검출된 원 반지름(px) 또는 None
                 "conf": conf,
                 "cls_id": cls_id,
                 "cls_name": self._class_id_to_name(cls_id),
             })
-        return detections
+        return self._dedup_detections(detections)
 
-    # -- pick point: "circle" / top-hole center of the mask ----
+    def _dedup_detections(self, detections):
+        """pick point 가 dedup_min_dist_px 안인 **같은 클래스** 검출은 conf 높은
+        것만 남긴다. YOLO NMS 가 못 거른 겹친 중복 검출(같은 컵 두 번)을 정리."""
+        if self.dedup_min_dist_px <= 0 or len(detections) < 2:
+            return detections
+        thr2 = self.dedup_min_dist_px ** 2
+        kept = []
+        for det in sorted(detections, key=lambda d: d["conf"], reverse=True):
+            c = det["center"]
+            dup = False
+            for k in kept:
+                if k["cls_id"] != det["cls_id"]:
+                    continue
+                kc = k["center"]
+                if (c[0] - kc[0]) ** 2 + (c[1] - kc[1]) ** 2 <= thr2:
+                    dup = True
+                    break
+            if not dup:
+                kept.append(det)
+        return kept
+
+    # ── pick point: mask 의 "원" 중심 산출 ────────────────────
     def compute_pick_point(self, frame_bgr, binary, contour, centroid):
-        """Return pick point (u,v) and circle radius (px, None if absent) by
-        the selected method. Every method falls back to the moments centroid.
+        """선택된 방식으로 pick point (u,v) 와 원 반지름(px, 없으면 None) 반환.
+
+        모든 방식은 실패 시 moments 무게중심(centroid)으로 폴백한다.
         """
         method = self.pick_point_method
         if method == "centroid":
             return centroid, None
+        if method == "top_ellipse":
+            res = self._top_ellipse(frame_bgr, binary, centroid)
+            if res is not None:
+                return res
+            # 타원 피팅 실패/저신뢰 → 내접원으로 폴백
+            return self._inscribed_circle(binary, centroid)
         if method == "top_hole":
             res = self._top_hole(frame_bgr, binary, centroid)
             if res is not None:
                 return res
-            # hole detection failed -> fall back to inscribed circle
+            # 홀 검출 실패 → 내접원으로 폴백
             return self._inscribed_circle(binary, centroid)
         if method == "hough":
             res = self._hough_circle(frame_bgr, contour, centroid)
             if res is not None:
                 return res
-            # hough failed -> fall back to inscribed circle
+            # hough 실패 → 내접원으로 폴백
             return self._inscribed_circle(binary, centroid)
-        # default: inscribed
+        # 기본: inscribed
         return self._inscribed_circle(binary, centroid)
 
     def _inscribed_circle(self, binary, centroid):
-        """distance-transform max = center of the largest inscribed circle;
-        ignores the elongated tail (side wall) and locks onto the round top."""
+        """distance transform 최댓값 = 가장 큰 내접원 중심. 길쭉한 꼬리(옆면)를
+        무시하고 둥근 윗부분 중심을 잡는다."""
         dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
         _, max_val, _, max_loc = cv2.minMaxLoc(dist)
         if max_val <= 0:
@@ -496,17 +657,21 @@ class UprightCupPoseNode(Node):
         center = np.array([float(max_loc[0]), float(max_loc[1])], dtype=np.float32)
         return center, float(max_val)
 
-    def _top_hole(self, frame_bgr, binary, centroid):
-        """Detect the center of the top-face donut hole (dark central hole).
-        Returns None on failure (caller falls back to inscribed).
+    def _find_opening(self, frame_bgr, binary):
+        """컵 입구(어두운 중앙 영역) 윤곽을 검출해 반환. (contour, face_center, face_r)
+        또는 실패 시 None. top_hole / top_ellipse 가 공유한다.
 
-        Lighting-robust design: (1) restrict the search to the TOP FACE
-        (inscribed-circle disk) so side-wall shadows cannot be mistaken for
-        the hole; (2) auto-threshold brightness with Otsu (relative rim/hole
-        split, lighting-adaptive), capped by dark_percentile; (3) score hole
-        candidates by circularity + centrality + area; (4) use the moments
-        centroid (not minEnclosingCircle) for the center."""
-        # 1) top-face region = inscribed-circle disk
+        강건성 설계:
+          1) 탐색 범위 = 내접원 디스크(`×face_ratio`, 기본 2.5). 기운 컵 입구가
+             내접원(몸통쪽 치우침)에서 멀어도 포함되도록 넉넉히 둔다.
+          2) Otsu 자동 임계(조명 적응) + dark_percentile 상한 가드.
+          3) **내부 구멍 제약(enclosed-only)**: 어두운 영역 윤곽이 컵 실루엣 가장자리
+             띠(`mask−erode`)에 둘레의 `border_touch_ratio` 이상 닿으면 제외. 입구는
+             rim 에 둘러싸인 내부 구멍이라 안 닿고, **몸통 옆면 그림자는 실루엣
+             가장자리에 붙어** 닿는다 → 그림자 오선택을 위상학적으로 차단.
+          4) **면적 지배 선택**: pick 대상(입구/center 구멍)은 남은 내부 구멍 중 가장
+             크다(볼트구멍은 작음). score = area × (1 − k·(dist/face_r)²).
+        """
         dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
         _, insc_r, _, insc_loc = cv2.minMaxLoc(dist)
         if insc_r < 4:
@@ -521,14 +686,12 @@ class UprightCupPoseNode(Node):
         if face_area < 30:
             return None
 
-        # 2) brightness (HSV V) of top-face pixels -> Otsu (lighting-adaptive)
         v = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)[:, :, 2]
         vals = v[face > 0]
         if vals.size < 30:
             return None
         otsu_thr, _ = cv2.threshold(
             vals.reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # guard if Otsu runs too high and marks most of the face as "dark".
         cap = float(np.percentile(vals, self.top_hole_dark_percentile))
         thr = min(float(otsu_thr), cap)
 
@@ -536,12 +699,14 @@ class UprightCupPoseNode(Node):
         dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
+        # 실루엣 가장자리 띠(내부 구멍 판정용).
+        border = cv2.subtract(binary, cv2.erode(binary, np.ones((9, 9), np.uint8)))
+
         cnts, _ = cv2.findContours(
             dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not cnts:
             return None
 
-        # 3) score candidate holes: circularity + centrality + area
         min_a = self.top_hole_min_area_frac * face_area
         max_a = self.top_hole_max_area_frac * face_area
         best = None
@@ -561,20 +726,60 @@ class UprightCupPoseNode(Node):
             hx = Mh["m10"] / Mh["m00"]
             hy = Mh["m01"] / Mh["m00"]
             dist_c = math.hypot(hx - face_center[0], hy - face_center[1])
-            if dist_c > face_r:                 # reject centers outside the top face
+            if dist_c > face_r:                 # 윗면 밖 중심은 제외
                 continue
-            # higher score = rounder, more central, larger.
-            score = circularity - 0.004 * dist_c + 0.0006 * a
+            # 내부 구멍 제약: 실루엣 가장자리에 많이 닿으면(=몸통 그림자) 제외.
+            if self.top_hole_enclosed_only:
+                bm = np.zeros_like(binary)
+                cv2.drawContours(bm, [c], -1, 255, -1)
+                touch = (cv2.countNonZero(cv2.bitwise_and(bm, border))
+                         / max(cv2.arcLength(c, True), 1.0))
+                if touch > self.top_hole_border_touch_ratio:
+                    continue
+            r = dist_c / face_r
+            score = a * (1.0 - self.top_hole_centrality_penalty * r * r)
             if best is None or score > best[0]:
-                best = (score, hx, hy, cr)
+                best = (score, c)
         if best is None:
             return None
-        center = np.array([best[1], best[2]], dtype=np.float32)
-        return center, float(best[3])
+        return best[1], face_center, face_r
+
+    def _top_hole(self, frame_bgr, binary, centroid):
+        """입구의 **무게중심(moments)** 을 pick 으로. 실패 시 None."""
+        found = self._find_opening(frame_bgr, binary)
+        if found is None:
+            return None
+        c = found[0]
+        Mh = cv2.moments(c)
+        if abs(Mh["m00"]) < 1e-6:
+            return None
+        center = np.array([Mh["m10"] / Mh["m00"], Mh["m01"] / Mh["m00"]], np.float32)
+        (_, _), cr = cv2.minEnclosingCircle(c)
+        return center, float(cr)
+
+    def _top_ellipse(self, frame_bgr, binary, centroid):
+        """입구에 **타원 피팅** 후 타원 중심을 pick 으로. 실패 시 None.
+
+        기운 컵 입구는 원이 타원으로 투영되는데, fitEllipse 중심이 기울기를 보정한
+        진짜 입구 중심이다. 부분/비대칭 영역에도 경계로 전체 타원을 복원해 무게중심보다
+        강건. 축비(단축/장축)가 비정상이면(과도 기울기·가림·엉뚱한 피팅) 거부 → 폴백.
+        """
+        found = self._find_opening(frame_bgr, binary)
+        if found is None:
+            return None
+        c = found[0]
+        if len(c) < 5:                          # fitEllipse 는 점 5개 이상 필요
+            return None
+        (cx, cy), (MA, ma), _ = cv2.fitEllipse(c)
+        if min(MA, ma) < 4.0:
+            return None
+        if max(MA, ma) / min(MA, ma) > self.top_ellipse_max_axis_ratio:
+            return None                         # 너무 납작 → 신뢰 낮음, 폴백
+        return np.array([cx, cy], np.float32), float((MA + ma) / 4.0)
 
     def _hough_circle(self, frame_bgr, contour, centroid):
-        """Detect the rim circle directly with HoughCircles inside the contour
-        bbox ROI. Returns None on failure (caller falls back to inscribed)."""
+        """contour bbox ROI 안에서 HoughCircles 로 rim 원을 직접 검출.
+        검출 실패 시 None (호출부가 내접원으로 폴백)."""
         x, y, w, h = cv2.boundingRect(contour)
         if min(w, h) < 4:
             return None
@@ -599,7 +804,7 @@ class UprightCupPoseNode(Node):
         if circles is None:
             return None
         circles = np.asarray(circles, dtype=np.float32).reshape(-1, 3)
-        # among circles whose center lies inside the contour, take the largest.
+        # contour 안에 중심이 들어오는 원 중 가장 큰 것을 고른다.
         best = None
         for cu, cv_, cr in circles:
             gu, gv = float(cu) + x0, float(cv_) + y0
@@ -727,17 +932,22 @@ class UprightCupPoseNode(Node):
                 "center": (float(u), float(v)),
             })
 
-        self.publish_boxes(cups)
+        # 시간 평활/트래킹 (base_link 공간): per-frame 튐·outlier 제거.
+        if self.enable_temporal_smoothing:
+            published = self.tracker.update(cups, time.time())
+        else:
+            published = cups
+        self.publish_boxes(published)
 
         # ── debug 시각화 ──
         for det in targets:
             cv2.drawContours(debug, [det["contour"]], -1, (0, 200, 255), 1)
-            # detected circle (inscribed/hough/top_hole) -- green outline
+            # 검출된 원(내접원/hough) — 초록 테두리
             if det.get("pick_radius"):
                 c = det["center"]
                 cv2.circle(debug, (int(c[0]), int(c[1])),
                            int(det["pick_radius"]), (0, 255, 0), 2)
-            # original centroid (gray) vs final pick point (red)
+            # 기존 무게중심(회색) vs 최종 pick point(빨강) 비교
             ctr = det.get("centroid")
             if ctr is not None:
                 cv2.circle(debug, (int(ctr[0]), int(ctr[1])), 3, (160, 160, 160), -1)
@@ -745,14 +955,15 @@ class UprightCupPoseNode(Node):
             cv2.circle(debug, (int(c[0]), int(c[1])), 4, (0, 0, 255), -1)
         cv2.putText(
             debug,
-            f"upright cups={len(targets)} published={len(cups)} "
-            f"fallen={fallen_n} pick={self.pick_point_method}",
+            f"upright cups={len(targets)} published={len(published)} "
+            f"fallen={fallen_n} pick={self.pick_point_method} "
+            f"smooth={self.enable_temporal_smoothing}",
             (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         self.publish_debug(debug, msg.header)
 
         elapsed = (time.time() - start) * 1000.0
         self.get_logger().info(
-            f"upright cups={len(targets)} published(base)={len(cups)} "
+            f"upright cups={len(targets)} base={len(cups)} published={len(published)} "
             f"fallen={fallen_n} time={elapsed:.1f} ms")
 
     # ── Publish ───────────────────────────────────────────────
@@ -771,12 +982,13 @@ class UprightCupPoseNode(Node):
             x, y = cup["xy_base"]
             z = cup["z_base"]
             color = cup["color"]
+            mid = int(cup.get("id", i))   # 트래커 안정 id(있으면) 사용
 
             top = Marker()
             top.header.frame_id = self.base_frame
             top.header.stamp = now
             top.ns = "box_top"
-            top.id = i
+            top.id = mid
             top.action = Marker.ADD
             top.type = Marker.SPHERE
             top.pose.position.x = x
@@ -789,14 +1001,14 @@ class UprightCupPoseNode(Node):
             label.header.frame_id = self.base_frame
             label.header.stamp = now
             label.ns = "box_labels"
-            label.id = i
+            label.id = mid
             label.action = Marker.ADD
             label.type = Marker.TEXT_VIEW_FACING
             label.pose.position.x = x
             label.pose.position.y = y
             label.pose.position.z = z
             label.pose.orientation.w = 1.0
-            label.text = f"#{i}_c={color}_upright-cup"
+            label.text = f"#{mid}_c={color}_upright-cup"
             markers.markers.append(label)
 
         self.boxes_pub.publish(markers)

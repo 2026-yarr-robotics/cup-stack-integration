@@ -53,6 +53,9 @@ HAND_EYE_MODE="${HAND_EYE_MODE:-real}"
 HAND_EYE_WEIGHTS="${HAND_EYE_WEIGHTS:-/home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt}"
 HAND_EYE_CALIB="${HAND_EYE_CALIB:-/home/ssu/cup-stack-integration/fallen-cup-recovery/dsr_practice/config/T_gripper2camera.npy}"
 HAND_EYE_DEVICE="${HAND_EYE_DEVICE:-cuda}"
+# pick point 선택 방식. top_ellipse = hand_pick 최신 (윗면 타원 + 내부구멍
+# 제약 — 몸통/그림자 오선택 제거). 구 동작으로 되돌리려면 centroid.
+HAND_EYE_PICK_METHOD="${HAND_EYE_PICK_METHOD:-top_ellipse}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_ID}}"
 
@@ -299,7 +302,7 @@ if [[ "${HAND_EYE_MODE}" == "real" ]]; then
     -p conf:=0.35 \
     -p base_frame:=base_link \
     -p target_class_name:=upright-cup \
-    -p pick_point_method:=centroid
+    -p pick_point_method:="${HAND_EYE_PICK_METHOD}"
 else
   launch fake_hand_eye python3 scripts/fake_hand_eye_node.py \
     --ros-args \
