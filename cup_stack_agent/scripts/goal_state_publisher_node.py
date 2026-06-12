@@ -32,6 +32,7 @@ import traceback
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
+from rclpy.qos import (QoSDurabilityPolicy, QoSProfile)
 from std_msgs.msg import String
 
 from payload_builder import (
@@ -98,6 +99,17 @@ class GoalStatePublisher(Node):
         # the stale pre-recovery sample. On timeout publish anyway so the LLM
         # can decide retry/replan.
         self.declare_parameter('recovery_clear_timeout_s', 8.0)
+        # Agent-scan sync (2026-06-13 flow): after every command the arm
+        # returns to its high home pose and cup_fusion auto-runs a hand scan
+        # there (clear→capture→freeze, ~1.3 s). The NEXT /llm_input must
+        # reason on that post-action fit, so the in-flight publish is held
+        # until a 'frozen' event on scan_event_topic NEWER than the
+        # /action_result. Auto-detects availability: the gate only engages
+        # once at least one scan event has been seen (vision without the
+        # scan FSM ⇒ no event ⇒ no added latency); timeout publishes anyway.
+        self.declare_parameter('scan_event_topic', '/digital_twin/scan_event')
+        self.declare_parameter('wait_scan_after_action', True)
+        self.declare_parameter('scan_sync_timeout_s', 8.0)
 
         self._strict = bool(self.get_parameter('strict_json').value)
         self._on_world_change = bool(
@@ -139,6 +151,12 @@ class GoalStatePublisher(Node):
         # fallen_recovery result awaiting a post-recovery hand-eye sample
         # before the next /llm_input: {'at_ns'}.
         self._pending_recovery = None
+        self._wait_scan = bool(
+            self.get_parameter('wait_scan_after_action').value)
+        self._scan_sync_timeout_s = float(
+            self.get_parameter('scan_sync_timeout_s').value)
+        self._scan_event_seen = False   # any event ⇒ scan FSM is alive
+        self._scan_frozen_ns = 0        # event-payload 't' of last 'frozen'
 
         self._pub = self.create_publisher(String, out_topic, 10)
         self.create_subscription(
@@ -165,6 +183,14 @@ class GoalStatePublisher(Node):
         self.create_subscription(
             String, str(self.get_parameter('fallen_cups_topic').value),
             self._on_fallen_cups, 10)
+        # TRANSIENT_LOCAL: matches cup_fusion's latched publisher (a stale
+        # latched event cannot satisfy a new wait — payload 't' is compared
+        # against the action timestamp).
+        self.create_subscription(
+            String, str(self.get_parameter('scan_event_topic').value),
+            self._on_scan_event,
+            QoSProfile(depth=1,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL))
         # Wall-clock check of the unfreeze deadline / freeze timeout so it
         # fires even if perception stops (the gate alone is tick-driven).
         self.create_timer(0.2, self._freeze_tick)
@@ -215,6 +241,20 @@ class GoalStatePublisher(Node):
         self._fallen_count_sample = normalize_fallen_count(obj.get('count'))
         self._fallen_seen_ns = self.get_clock().now().nanoseconds
         self._maybe_publish_pending_recovery()
+
+    def _on_scan_event(self, msg: String) -> None:
+        """cup_fusion scan lifecycle ('capture_start' | 'frozen'). A 'frozen'
+        newer than the pending /action_result releases the scan-sync hold."""
+        obj = self._parse(msg.data, '/digital_twin/scan_event')
+        if obj is None:
+            return
+        self._scan_event_seen = True
+        if obj.get('event') == 'frozen':
+            try:
+                self._scan_frozen_ns = int(float(obj.get('t', 0.0)) * 1e9)
+            except (TypeError, ValueError):
+                return
+            self._maybe_publish_pending_action()
 
     def _on_user_command(self, msg: String) -> None:
         # Plain text, not JSON. Empty string clears the command.
@@ -384,6 +424,19 @@ class GoalStatePublisher(Node):
                 return False
             self.get_logger().warn(
                 'no fresh /cups_on_table since action — proceeding on last world')
+        # P1b: agent-scan sync — the decision must see the POST-action hand
+        # scan ([S] refresh at the home pose). Engages only when the scan FSM
+        # is alive (≥1 event seen); time-bounded so a missed arrival/capture
+        # still advances the loop.
+        if (self._wait_scan and self._scan_event_seen
+                and self._scan_frozen_ns <= self._pending_action_at_ns):
+            age = (self.get_clock().now().nanoseconds
+                   - self._pending_action_at_ns) * 1e-9
+            if age < self._scan_sync_timeout_s:
+                return False
+            self.get_logger().warn(
+                f'no post-action scan freeze within '
+                f'{self._scan_sync_timeout_s:.1f}s — proceeding without it')
         # next step's slot occupancy still debouncing -> hold the decision.
         if self._next_slot_blocked:
             return False
