@@ -20,3 +20,6 @@
 [submodule "ros2-skill-manager"]
 	path = ros2-skill-manager
 	url = https://github.com/2026-yarr-robotics/ros2-skill-manager.git
+[submodule "yarr-isaac-playground"]
+	path = yarr-isaac-playground
+	url = https://github.com/2026-yarr-robotics/yarr-isaac-playground.git
