@@ -1,222 +1,354 @@
-# 서브모듈 평탄화(flatten) & 정리 계획
+# 서브모듈 평탄화(flatten) & cup-stack-server 해체 계획
 
 > 작성 브랜치: `chore/flatten-submodules` (worktree, `main` 기준)
-> 작성일: 2026-06-12
-> 목적: `cup-stack-integration` 의 중첩 서브모듈을 루트로 정리하고, org 레포 기준으로
-> (1) 실제 사용하는 레포만 서브모듈로 등록, (2) 미사용 코드·문서·브랜치를 제거 후보로 식별.
+> 최초 작성 2026-06-12 · **개정 2026-06-12** (전략 A 확정: cup-stack-server 해체)
+> 목적: `cup-stack-integration` 의 중첩 서브모듈을 루트 단일 계층으로 평탄화하고,
+> `cup-stack-server` 집합 레포를 해체한다. org 레포 기준 사용 레포만 루트 서브모듈로 둔다.
+
+---
+
+## 0. 확정된 결정 (이번 개정)
+
+- ✅ **전략 A 채택** — `cup-stack-server` **배포 단위 해체**. 모든 leaf 서브모듈을 integration 루트로.
+- ✅ **`cup-stack-server` 레포 미사용** — integration 의 서브모듈에서 제거. (leaf 들은 루트로 직접 등록)
+- ✅ **`cup-stack-server/script/` → integration 루트 `script/server/` 로 이동.**
+- ✅ `LLM-prompting`(archived·중복) 제거, `ros2-skill-manager` 정식 서브모듈 등록.
+- ✅ **등록 검토 범위 = org 의 모든 active 레포**(아카이브 레포 제외). 전수 검토는 §3-A.
+- ⚠️ **충돌 플래그**: `ros2-recode-sequence` 는 **아카이브 + 사용중**. "아카이브 제외" 규칙과
+  "런타임 사용" 이 충돌 → §3-A 및 §9-7 에서 별도 결정 필요.
 
 ---
 
 ## 1. 목적 & 범위
 
-- **평탄화**: 현재 2~3단계로 중첩된 서브모듈을 `cup-stack-integration` 루트(또는 의미 있는 단일 계층)로 끌어올린다.
-- **사용 레포 재등록**: [org 레포 목록](https://github.com/orgs/2026-yarr-robotics/repositories) 기준으로 *실제 런타임/빌드에 쓰이는* 레포만 서브모듈로 둔다.
-- **제거 후보 식별**: 아카이브된 레포 서브모듈, 미사용 코드·문서, stale 브랜치를 골라낸다.
-- 이 문서는 **계획만** 담는다. 실제 `git rm`/`git submodule add` 실행은 승인 후 별도 단계.
+- **평탄화 + 해체**: 2~3단 중첩 + cup-stack-server 집합 계층을 걷어내고, 루트에 leaf 레포를 평평하게 둔다.
+- **사용 레포만 등록**: [org 레포 목록](https://github.com/orgs/2026-yarr-robotics/repositories) 기준.
+- **제거 후보 식별**: 아카이브 서브모듈, 미사용 코드·문서, stale 브랜치.
+- 이 문서는 **계획**이다. 실제 `git rm`/`submodule add`/경로 수정은 승인 후 별도 단계.
 
 ---
 
-## 2. 현재 구조 (as-is, 재귀 서브모듈 트리)
+## 2. 현재 구조 (as-is)
 
 ```
 cup-stack-integration/                                   [repo @ main]
-├── cup_stack_agent/                                     ← 이 레포 자체 코드 (서브모듈 아님)
+├── cup_stack_agent/                                     ← 자체 코드 (서브모듈 아님)
 ├── tools/
-│   ├── run_skill_manager.sh                             ← wrapper (tracked)
-│   └── ros2-skill-manager/                              ← ros2-skill-manager.git clone (★ .gitignore 처리, 서브모듈 아님)
-├── docs/                                                ← 비어 있음 (.gitkeep)
+│   ├── run_skill_manager.sh
+│   └── ros2-skill-manager/                              ← ros2-skill-manager.git clone (.gitignore, 서브모듈 아님)
+├── docs/
 ├── vision_rviz.sh
-├── build/  install/  log/                               ← colcon 산출물 (.gitignore, 미추적)
-├── cup-stack-server/                          [submodule → cup-stack-server.git]
-│   ├── CLAUDE.md, docs/, script/, pull.sh, cup_stack/   ← 자체 파일
-│   ├── server/                                [submodule → server.git]   (docker-compose 포함)
+├── build/ install/ log/                                 ← colcon 산출물(.gitignore)
+├── cup-stack-server/                          [submodule → cup-stack-server.git]  ⚠️ 해체 대상
+│   ├── CLAUDE.md, pull.sh, .gitmodules
+│   ├── script/  (build_pyramid*.sh, cycle_*.sh, unstack*.sh)   ← script/server/ 로 이동
+│   ├── docs/    (*.docx, integration/*.md)
+│   ├── cup_stack/ros2/                                  ← root:root 잔재(빌드 마운트 추정)
+│   ├── server/                                [submodule → server.git]   (docker-compose)
 │   ├── ros2-cup-stack/                        [submodule → ros2-cup-stack.git]  (colcon ws)
 │   │   └── ros2/src/doosan-robot2/            [submodule → doosan-robot2.git @ yarr-integration]
 │   ├── frontend/                              [submodule → frontend.git]
 │   ├── fallen-cup-recovery/                   [submodule → fallen-cup-recovery.git @ released]
-│   └── LLM-prompting/                         [submodule → LLM-prompting.git] ⚠️ ARCHIVED
+│   └── LLM-prompting/                         [submodule → LLM-prompting.git] ⚠️ ARCHIVED·제거
 └── vision/
-    ├── ros2-depth-point-cloude/               [submodule → ros2-depth-point-cloude.git]
-    ├── vision-node/                           [submodule → vision-node.git]
-    └── ros2-recode-sequence/                  [submodule → ros2-recode-sequence.git] ⚠️ ARCHIVED(but 사용중)
+    ├── ros2-depth-point-cloude/               [submodule]
+    ├── vision-node/                           [submodule]
+    └── ros2-recode-sequence/                  [submodule] ⚠️ ARCHIVED(but 사용중·frozen)
 ```
 
-> 참고: `yarr-robust-speed-stack` 서브모듈은 직전 작업에서 이미 제거됨(미사용 dead scaffold).
+> `yarr-robust-speed-stack` 서브모듈은 직전 작업에서 제거 완료.
 
 ---
 
-## 3. Org 레포 인벤토리 & 분류
+## 2-bis. 의존성 트리 & 코드 사용 범위 (결정 근거)
 
-| 레포 | 상태 | 현재 서브모듈? | 사용 판정 | 근거 |
+### 런타임 의존성 트리 (closed loop)
+
+```
+user command
+   │
+   ▼
+cup_stack_agent  ───────────────────────────────────────────────┐  (이 레포 자체 코드)
+  ├─HTTP─▶ server (REST: /api/robot/skill/pyramid|unstack, /move) │
+  │          └─rosbridge─▶ ros2-cup-stack (cup_stack skill, MoveIt)
+  │                           └─colcon src─▶ doosan-robot2 (M0609 드라이버)
+  ├─sub◀── ros2-depth-point-cloude (depth_digital_twin: /digital_twin/boxes, detection)
+  ├─sub◀── vision-node (verifier_node: /stack 슬롯 판정)
+  ├─launch─ ros2-recode-sequence (recode_sequence: cameras_only.launch.py — 카메라 bringup)
+  └─prompts─ cup_stack_agent/prompts/*  (← 구 LLM-prompting, 이관 완료)
+
+frontend ──REST/ws──▶ server                         (대시보드)
+fallen-cup-recovery ──▶ ros2-cup-stack / server      (복구 skill, @released)
+ros2-skill-manager ──REST──▶ server                  (오퍼레이터 GUI, 별도 실행·메타 launch 미포함)
+
+[offline] vision-YOLO ──.pt 모델──▶ ros2-depth-point-cloude / vision-node   (학습 산출물만 소비)
+[absorbed] hand_pick ──▶ cup_stack_agent (pick_node/upright_cup_pose_node 로 inline)
+```
+
+### 코드 사용 범위 요약
+
+| 레포 | 사용 면(surface) | 결합 깊이 | 런타임? |
+|---|---|---|---|
+| `server` | REST/rosbridge 게이트웨이 | docker-compose · `../vision` 역참조 | ✅ |
+| `ros2-cup-stack` | cup_stack skill, MoveIt 실행 | colcon ws + doosan-robot2 src | ✅ |
+| `doosan-robot2` | 로봇 드라이버 | ros2-cup-stack `src/` bound | ✅ |
+| `ros2-depth-point-cloude` | `/digital_twin/boxes` 등 토픽 | install/setup.bash 소싱 | ✅ |
+| `vision-node` | `/stack` verifier | install/setup.bash 소싱 | ✅ |
+| `ros2-recode-sequence` | `cameras_only.launch.py` | install/setup.bash 소싱 | ✅ (but archived → 병합) |
+| `frontend` | 대시보드 UI | server compose | ✅(보조) |
+| `fallen-cup-recovery` | 복구 skill | ros2-cup-stack/server | ✅ |
+| `ros2-skill-manager` | 오퍼레이터 GUI | server REST(별도 실행) | ✅(도구) |
+| `LLM-prompting` | (런타임 미사용) | 프롬프트 cup_stack_agent 로 이관 | ❌ |
+| `hand_pick` | (런타임 미사용) | cup_stack_agent 로 흡수 | ❌ |
+| `vision-YOLO` | 모델 학습(오프라인) | 산출물 .pt 만 소비 | ❌(런타임) |
+| Isaac 계열 | 별도 통합/실험 | 무관 | ❌ |
+
+**정리 원칙(이 트리에서 도출):**
+1. **런타임 토픽/REST/colcon 으로 직접 엮인 것만** 서브모듈로 둔다 → server, ros2-cup-stack(+doosan-robot2), ros2-depth-point-cloude, vision-node, fallen-cup-recovery, ros2-skill-manager.
+2. **이관(병합)으로 트리에서 사라질 수 있는 것** → LLM-prompting·hand_pick(이미 cup_stack_agent 흡수), ros2-recode-sequence(→depth 로 흡수).
+3. **오프라인/병렬트랙** → vision-YOLO·Isaac 계열은 서브모듈 제외.
+
+---
+
+## 3. Org 레포 전수 검토 & 서브모듈 결정
+
+### 3-A. 모든 active 레포 등록 검토 (아카이브 제외)
+
+> 규칙: **아카이브 레포는 등록 대상에서 제외.** 아래는 org 의 active 레포 전수.
+> (참고용으로 archived 레포도 하단에 분리 표기)
+
+| 레포 | 상태 | 결정 | 위치(to-be) | 근거 |
 |---|---|---|---|---|
-| `cup-stack-server` | active | ✅ (root) | **사용 (deploy unit)** | 라이브 배포 단위. server+ros2-cup-stack+frontend 집합체 |
-| `server` | active | ✅ (중첩) | **사용 (runtime)** | FastAPI/rosbridge, `docker-compose.yml` 보유 |
-| `ros2-cup-stack` | active | ✅ (중첩) | **사용 (runtime)** | cup_stack ROS pkg, pyramid/unstack skill, colcon ws |
-| `frontend` | active | ✅ (중첩) | **사용** | React 대시보드 (compose가 빌드) |
-| `fallen-cup-recovery` | active | ✅ (중첩, `released`) | **사용** | 쓰러진 컵 복구 통합 |
-| `doosan-robot2` | active | ✅ (3단 중첩, `yarr-integration`) | **사용** | Doosan 드라이버. **colcon `ros2/src/` 에 bound** |
-| `ros2-depth-point-cloude` | active | ✅ (vision/) | **사용 (perception)** | detection + 3D boxes |
-| `vision-node` | active | ✅ (vision/) | **사용** | `/stack` 슬롯 verifier |
-| `ros2-recode-sequence` | **archived** | ✅ (vision/) | **사용중(frozen)** | `server/start.sh:174` 가 `cameras_only.launch.py` 소싱 |
-| `ros2-skill-manager` | active | ❌ (.gitignore clone) | **사용** | 오퍼레이터 GUI. `tools/run_skill_manager.sh` 가 실행 → **서브모듈 등록 후보** |
-| `LLM-prompting` | **archived** | ✅ (중첩) | **미사용(중복)** | 프롬프트는 `cup_stack_agent/prompts/*` 가 런타임. 본체는 연구 레포 → **제거 후보** |
-| `hand_pick` | active | ❌ | **미사용(추정)** | 트리 내 `hand_pick` 참조 0건. hand-eye pick 은 `cup_stack_agent/{pick_node,upright_cup_pose_node}.py` 에 inline |
-| `vision-YOLO` | active | ❌ | **참조용(모델 학습)** | YOLO seg 학습 파이프라인. 코드가 아니라 모델 산출물 출처. 문서 URL 참조만 → 서브모듈 불필요 |
-| `cup-stack-integration-isaac` | active | ❌ | **별도 통합** | Isaac sim 변형. 형제 레포 (서브모듈 아님) |
-| `yarr-isaac-playground` | active | ❌ | **별도 sandbox** | Isaac 실험장 |
-| `yarr-robust-speed-stack` | archived | ❌(제거됨) | 미사용 | dead meta repo |
-| `yarr-robust-speed-stack-v2` | archived | ❌ | 미사용 | 구 통합본 |
-| `test-yarr-cup-stack` | archived | ❌ | 미사용 | 테스트 잔재 |
+| `cup-stack-integration` | active | **self** | (루트) | 이 통합 레포 자신 |
+| `cup-stack-server` | active | **제거(해체)** | — | 집합 레포 미사용. leaf 를 루트로 직접 등록 |
+| `server` | active | 루트 등록 | `server/` | FastAPI/rosbridge, docker-compose |
+| `ros2-cup-stack` | active | 루트 등록 | `ros2-cup-stack/` | cup_stack ROS pkg, pyramid/unstack skill |
+| `frontend` | active | 루트 등록 | `frontend/` | React 대시보드 |
+| `fallen-cup-recovery` | active | 루트 등록 | `fallen-cup-recovery/` @released | 쓰러진 컵 복구 |
+| `doosan-robot2` | active | **중첩 유지** | `ros2-cup-stack/ros2/src/doosan-robot2` @yarr-integration | colcon `src/` bound — 루트로 못 뺌 |
+| `ros2-depth-point-cloude` | active | 루트 등록 | `ros2-depth-point-cloude/` | perception detection+3D boxes |
+| `vision-node` | active | 루트 등록 | `vision-node/` | `/stack` verifier |
+| `ros2-skill-manager` | active | **신규 등록** | `tools/ros2-skill-manager/` | 오퍼레이터 GUI. ignore clone → 승격 |
+| `hand_pick` | active | **병합 권장**(미등록) | → `cup_stack_agent` | 기능 inline 흡수됨, 트리 참조 0건 (§3-B) |
+| `vision-YOLO` | active | **등록 보류** | — | 모델 학습 레포(런타임 코드 아님). in-tree 필요 시 `training/` 로 등록 |
+| `cup-stack-integration-isaac` | active | **제외** | — | 병렬 통합 레포. 서브모듈로 중첩 부적합(형제 프로젝트) |
+| `yarr-isaac-playground` | active | **제외** | — | Isaac sandbox. 별도 트랙 |
+| **archived (등록 제외)** | | | | |
+| `ros2-recode-sequence` | archived | **병합 후 제거** | → `ros2-depth-point-cloude` 로 코드 이관 | 사용중이나 아카이브. 코드 이관으로 충돌 해소 (§3-B) |
+| `LLM-prompting` | archived | **병합완료·제거** | (이미 `cup_stack_agent/prompts`) | 프롬프트 이관 완료 (§3-B) |
+| `yarr-robust-speed-stack(-v2)`, `test-yarr-cup-stack` | archived | 대상 외 | — | dead |
 
-### 3-1. 추가 서브모듈로 등록할 목록 (사용자 추가 조사 요청 답)
+### 3-B. 서브모듈 병합 가능성 검토 (코드 이관 → 서브모듈 소거)
 
-- **`ros2-skill-manager`** → **등록 권장**. 현재 `tools/ros2-skill-manager/` 에 clone 으로만 존재하고 `.gitignore` 됨. 오퍼레이터 GUI 로 실제 사용 중이므로 `tools/ros2-skill-manager` 경로의 정식 서브모듈로 승격.
-- **`hand_pick`** → **보류/조사**. 기능이 `cup_stack_agent` 에 inline 되어 현재 트리에서 직접 참조 없음. "원본 prototype 을 흡수했는가"를 확인 후, 통합 의도가 있으면 등록·아니면 제외.
-- **`vision-YOLO`** → **등록 불필요**. 런타임 ROS 패키지가 아니라 모델 학습 레포. 모델(.pt) 산출물만 소비하므로 URL 참조로 충분.
-- **`doosan-robot2`** → 이미 서브모듈(중첩). 신규 등록 아님. 평탄화 제약 대상(아래 §4).
-- Isaac 계열(`cup-stack-integration-isaac`, `yarr-isaac-playground`) → 이 레포의 서브모듈로 부적합. 별도 통합 라인.
+> 목표: 독립 유지가치가 낮은 서브모듈은 **코드를 active 레포로 이관**하고 서브모듈 자체를 없앤다.
 
----
+| 서브모듈 | 병합 가능? | 이관 대상 | 작업 내용 | 효과 |
+|---|---|---|---|---|
+| `ros2-recode-sequence`(archived) | ✅ **권장** | `ros2-depth-point-cloude` | `recode_sequence` 패키지(`cameras_only.launch.py`, `cameras.yaml`, playback/sequence 노드)를 depth 레포 colcon ws 의 2번째 pkg 로 이동. **패키지명 `recode_sequence` 유지** → `ros2 launch recode_sequence cameras_only.launch.py` 그대로 동작 | 아카이브 서브모듈 제거 + §0 충돌 해소 |
+| `LLM-prompting`(archived) | ✅ **완료** | `cup_stack_agent` | 런타임 프롬프트는 이미 `cup_stack_agent/prompts/*`. 잔여(executor/benchmarks/legacy)는 미사용 | 서브모듈 단순 제거 |
+| `hand_pick` | ✅ 가능 | `cup_stack_agent` | hand-eye pick 은 이미 `pick_node.py`/`upright_cup_pose_node.py` 로 inline. 추가 이관 불필요 | 등록 안 하고 종료 |
+| `vision-node` ↔ `ros2-depth-point-cloude` | △ 가능하나 보류 | (단일 `vision` 레포) | 두 perception 패키지를 한 레포로 통합 가능하나 **독립 개발/릴리스 결합** 비용. 당장은 분리 유지 | 차후 검토 |
+| `server` / `ros2-cup-stack` / `frontend` | ❌ | — | 배포 컴포넌트(서로 다른 런타임·언어·compose). 병합 부적합 | 분리 유지 |
+| `doosan-robot2` | ❌ | — | upstream fork mirror. 병합 시 upstream sync 단절 | 분리 유지 |
 
-## 4. 핵심 제약 — "전부 루트로"가 그대로는 안 되는 이유
-
-평탄화 대상마다 **빌드/배포 레이아웃 결합도**가 다르다. 무지성 full-flatten 은 워크스페이스를 깨뜨린다.
-
-1. **`doosan-robot2` 는 colcon `src/` 에 묶임** — `ros2-cup-stack/ros2/src/doosan-robot2`. 루트로 빼면 `ros2-cup-stack` 의 colcon 빌드가 드라이버를 못 찾는다. → **중첩 유지 필수.**
-2. **`server`/`frontend` 는 `cup-stack-server` 배포 단위에 묶임** — `server/docker-compose.yml` 이 형제 경로를 빌드 컨텍스트로 참조. 라이브 배포(`/home/ssu/cup-stack` = cup-stack-server 체크아웃)가 이 구조를 가정. → **cup-stack-server 안에 유지 권장.**
-3. **`cup-stack-server/server/start.sh` 가 `../../vision/` 를 역참조** (`start.sh:100,174`) — 즉 cup-stack-server 는 이미 "cup-stack-integration 안에서 vision/ 을 형제로 둔다"고 가정. vision/ 을 루트로 올리면(`vision/ros2-recode-sequence` → `ros2-recode-sequence`) 이 상대경로(`../../vision/...`)를 **전부 수정**해야 한다.
-4. **`ros2-recode-sequence` 는 archived 지만 런타임 사용중** — frozen 으로 두되 제거하면 카메라 bringup 이 깨진다.
+**병합 후 최종 vision 관련 서브모듈**: `ros2-depth-point-cloude`(+recode_sequence 패키지 흡수), `vision-node` 2개만 남음. `ros2-recode-sequence` 서브모듈은 소멸.
 
 ---
 
-## 5. 목표 구조 (to-be) — 2가지 전략
+## 4. 핵심 제약 (해체 시 반드시 동반 수정)
 
-### 전략 A — 완전 평탄화(사용자 직설 목표)
-모든 leaf 레포를 루트 단일 계층으로:
-```
-cup-stack-integration/
-├── cup_stack_agent/
-├── server/  ros2-cup-stack/  frontend/  fallen-cup-recovery/
-├── doosan-robot2/            (← ros2-cup-stack 의 colcon src 로 symlink/overlay 필요)
-├── ros2-depth-point-cloude/  vision-node/  ros2-recode-sequence/
-├── ros2-skill-manager/
-└── docs/
-```
-- 장점: 트리가 평평, 한눈에 모든 컴포넌트.
-- 단점/비용: `cup-stack-server` 집합 레포를 이 통합에서 **해체** → 배포 단위와 어긋남. docker-compose 빌드 컨텍스트, colcon `src/`, `start.sh ../../vision` 경로를 **모두 재작성**. 동일 leaf 를 cup-stack-server 와 integration 양쪽이 가리켜 **포인터 분기** 위험.
+1. **`doosan-robot2` 중첩 유지** — `ros2-cup-stack/ros2/src/doosan-robot2`. colcon `src/` 결합. 루트로 빼면 빌드 깨짐. **유일하게 평탄화 제외.**
+2. **`server/start.sh` 상대경로 전면 재계산** — 현재 `$SCRIPT_DIR/../../vision/ros2-recode-sequence` 는 (server 가 `cup-stack-server/server/` 라서) integration 루트 vision/ 을 가리킴. 해체 후 server 가 `integration/server/` 로 올라가고 vision/ 이 루트로 풀리면:
+   - `../../vision/ros2-recode-sequence` → **`../ros2-recode-sequence`**
+   - cup_stack/ros2-cup-stack setup.bash 소싱 경로(`../../...`)도 한 단계 줄여 재계산
+   - 대상: `server/start.sh`(100,174,216 등), `server/stop.sh`, `vision_rviz.sh`
+3. **`pull.sh` 폐기** — `cd ./server && git pull ...` 식 수동 동기화. 루트 서브모듈화 후 `git submodule update --remote` 로 대체.
+4. **`ros2-recode-sequence` archived** — frozen 유지(사용중). 제거 금지.
+5. **배포 단위 이관** — 라이브 Docker 는 별도 체크아웃 `/home/ssu/cup-stack`(= cup-stack-server). integration 에서 해체해도 그 배포가 자동으로 바뀌지 않음 → **배포 측 마이그레이션은 별도 후속**(§9-1).
 
-### 전략 B — 실용적 하이브리드(권장)
-"평탄화"를 *결합도 없는 계층 제거*로 한정:
+---
+
+## 5. 목표 구조 (to-be, 전략 A)
+
 ```
 cup-stack-integration/
 ├── cup_stack_agent/                          [own code]
-├── cup-stack-server/                         [submodule, 배포 단위 그대로]
-│   └── ... server/ ros2-cup-stack/ frontend/ fallen-cup-recovery/ (+doosan-robot2 중첩 유지)
-├── ros2-depth-point-cloude/                  [submodule]  ← vision/ 계층 제거
-├── vision-node/                              [submodule]  ← vision/ 계층 제거
-├── ros2-recode-sequence/                     [submodule, frozen]  ← vision/ 계층 제거
-├── tools/ros2-skill-manager/                 [submodule 신규 등록]  ← .gitignore clone 승격
+├── script/
+│   ├── run_skill_manager.sh                  (← tools/ 에서 통합, 선택)
+│   └── server/                               ★ cup-stack-server/script/* 이동
+│       ├── build_pyramid.sh  build_pyramid_nested.sh
+│       ├── cycle_grid.sh     cycle_nested.sh
+│       └── unstack.sh        unstack_grid.sh
+├── server/                                   [submodule]
+├── ros2-cup-stack/                           [submodule]
+│   └── ros2/src/doosan-robot2/               [submodule, 중첩 유지]
+├── frontend/                                 [submodule]
+├── fallen-cup-recovery/                      [submodule @released]
+├── ros2-depth-point-cloude/                  [submodule] (+recode_sequence 패키지 흡수)
+├── vision-node/                              [submodule]
+├── tools/ros2-skill-manager/                 [submodule 신규]
 └── docs/
 ```
-- `vision/` 한 계층만 루트로 흡수(결합 없음, 단 `../../vision/` 경로 4곳 수정).
-- 빌드/배포 결합 서브모듈(`server`,`ros2-cup-stack`,`frontend`,`doosan-robot2`)은 제자리 유지.
-- `LLM-prompting`(archived·중복) 제거, `ros2-skill-manager` 정식 등록.
 
-> **권장: 전략 B.** 사용자의 "루트로" 의도는 충족하되(중첩 계층 제거) 워크스페이스/배포를 깨지 않음. 전략 A 가 정말 필요하면 §8 의 결정사항부터 합의.
+해체/병합으로 사라지는 것: `cup-stack-server/`(집합 계층), `vision/`(계층),
+`LLM-prompting`(서브모듈, 흡수완료), `ros2-recode-sequence`(서브모듈, depth 로 병합),
+`pull.sh`, `cup_stack/ros2/`(잔재). cup-stack-server 의 `docs/`·`CLAUDE.md` 처리는 §7.
+
+> 최종 루트 서브모듈(8): `server`, `ros2-cup-stack`(+doosan-robot2 중첩), `frontend`,
+> `fallen-cup-recovery`, `ros2-depth-point-cloude`(+recode_sequence), `vision-node`,
+> `tools/ros2-skill-manager`.
 
 ---
 
-## 6. 마이그레이션 단계 (전략 B 기준)
+## 6. 마이그레이션 단계 (전략 A)
 
-> 모두 worktree(`chore/flatten-submodules`)에서 수행. 서브모듈 내부 커밋은 `dwl21 <nggus5@gmail.com>`, 최상위는 기본 author.
+> worktree(`chore/flatten-submodules`)에서. 서브모듈 내부 커밋은 `dwl21 <nggus5@gmail.com>`, 최상위는 기본 author.
+> ⚠️ 서브모듈을 부모(cup-stack-server)에서 떼어 조부모(integration)로 옮기는 작업이라
+> **`.git/modules` 경로와 `.gitmodules` 양쪽을 모두 손봐야 한다.** 가장 안전한 방식은
+> "deinit → 상위에서 add 재등록" 이다.
 
-**(1) `LLM-prompting` 서브모듈 제거** — cup-stack-server 내부
+**(0) 사전 보존**
 ```bash
-cd cup-stack-server
-git submodule deinit -f LLM-prompting
-git rm -f LLM-prompting
-rm -rf .git/modules/LLM-prompting
-# commit(dwl21) → push → 상위에서 cup-stack-server 포인터 bump
+# cup-stack-server/script 와 docs 를 작업트리로 복사해 둠(이동 소스)
 ```
-*선결*: `cup_stack_agent/prompts/*` 가 LLM-prompting 의 프롬프트를 완전히 대체하는지 최종 확인.
 
-**(2) `vision/` 계층 평탄화** — 각 서브모듈을 `vision/<x>` → `<x>` 로 이동
+**(1) cup-stack-server 의 script → 루트 script/server**
 ```bash
-# 예: ros2-depth-point-cloude
-git mv vision/ros2-depth-point-cloude ros2-depth-point-cloude   # .gitmodules path 자동 갱신은 git mv가 처리(또는 수동)
-# vision-node, ros2-recode-sequence 동일
-# .gitmodules 의 path/section 정리 후:
-git submodule sync
+mkdir -p script/server
+git mv cup-stack-server/script/* script/server/     # cup-stack-server 가 아직 서브모듈이면 일반 cp 후 add
 ```
-*동반 수정(필수)*: `cup-stack-server/server/start.sh` 의 `../../vision/ros2-recode-sequence` → `../../ros2-recode-sequence` 등 상대경로 4곳, `vision_rviz.sh`, CLAUDE.md 의 vision/ 경로 서술.
+> cup-stack-server 가 서브모듈이라 `git mv` 가 경계를 못 넘으면: `cp` → integration 에 `git add script/server`, 원본은 (3)에서 통째 제거.
 
-**(3) `ros2-skill-manager` 정식 서브모듈 등록**
+**(2) leaf 서브모듈을 루트로 재등록** (각각: 현 포인터 SHA 기록 → deinit)
 ```bash
-# 기존 ignore clone 백업/제거 후
-git rm -r --cached tools/ros2-skill-manager 2>/dev/null || true
-# .gitignore 의 /tools/ros2-skill-manager/ 라인 제거
+# 현재 포인터 기록
+git -C cup-stack-server submodule status   # server/ros2-cup-stack/frontend/fallen-cup-recovery SHA
+# integration 에 루트 서브모듈로 추가 (기록한 SHA 로 checkout)
+git submodule add https://github.com/2026-yarr-robotics/server.git server
+git submodule add https://github.com/2026-yarr-robotics/ros2-cup-stack.git ros2-cup-stack
+git submodule add https://github.com/2026-yarr-robotics/frontend.git frontend
+git submodule add -b released https://github.com/2026-yarr-robotics/fallen-cup-recovery.git fallen-cup-recovery
+# 각 서브모듈을 기록한 SHA 로 set
+# ros2-cup-stack 의 doosan-robot2 는 그 안의 .gitmodules 로 자동 따라옴(submodule update --init --recursive)
+```
+
+**(3) vision/ 계층 해체** — 동일 방식으로 루트 재등록
+```bash
+git submodule add https://github.com/2026-yarr-robotics/ros2-depth-point-cloude.git ros2-depth-point-cloude
+git submodule add https://github.com/2026-yarr-robotics/vision-node.git vision-node
+git submodule add https://github.com/2026-yarr-robotics/ros2-recode-sequence.git ros2-recode-sequence
+```
+
+**(4) cup-stack-server · vision/ · LLM-prompting 제거**
+```bash
+git submodule deinit -f cup-stack-server && git rm -f cup-stack-server && rm -rf .git/modules/cup-stack-server
+git submodule deinit -f vision/ros2-depth-point-cloude vision/vision-node vision/ros2-recode-sequence
+git rm -f vision/ros2-depth-point-cloude vision/vision-node vision/ros2-recode-sequence
+rmdir vision 2>/dev/null
+# LLM-prompting 는 cup-stack-server 제거로 함께 사라짐
+```
+
+**(5) ros2-skill-manager 정식 등록**
+```bash
+git rm -r --cached tools/ros2-skill-manager 2>/dev/null || true   # ignore clone 해제
+# .gitignore 의 /tools/ros2-skill-manager/ 라인 삭제
 git submodule add https://github.com/2026-yarr-robotics/ros2-skill-manager.git tools/ros2-skill-manager
 ```
 
-**(4) 상위 포인터 bump & 검증**
+**(6) 경로 수정 (핵심)**
+- `server/start.sh`, `server/stop.sh` — `../../vision/X` → `../X`, cup_stack/ros2-cup-stack 소싱 경로 한 단계 축소
+- `vision_rviz.sh`, `tools/run_skill_manager.sh` — vision/·tools 경로 점검
+- 루트 `CLAUDE.md` — 구조도/경로 서술 전면 갱신
+- `pull.sh` 삭제(또는 `git submodule update --remote` wrapper 로 대체)
+
+**(7) 검증**
 ```bash
 git submodule status --recursive
 python3 -m py_compile cup_stack_agent/scripts/*.py
-bash -n cup-stack-server/server/start.sh tools/run_skill_manager.sh
+for f in server/start.sh server/stop.sh script/server/*.sh tools/run_skill_manager.sh vision_rviz.sh; do bash -n "$f"; done
+grep -rn "cup-stack-server\|\.\./\.\./vision" --include='*.sh' --include='*.md' .   # 잔존 참조 0 확인
 ```
 
 ---
 
 ## 7. 제거 후보 (코드 · 문서)
 
-| 후보 | 위치 | 사유 | 권장 |
-|---|---|---|---|
-| `LLM-prompting` 서브모듈 | cup-stack-server/LLM-prompting | archived + 프롬프트가 `cup_stack_agent/prompts` 로 이관됨 | **제거** (단 §6-1 선결확인) |
-| `LLM-prompting/legacy/**` | (위 서브모듈 내부) | colab 노트북·프레임 PNG·옛 리포트 등 dead weight | 제거 시 함께 사라짐 (보존 원하면 upstream 에서 정리) |
-| `cup-stack-server/docs/integration/yarr-robust-speed-stack-integration.md` | 문서 | 이미 제거된 dead 레포 통합 계획 | **제거 후보** |
-| `cup-stack-server/server/start.sh.bak_disable_dt_panel` | 백업 파일 | `.bak` 잔재 | **제거 후보** |
-| 루트 `build/` `install/` `log/` | 산출물 | colcon 산출물 | 이미 `.gitignore`, 추적 안 됨 → 조치 불필요(디스크 정리만) |
-| `docs/.gitkeep` | placeholder | docs 채워지면 불필요 | 본 계획 문서 추가로 해소 |
-| `hand_pick` 레포 | (외부) | inline 으로 흡수, 미참조 | 레포 자체 아카이브 여부는 org 차원 결정 |
-
-> 트리 전반 추가 정밀 스캔(미참조 launch/script/문서)은 평탄화 확정 후 별도 패스로.
+| 후보 | 사유 | 권장 |
+|---|---|---|
+| `cup-stack-server` 서브모듈 | 집합 레포 해체 | **제거** |
+| `LLM-prompting` 서브모듈 | archived + 프롬프트 이관됨 | **제거** (§6-1 선결확인) |
+| `cup-stack-server/pull.sh` | 수동 submodule pull, submodule update 로 대체 | **삭제** |
+| `cup-stack-server/cup_stack/ros2/` | root:root 잔재(빌드 마운트 추정), 트리 비결합 | **삭제 후보**(확인 후) |
+| `cup-stack-server/docs/integration/yarr-robust-speed-stack-integration.md` | 이미 제거된 dead 레포 통합 문서 | **삭제** |
+| `cup-stack-server/docs/*.docx`, `integration/*.md`(나머지) | 프로젝트 문서·통합 노트 | integration `docs/` 로 **이관** 또는 보존 결정 |
+| `cup-stack-server/CLAUDE.md` | 해체되면 무주공산 | 유용분은 루트 CLAUDE.md 로 흡수 |
+| `server/start.sh.bak_disable_dt_panel` | `.bak` 잔재 | **삭제 후보** |
+| 루트 `build/ install/ log/` | colcon 산출물 | 이미 ignore, 디스크 정리만 |
 
 ---
 
 ## 8. 브랜치 정리 후보 (stale)
 
-| 레포 | 정리 후보 브랜치 | 비고 |
+| 레포 | 정리 후보 | 비고 |
 |---|---|---|
-| `cup-stack-integration` | `tmp`, `vision-integration` | `tmp` = 현재 WIP(merge 후 삭제), `vision-integration` = main 병합 여부 확인 |
-| `server` | `worktree-fix-joint-ee-risks`, `worktree-swagger-nginx-route` | worktree 잔재 브랜치 |
+| `cup-stack-integration` | `tmp`, `vision-integration` | `tmp`=WIP, `vision-integration`=main 병합 확인 |
+| `server` | `worktree-fix-joint-ee-risks`, `worktree-swagger-nginx-route` | worktree 잔재 |
 | `ros2-cup-stack` | `worktree-add-pyramid-unstack-loop` | worktree 잔재 |
-| `doosan-robot2` | `auto-sync-jazzy-*`(6개), `feature/*`, `fix/issue-345/346`, `foxy-devel`, `master` 등 | upstream fork 노이즈. **사용은 `yarr-integration`** 만. 단 fork mirror 정책이면 보존 |
-| `LLM-prompting` | `feat/llm-demo-and-noreplan-prompt` | 레포 자체 archived |
-| `ros2-skill-manager` | `feat/settled-gate` | merge 여부 확인 |
-| 다수 | `isaac` | Isaac 통합 라인 — 삭제 말 것(별도 트랙) |
+| `doosan-robot2` | `auto-sync-jazzy-*`(6), `feature/*`, `fix/issue-345/346`, `foxy-devel`, `master` | fork 노이즈. 사용=`yarr-integration`. fork mirror 정책이면 보존 |
+| `LLM-prompting` | `feat/llm-demo-and-noreplan-prompt` | 레포 archived |
+| `ros2-skill-manager` | `feat/settled-gate` | merge 확인 |
+| 다수 | `isaac` | Isaac 트랙 — **삭제 금지** |
 
-> 브랜치 삭제는 각 레포에서 `git push origin --delete <branch>`. **삭제 전 main 병합/머지 여부 개별 확인 필수.**
-
----
-
-## 9. 리스크 & 미결정 사항 (사용자 결정 필요)
-
-1. **전략 A vs B** — `cup-stack-server` 집합 레포를 이 통합에서 해체할 것인가? (배포 단위/포인터 분기 이슈) → **권장 B.**
-2. **`LLM-prompting` 제거 확정** — `cup_stack_agent/prompts/*` 가 완전 대체임을 확인했는가?
-3. **`hand_pick` 처리** — 흡수 완료로 보고 제외 vs 정식 서브모듈 편입.
-4. **`doosan-robot2` 다수 브랜치** — fork mirror 로 upstream 브랜치 보존할지, `yarr-integration`+`humble` 만 남길지.
-5. **`ros2-recode-sequence` archived** — frozen 사용 유지가 맞나(후속 레포로 대체 계획 없는지).
+> 삭제 전 main 병합 여부 개별 확인. `git push origin --delete <branch>`.
 
 ---
 
-## 10. 실행 체크리스트 (확정 후)
+## 9. 리스크 & 미결정 사항
 
-- [ ] 전략(A/B) 확정 — §5/§9-1
-- [ ] LLM-prompting 대체 확인 → 제거(§6-1)
-- [ ] vision/ 평탄화 + `../../vision` 경로 수정(§6-2)
-- [ ] ros2-skill-manager 서브모듈 등록(§6-3)
-- [ ] 제거 후보 문서/백업 파일 정리(§7)
+1. **배포 마이그레이션** — 라이브 Docker 가 `/home/ssu/cup-stack`(cup-stack-server) 에서 구동. integration 해체 후 배포를 어디서 띄울지(integration 직접 vs server 단독 체크아웃) 결정 필요. server 의 docker-compose 빌드 컨텍스트가 형제 경로 가정 시 영향.
+2. **`LLM-prompting` 제거 확정** — `cup_stack_agent/prompts/*` 완전 대체 확인.
+3. **`hand_pick` 처리** — inline 흡수로 제외 vs 정식 편입.
+4. **cup-stack-server `docs/` 처리** — integration `docs/` 이관 vs 폐기.
+5. **`doosan-robot2` 브랜치 정책** — fork mirror 보존 vs `yarr-integration`+`humble` 만.
+6. **포인터 분기** — server/ros2-cup-stack/frontend 를 다른 곳(예: 배포 체크아웃)에서도 참조 시 SHA 동기화 주체 명확화.
+
+---
+
+## 10. 실행 체크리스트
+
+- [ ] script → `script/server/` 이동(§6-1)
+- [ ] leaf 4종 루트 재등록 + 포인터 SHA 보존(§6-2)
+- [ ] vision/ 3종 루트 재등록(§6-3)
+- [ ] cup-stack-server·vision/·LLM-prompting 제거(§6-4)
+- [ ] ros2-skill-manager 서브모듈 등록(§6-5)
+- [ ] **경로 수정**: start.sh/stop.sh/vision_rviz.sh/CLAUDE.md, pull.sh 삭제(§6-6)
+- [ ] docs 이관/정리, .bak·cup_stack 잔재 정리(§7)
 - [ ] stale 브랜치 개별 병합확인 후 삭제(§8)
-- [ ] `git submodule status --recursive` + py_compile + `bash -n` 검증(§6-4)
-- [ ] cup-stack-server 내부 커밋(dwl21) → push → 상위 포인터 bump → push
+- [ ] `submodule status --recursive` + py_compile + `bash -n` + 잔존참조 grep(§6-7)
+- [ ] 배포 마이그레이션 방침 확정(§9-1)
+
+---
+
+## 11. 최종 결정 요약 (TL;DR)
+
+의존성 트리(§2-bis)와 코드 사용 범위로부터 도출한 최종 결정:
+
+**(A) cup-stack-server 해체** — 집합 레포 미사용. leaf 를 integration 루트로 직접 등록.
+`cup-stack-server/script/` → `script/server/`, `pull.sh`·`cup_stack/ros2/` 잔재 제거.
+
+**(B) 최종 루트 서브모듈 8개** (런타임 직접 결합만):
+`server` · `ros2-cup-stack`(→`ros2/src/doosan-robot2` 중첩) · `frontend` ·
+`fallen-cup-recovery`@released · `ros2-depth-point-cloude`(+recode_sequence 흡수) ·
+`vision-node` · `tools/ros2-skill-manager`(신규).
+
+**(C) 병합으로 소거**:
+- `ros2-recode-sequence`(archived) → `ros2-depth-point-cloude` 로 `recode_sequence` 패키지 이관(패키지명 유지). 아카이브 충돌 해소.
+- `LLM-prompting`(archived) → `cup_stack_agent/prompts` 로 이관 완료, 서브모듈 제거.
+- `hand_pick` → `cup_stack_agent` 로 inline 흡수 완료, 미등록.
+
+**(D) 제외**: `vision-YOLO`(오프라인 학습), `cup-stack-integration-isaac`·`yarr-isaac-playground`(병렬 트랙), 모든 archived 레포.
+
+**(E) 동반 필수**: `server/start.sh|stop.sh` 의 `../../vision/*`→`../*` 경로 재계산, 루트 `CLAUDE.md` 갱신, stale 브랜치 정리(§8).
+
+**(F) 남은 결정**(§9): 배포 마이그레이션 위치, doosan-robot2 fork 브랜치 정책.
 ```
