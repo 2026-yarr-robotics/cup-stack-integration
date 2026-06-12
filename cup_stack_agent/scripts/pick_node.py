@@ -115,10 +115,13 @@ class PickNode(Node):
         # next call hits HTTP 409 "a skill is already running".
         self.declare_parameter("api_timeout_sec", 180.0)
         # 컵 선택
-        self.declare_parameter("box_wait_sec", 1.5)   # 마커 수집 대기(>= publish 주기)
+        self.declare_parameter("box_wait_sec", 1.5)   # 마커 수집 최대 대기
+        self.declare_parameter("post_move_box_ignore_sec", 0.3)  # 이동 직후 큐/잔상 버림
+        self.declare_parameter("box_settle_sec", 0.5)  # 첫 마커 이후 안정화 대기
+        self.declare_parameter("max_pick_distance_m", 0.20)  # coarse target 과 허용 거리
         self.declare_parameter("box_top_ns", "box_top")
         self.declare_parameter("box_labels_ns", "box_labels")
-        self.declare_parameter("filter_by_color", True)  # move_result.color 로 후보 필터
+        self.declare_parameter("filter_by_color", False)  # 색은 근거리 tie-break 에만 사용
         # 트리거 게이트 (1차 = 유효 slot 존재. 아래는 보조 필터)
         self.declare_parameter("require_result_success", False)
         self.declare_parameter("success_result_values", "success,ok,200,true,done")
@@ -134,6 +137,11 @@ class PickNode(Node):
         self.api_url = self.api_base + self.api_path
         self.api_timeout_sec = float(self.get_parameter("api_timeout_sec").value)
         self.box_wait_sec = float(self.get_parameter("box_wait_sec").value)
+        self.post_move_box_ignore_sec = float(
+            self.get_parameter("post_move_box_ignore_sec").value)
+        self.box_settle_sec = float(self.get_parameter("box_settle_sec").value)
+        self.max_pick_distance_m = float(
+            self.get_parameter("max_pick_distance_m").value)
         self.box_top_ns = str(self.get_parameter("box_top_ns").value)
         self.box_labels_ns = str(self.get_parameter("box_labels_ns").value)
         self.filter_by_color = bool(self.get_parameter("filter_by_color").value)
@@ -165,6 +173,7 @@ class PickNode(Node):
         # ── 상태 ───────────────────────────────────
         # 최신 /hand_eye/boxes 파싱 결과: id → {"xy": np.array, "color": str|None}
         self._boxes = {}
+        self._ignore_boxes_until = 0.0
         self._pending = None   # 처리 대기 중인 move_result dict
         self._busy = False     # pyramid 시퀀스 처리 중 재진입 방지
 
@@ -179,6 +188,9 @@ class PickNode(Node):
     # ── 콜백 ─────────────────────────────────────
     def _boxes_cb(self, msg: MarkerArray):
         """최신 /hand_eye/boxes 스냅샷 갱신. box_top=좌표, box_labels=색."""
+        if time.time() < self._ignore_boxes_until:
+            return
+
         for m in msg.markers:
             if m.action == Marker.DELETEALL:
                 self._boxes.clear()
@@ -249,15 +261,32 @@ class PickNode(Node):
         log = self.get_logger()
         self._boxes.clear()
 
-        # 첫 hand-eye 마커(xy)가 들어오는 즉시 선택 — 실제 추론 시간으로 바로
-        # 움직인다. box_wait_sec 은 마커가 영영 안 올 때를 위한 안전 timeout 일 뿐
-        # (예전엔 항상 이 시간을 꽉 채워 인위적으로 대기했음).
-        log.info(f"[select] hand-eye 마커 대기 (timeout {self.box_wait_sec}s)")
+        # move_result 직후에는 이동 중/이동 직전 hand-eye 메시지가 subscription
+        # queue 에 남아 있을 수 있다. 짧게 spin 하며 버린 뒤 새 프레임만 수집한다.
+        if self.post_move_box_ignore_sec > 0.0:
+            self._ignore_boxes_until = time.time() + self.post_move_box_ignore_sec
+            log.info(
+                f"[select] move 후 hand-eye 입력 무시 "
+                f"({self.post_move_box_ignore_sec:.2f}s)")
+            while rclpy.ok() and time.time() < self._ignore_boxes_until:
+                rclpy.spin_once(self, timeout_sec=0.02)
+            self._ignore_boxes_until = 0.0
+            self._boxes.clear()
+
+        # 첫 프레임에는 일부 컵만 들어올 수 있으므로, 첫 xy 이후 짧게 더 모아
+        # hand-eye 스냅샷이 안정된 뒤 coarse move 타깃에 가장 가까운 컵을 고른다.
+        log.info(
+            f"[select] hand-eye 마커 대기 "
+            f"(timeout {self.box_wait_sec}s, settle {self.box_settle_sec}s)")
         t0 = time.time()
+        first_xy_at = None
         while rclpy.ok() and time.time() - t0 < self.box_wait_sec:
             rclpy.spin_once(self, timeout_sec=0.05)
             if any(b.get("xy") is not None for b in self._boxes.values()):
-                break
+                if first_xy_at is None:
+                    first_xy_at = time.time()
+                if time.time() - first_xy_at >= self.box_settle_sec:
+                    break
 
         cands = [(i, b) for i, b in self._boxes.items() if b.get("xy") is not None]
         if not cands:
@@ -265,21 +294,46 @@ class PickNode(Node):
                 f"[select] 컵 마커 없음 ({self.hand_eye_boxes_topic} 흐르는지 확인)")
             return None
 
+        scored = sorted(
+            (
+                (float(np.linalg.norm(b["xy"] - ref_xy)), i, b)
+                for i, b in cands
+            ),
+            key=lambda dib: dib[0],
+        )
+
         if self.filter_by_color and color:
             cl = str(color).strip().lower()
-            colored = [(i, b) for i, b in cands if b.get("color") == cl]
+            nearest_dist = scored[0][0]
+            # Color is only a tie-break among cups already near the moved-to target.
+            colored = [
+                (dist, i, b) for dist, i, b in scored
+                if b.get("color") == cl and dist <= nearest_dist + 0.04
+            ]
             if colored:
-                cands = colored
+                scored = colored
             else:
                 log.warn(
-                    f"[select] color={cl!r} 매칭 컵 없음 → 전체 {len(cands)}개 중 선택")
+                    f"[select] color={cl!r} 근거리 매칭 컵 없음 → "
+                    f"nearest-first 유지")
 
-        cid, best = min(
-            cands, key=lambda ib: float(np.linalg.norm(ib[1]["xy"] - ref_xy)))
+        dist, cid, best = scored[0]
         x, y = float(best["xy"][0]), float(best["xy"][1])
+        if self.max_pick_distance_m > 0.0 and dist > self.max_pick_distance_m:
+            log.error(
+                f"[select] nearest cup too far: "
+                f"move target=({ref_xy[0]:.3f},{ref_xy[1]:.3f}) → "
+                f"cup#{cid} pick=({x:.3f},{y:.3f}) dist={dist:.3f}m "
+                f"> limit={self.max_pick_distance_m:.3f}m")
+            return None
+
+        preview = ", ".join(
+            f"#{i}:{d:.3f}m/{b.get('color') or '?'}"
+            for d, i, b in scored[:6])
         log.info(
             f"[select] move target=({ref_xy[0]:.3f},{ref_xy[1]:.3f}) → "
-            f"cup#{cid} pick=({x:.3f},{y:.3f}) (후보 {len(cands)}개)")
+            f"cup#{cid} pick=({x:.3f},{y:.3f}) dist={dist:.3f}m "
+            f"(후보 {len(cands)}개; {preview})")
         return np.array([x, y])
 
     # ── pyramid API 호출 ─────────────────────────
