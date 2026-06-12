@@ -73,6 +73,18 @@ if [[ "${1:-}" == "--real-api" ]]; then
   DRY_RUN=false
 fi
 
+# ── Node-group toggles (split launch from integration start scripts) ─────────
+#   WITH_VISION=true → perception relay: aggregator(/vision/* → /cups_on_table,
+#                      /stack), digital_twin_stabilizer, hand-eye pose source.
+#                      No Ollama needed → can run always-on without the agent.
+#   WITH_LLM=true    → LLM closed loop: goal_state_publisher, llm_node,
+#                      plan_executor, pick_node, topic_logger (+ Ollama check).
+# Defaults keep the original single-invocation behaviour (both groups).
+# Stale-process cleanup is scoped to the groups THIS invocation launches, so a
+# vision-only and an llm-only instance can coexist without killing each other.
+WITH_VISION="${WITH_VISION:-true}"
+WITH_LLM="${WITH_LLM:-true}"
+
 CLEANUP_STALE_AGENT_PROCESSES="${CLEANUP_STALE_AGENT_PROCESSES:-true}"
 
 cleanup_stale_agent_processes() {
@@ -81,31 +93,44 @@ cleanup_stale_agent_processes() {
     return
   fi
 
-  local patterns=(
-    "bash ./start.sh"
-    "bash start.sh"
-    "bash .*/cup_stack_agent/start.sh"
-    "python3 scripts/fake_aggregator_node.py"
-    "python3 scripts/aggregator_node.py"
-    "python3 scripts/fake_digital_twin_node.py"
-    "python3 scripts/digital_twin_stabilizer_node.py"
-    "python3 scripts/fake_hand_eye_node.py"
-    "python3 scripts/upright_cup_pose_node.py"
-    "python3 scripts/goal_state_publisher_node.py"
-    "python3 scripts/topic_logger_node.py"
-    "python3 scripts/llm_node.py"
-    "python3 scripts/plan_executor_node.py"
-    "python3 scripts/pick_node.py"
-    "tee -a logs/.*/aggregator.log"
-    "tee -a logs/.*/digital_twin_stabilizer.log"
-    "tee -a logs/.*/fake_hand_eye.log"
-    "tee -a logs/.*/upright_cup_pose.log"
-    "tee -a logs/.*/goal_state_publisher.log"
-    "tee -a logs/.*/topic_logger.log"
-    "tee -a logs/.*/llm_node.log"
-    "tee -a logs/.*/plan_executor.log"
-    "tee -a logs/.*/pick_node.log"
-  )
+  local patterns=()
+  # Whole-script patterns only in full mode — in split mode the OTHER group's
+  # start.sh instance must survive this cleanup.
+  if [[ "${WITH_VISION}" == "true" && "${WITH_LLM}" == "true" ]]; then
+    patterns+=(
+      "bash ./start.sh"
+      "bash start.sh"
+      "bash .*/cup_stack_agent/start.sh"
+    )
+  fi
+  if [[ "${WITH_VISION}" == "true" ]]; then
+    patterns+=(
+      "python3 scripts/fake_aggregator_node.py"
+      "python3 scripts/aggregator_node.py"
+      "python3 scripts/fake_digital_twin_node.py"
+      "python3 scripts/digital_twin_stabilizer_node.py"
+      "python3 scripts/fake_hand_eye_node.py"
+      "python3 scripts/upright_cup_pose_node.py"
+      "tee -a logs/.*/aggregator.log"
+      "tee -a logs/.*/digital_twin_stabilizer.log"
+      "tee -a logs/.*/fake_hand_eye.log"
+      "tee -a logs/.*/upright_cup_pose.log"
+    )
+  fi
+  if [[ "${WITH_LLM}" == "true" ]]; then
+    patterns+=(
+      "python3 scripts/goal_state_publisher_node.py"
+      "python3 scripts/topic_logger_node.py"
+      "python3 scripts/llm_node.py"
+      "python3 scripts/plan_executor_node.py"
+      "python3 scripts/pick_node.py"
+      "tee -a logs/.*/goal_state_publisher.log"
+      "tee -a logs/.*/topic_logger.log"
+      "tee -a logs/.*/llm_node.log"
+      "tee -a logs/.*/plan_executor.log"
+      "tee -a logs/.*/pick_node.log"
+    )
+  fi
   local pids=()
   local pid pattern
   for pattern in "${patterns[@]}"; do
@@ -261,7 +286,12 @@ export PYTHONUNBUFFERED=1
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-21}"
 export ROS_LOCALHOST_ONLY=1
 echo "[start.sh] logs: ${LOG_DIR}"
-wait_for_ollama
+echo "[start.sh] groups: WITH_VISION=${WITH_VISION} WITH_LLM=${WITH_LLM}"
+if [[ "${WITH_LLM}" == "true" ]]; then
+  wait_for_ollama
+else
+  echo "[start.sh] WITH_LLM=false → vision-only, Ollama check skipped"
+fi
 
 launch() {
   local name="$1"
@@ -278,82 +308,93 @@ launch_quiet() {
   "$@" >> "${LOG_DIR}/${name}.log" 2>&1 &
 }
 
+# ── Vision group (WITH_VISION) — perception relay, no LLM/robot deps ────────
 # Real vision pipeline must be running in its own (sourced) workspace, with:
 #   point_cloud_node  -> /digital_twin/boxes  (raw exo cup positions)
 #                     -> /vision/cups_on_table (-r /cups_on_table:=/vision/cups_on_table)
 #   verifier_node     -> /vision/stack         (-r /stack:=/vision/stack)
 #                     -> /stack_track_ids
 # aggregator relays the real world-state (/vision/*) to /cups_on_table, /stack.
-launch aggregator python3 scripts/aggregator_node.py \
-  --ros-args \
-  -p user_command:="${USER_COMMAND}"
-# digital_twin_stabilizer median-filters the real /digital_twin/boxes into
-# /digital_twin/boxes_filtered (what plan_executor's coarse move reads).
-launch digital_twin_stabilizer python3 scripts/digital_twin_stabilizer_node.py \
-  --ros-args \
-  -p method:="${STABILIZE_METHOD}" \
-  -p window_s:="${STABILIZE_WINDOW_S}" \
-  -p track_timeout_s:="${STABILIZE_TRACK_TIMEOUT_S}" \
-  -p merge_distance_m:="${STABILIZE_MERGE_DISTANCE_M}"
-# hand-eye source for pick_node fine pick (/hand_eye/boxes). HAND_EYE_MODE:
-#   real = upright_cup_pose_node (hand cam YOLO-seg -> base_link via /tf FK)
-#   fake = fake_hand_eye_node (GT)
-if [[ "${HAND_EYE_MODE}" == "real" ]]; then
-  launch_quiet upright_cup_pose python3 scripts/upright_cup_pose_node.py \
+if [[ "${WITH_VISION}" == "true" ]]; then
+  # user_command is yaml-quoted: a bare blank (USER_COMMAND=' ', the
+  # integration start.sh "no auto-fire" trick) yaml-parses to None →
+  # ParameterUninitializedException kills the node at the first command
+  # tick. Single-quoting keeps it a string (commands must not contain ').
+  launch aggregator python3 scripts/aggregator_node.py \
     --ros-args \
-    -p weights_path:="${HAND_EYE_WEIGHTS}" \
-    -p image_topic:=/hand/hand/color/image_raw \
-    -p depth_topic:=/hand/hand/aligned_depth_to_color/image_raw \
-    -p camera_info_topic:=/hand/hand/color/camera_info \
-    -p calib_file:="${HAND_EYE_CALIB}" \
-    -p calib_scale_mm_to_m:=true \
-    -p device:="${HAND_EYE_DEVICE}" \
-    -p imgsz:=1280 \
-    -p conf:=0.35 \
-    -p base_frame:=base_link \
-    -p target_class_name:=upright-cup \
-    -p pick_point_method:="${HAND_EYE_PICK_METHOD}" \
-    -p enable_temporal_smoothing:="${HAND_EYE_SMOOTHING}"
-else
-  launch fake_hand_eye python3 scripts/fake_hand_eye_node.py \
+    -p "user_command:='${USER_COMMAND}'"
+  # digital_twin_stabilizer median-filters the real /digital_twin/boxes into
+  # /digital_twin/boxes_filtered (what plan_executor's coarse move reads).
+  launch digital_twin_stabilizer python3 scripts/digital_twin_stabilizer_node.py \
     --ros-args \
-    -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
-    -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
-    -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
+    -p method:="${STABILIZE_METHOD}" \
+    -p window_s:="${STABILIZE_WINDOW_S}" \
+    -p track_timeout_s:="${STABILIZE_TRACK_TIMEOUT_S}" \
+    -p merge_distance_m:="${STABILIZE_MERGE_DISTANCE_M}"
+  # hand-eye source for pick_node fine pick (/hand_eye/boxes). HAND_EYE_MODE:
+  #   real = upright_cup_pose_node (hand cam YOLO-seg -> base_link via /tf FK)
+  #   fake = fake_hand_eye_node (GT)
+  if [[ "${HAND_EYE_MODE}" == "real" ]]; then
+    launch_quiet upright_cup_pose python3 scripts/upright_cup_pose_node.py \
+      --ros-args \
+      -p weights_path:="${HAND_EYE_WEIGHTS}" \
+      -p image_topic:=/hand/hand/color/image_raw \
+      -p depth_topic:=/hand/hand/aligned_depth_to_color/image_raw \
+      -p camera_info_topic:=/hand/hand/color/camera_info \
+      -p calib_file:="${HAND_EYE_CALIB}" \
+      -p calib_scale_mm_to_m:=true \
+      -p device:="${HAND_EYE_DEVICE}" \
+      -p imgsz:=1280 \
+      -p conf:=0.35 \
+      -p base_frame:=base_link \
+      -p target_class_name:=upright-cup \
+      -p pick_point_method:="${HAND_EYE_PICK_METHOD}" \
+      -p enable_temporal_smoothing:="${HAND_EYE_SMOOTHING}"
+  else
+    launch fake_hand_eye python3 scripts/fake_hand_eye_node.py \
+      --ros-args \
+      -p disturbance_enabled:="${DISTURBANCE_ENABLED}" \
+      -p disturbance_trigger_slot:="${DISTURBANCE_TRIGGER_SLOT}" \
+      -p disturbance_removed_slot:="${DISTURBANCE_REMOVED_SLOT}"
+  fi
 fi
-launch goal_state_publisher python3 scripts/goal_state_publisher_node.py \
-  --ros-args \
-  -p freeze_timeout_s:="${FREEZE_TIMEOUT_S}"
-launch topic_logger python3 scripts/topic_logger_node.py \
-  --ros-args \
-  -p log_dir:="${LOG_DIR}"
-launch llm_node python3 scripts/llm_node.py \
-  --ros-args \
-  -p model:="${MODEL}" \
-  -p ollama_url:="${OLLAMA_URL}"
-launch plan_executor python3 scripts/plan_executor_node.py \
-  --ros-args \
-  -p api_url_move:="${API_URL}" \
-  -p api_timeout_s:="${API_TIMEOUT_S}" \
-  -p move_z:="${MOVE_Z}" \
-  -p api_base_robot:="${ROBOT_API_BASE}" \
-  -p recovery_mode:="${RECOVERY_MODE}" \
-  -p recovery_timeout_s:="${RECOVERY_TIMEOUT_S}" \
-  -p dry_run:="${DRY_RUN}"
 
-# pick_node closes the loop (/move_result -> hand-eye fine pick ->
-# /api/robot/skill/pyramid -> /action_result). It has NO dry-run and always
-# POSTs the real pyramid API, so only launch it in --real-api mode; otherwise a
-# dry run would drive the real robot.
-if [[ "${DRY_RUN}" == "false" ]]; then
-  launch pick_node python3 scripts/pick_node.py \
+# ── LLM group (WITH_LLM) — closed loop, needs Ollama (+ robot API real mode) ─
+if [[ "${WITH_LLM}" == "true" ]]; then
+  launch goal_state_publisher python3 scripts/goal_state_publisher_node.py \
     --ros-args \
-    -p api_base:="${ROBOT_API_BASE}" \
-    -p api_timeout_sec:="${API_TIMEOUT_S}" \
-    -p filter_by_color:="${PICK_FILTER_BY_COLOR}"
-else
-  echo "[start.sh] dry-run: pick_node NOT launched (no dry-run; would POST the" \
-       "real pyramid API). Loop stays open. Use --real-api to close it."
+    -p freeze_timeout_s:="${FREEZE_TIMEOUT_S}"
+  launch topic_logger python3 scripts/topic_logger_node.py \
+    --ros-args \
+    -p log_dir:="${LOG_DIR}"
+  launch llm_node python3 scripts/llm_node.py \
+    --ros-args \
+    -p model:="${MODEL}" \
+    -p ollama_url:="${OLLAMA_URL}"
+  launch plan_executor python3 scripts/plan_executor_node.py \
+    --ros-args \
+    -p api_url_move:="${API_URL}" \
+    -p api_timeout_s:="${API_TIMEOUT_S}" \
+    -p move_z:="${MOVE_Z}" \
+    -p api_base_robot:="${ROBOT_API_BASE}" \
+    -p recovery_mode:="${RECOVERY_MODE}" \
+    -p recovery_timeout_s:="${RECOVERY_TIMEOUT_S}" \
+    -p dry_run:="${DRY_RUN}"
+
+  # pick_node closes the loop (/move_result -> hand-eye fine pick ->
+  # /api/robot/skill/pyramid -> /action_result). It has NO dry-run and always
+  # POSTs the real pyramid API, so only launch it in --real-api mode; otherwise a
+  # dry run would drive the real robot.
+  if [[ "${DRY_RUN}" == "false" ]]; then
+    launch pick_node python3 scripts/pick_node.py \
+      --ros-args \
+      -p api_base:="${ROBOT_API_BASE}" \
+      -p api_timeout_sec:="${API_TIMEOUT_S}" \
+      -p filter_by_color:="${PICK_FILTER_BY_COLOR}"
+  else
+    echo "[start.sh] dry-run: pick_node NOT launched (no dry-run; would POST the" \
+         "real pyramid API). Loop stays open. Use --real-api to close it."
+  fi
 fi
 
 wait
