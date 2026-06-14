@@ -64,6 +64,30 @@ cd /home/ssu/cup-stack-flat/server && ./start.sh    # ../<pkg>/install/setup.bas
 패키지명 `recode_sequence` 는 유지되어 `ros2 launch recode_sequence cameras_only.launch.py`
 는 그대로 동작.
 
+## 4-b. YOLO 가중치 sim/real 분기 ⚠️
+
+`ros2-depth-point-cloude/vision/yolo/` 에는 **sim 전용**(`sim_exo_best.pt`,
+`sim_hand_best.pt` — Isaac 렌더로 파인튜닝, vision-YOLO/data_generator v7)과
+**real**(`0610-2.pt`, `speedstack3class_…a100_best.pt`, `0609_exo_best.pt` 등 —
+실 카메라로 학습) 모델이 함께 들어 있다. **둘은 절대 호환되지 않는다**: sim
+모델은 Isaac 렌더 분포에만 맞고 실 카메라 이미지에선 퇴행, 반대도 마찬가지다.
+
+동일 hand/exo 모델을 쓰는 소비처는 3곳이며, **sim 오버라이드는
+`yarr-isaac-playground/start_isaac.sh`(SIM_YOLO_* )에만 존재**한다. real 경로는
+전부 별도 기본값(아래)을 쓰므로 sim 가중치를 집어가지 않는다 — 이 분리를 깨지
+말 것.
+
+| 소비처 | 파라미터 | SIM (start_isaac.sh) | REAL 기본값 (절대 sim 금지) |
+|---|---|---|---|
+| pick_node hand-eye fine pick (`upright_cup_pose_node`) | `HAND_EYE_WEIGHTS` | `$SIM_YOLO_HAND` = `sim_hand_best.pt` | `cup_stack_agent/start.sh` 기본 = real `speedstack3class_…a100_best.pt` |
+| fusion detection (exo+hand) | `model_exo` / `model_hand` | launch arg `$SIM_YOLO_{EXO,HAND}` | `depth_digital_twin/config/params.yaml` = real `0610-2.pt` / `speedstack3class_…` |
+| recovery `fallen_cup_detect` | `FALLEN_CUP_WEIGHTS` | `$SIM_YOLO_FALLEN` = `sim_hand_best.pt` | robot 서비스 env (real 모델 경로로 설정) |
+
+**규칙**: 새 모델을 배포할 때 sim/real 을 섞지 말 것. sim 산출물은
+`sim_*_best.pt` 접두로만, real 산출물은 real 모델 파일명으로. real 호스트의
+`HAND_EYE_WEIGHTS`·`params.yaml model_*`·`FALLEN_CUP_WEIGHTS` 가 `sim_*_best.pt`
+를 가리키면 안 된다(실 카메라에서 퇴행).
+
 ## 5. 위험 & 체크리스트
 
 - [ ] 대용량 서브모듈 초기 clone/build 시간 확보(depth/doosan)
@@ -71,5 +95,7 @@ cd /home/ssu/cup-stack-flat/server && ./start.sh    # ../<pkg>/install/setup.bas
 - [ ] `restart` 가 아닌 `build + up --force-recreate` 사용(이미지/볼륨 변경 반영)
 - [ ] 구 체크아웃 롤백 경로 유지 기간 합의
 - [ ] 컷오버 후 `cup-stack-server` 레포 아카이브 여부 결정
+- [ ] **real 호스트의 `HAND_EYE_WEIGHTS`·`params.yaml model_*`·`FALLEN_CUP_WEIGHTS`
+      가 real 모델을 가리키는지 확인 (sim_*_best.pt 금지 — 4-b 참조)**
 
 > **미결**: 컷오버 일정과 `cup-stack-server` 레포 아카이브 시점은 운영 합의 필요.

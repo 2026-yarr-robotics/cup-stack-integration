@@ -53,6 +53,10 @@ STABILIZE_MERGE_DISTANCE_M="${STABILIZE_MERGE_DISTANCE_M:-0.055}"
 #   real = upright_cup_pose_node (real hand camera YOLO-seg -> base_link /tf)
 #   fake = fake_hand_eye_node (GT). Revert with: HAND_EYE_MODE=fake ./start.sh
 HAND_EYE_MODE="${HAND_EYE_MODE:-real}"
+# 기본값 = REAL hand 모델(실 카메라 학습). sim 은 start_isaac.sh 가
+# HAND_EYE_WEIGHTS=$SIM_YOLO_HAND(=sim_hand_best.pt) 로 오버라이드한다.
+# ⚠️ real 에서 이 기본값을 sim_*_best.pt 로 바꾸지 말 것 — sim 모델은 Isaac
+# 렌더 분포 전용이라 실 카메라에서 퇴행한다 (deploy_migration_policy.md §4-b).
 HAND_EYE_WEIGHTS="${HAND_EYE_WEIGHTS:-/home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt}"
 HAND_EYE_CALIB="${HAND_EYE_CALIB:-/home/ssu/cup-stack-integration/fallen-cup-recovery/dsr_practice/config/T_gripper2camera.npy}"
 HAND_EYE_DEVICE="${HAND_EYE_DEVICE:-cuda}"
