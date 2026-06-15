@@ -48,6 +48,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import signal
 import threading
 import time
 import urllib.error
@@ -411,6 +413,7 @@ class PlanExecutorNode(Node):
         self._plan: list[dict] = []
         self._step_idx: int = 0
         self._busy: bool = False
+        self._shutting_down: bool = False  # guards one-shot done-shutdown
         self._last_fallen: tuple[int, float] | None = None  # (count, mono ts)
 
         self._move_pub = self.create_publisher(String, move_topic, 10)
@@ -555,9 +558,41 @@ class PlanExecutorNode(Node):
             with self._state_lock:
                 self._plan = []
                 self._step_idx = 0
+            self._shutdown_agent('LLM decision=done — plan complete')
         else:
             self.get_logger().warn(
                 f'/llm_output unknown shape: {list(data.keys())}')
+
+    def _shutdown_agent(self, reason: str) -> None:
+        """Cleanly terminate the whole cup_stack_agent stack once the loop is done.
+
+        Without this a ``done`` loop left every rclpy node spinning forever, so the
+        agent process stayed alive after the build finished (and the host bringup
+        agent reported it ``running`` indefinitely). start.sh runs as the process-
+        group leader and every node + tee shares its pgid, so one group SIGINT
+        takes the whole stack down: the rclpy nodes catch it and shut down
+        gracefully, and start.sh's cleanup() trap reaps any stragglers and exits.
+
+        Emits the host success sentinel (``TASK_RESULT=SUCCESS``) first so the
+        signal-driven (non-zero) exit is mapped to ``idle``, not ``failed``, by
+        bringup_agent._decide_task_status. The actual group signal is deferred a
+        beat so the sentinel + final logs flush through the tee pipeline before
+        teardown.
+        """
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self.get_logger().info(
+            f'plan complete — TASK_RESULT=SUCCESS; shutting down agent ({reason})')
+        threading.Timer(1.0, self._terminate_process_group).start()
+
+    def _terminate_process_group(self) -> None:
+        try:
+            os.killpg(os.getpgid(0), signal.SIGINT)
+        except (ProcessLookupError, PermissionError) as exc:
+            self.get_logger().warn(
+                f'group shutdown signal failed ({exc}); exiting self')
+            os._exit(0)
 
     def _adopt_plan(self, steps: list[dict], reason: str) -> None:
         raw_steps = list(steps) if isinstance(steps, list) else []
