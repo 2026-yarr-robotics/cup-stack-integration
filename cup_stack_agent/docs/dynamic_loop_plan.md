@@ -149,6 +149,18 @@ OBSERVED ──┐
 > 작업 브랜치: `loop` (top-level integration repo; cup_stack_agent은 own code라
 > 서브모듈 커밋 불필요, 커밋 작성자는 checkout의 git user).
 
+### #7 교란 트리거 결정 (✅ 2026-06-15)
+
+- **노이즈 필터는 verifier가 이미 처리** (release_off 5s + color vote, #10) →
+  GSP에 별도 디바운스 불필요. `/stack`이 슬롯을 null로 보고하면 그건 이미 ~5초
+  확정된 교란이다. #7의 실제 작업은 `publish_on_world_change`를 켜되 **실제
+  world delta일 때만** publish (지금은 프레임마다 flood하는 구조 → 직전 발행
+  world와 다를 때만 쏘도록 게이팅).
+- **done 후 자동종료(`_shutdown_agent`)와 충돌 → (a) done 후 10초 grace.**
+  done이어도 즉시 안 끄고 10초간 살아서 교란을 감시, 그 사이 교란이 루프를
+  다시 깨우면(`publish_on_world_change` 재트리거) 종료 타이머 취소. 10초 무사
+  통과 시 종료.
+
 ## 6. Phasing (위험도 순)
 
 - **Phase 1 (저위험, 색·unstack 무관)**: 부분플랜→전체목표 수렴 + done-race 가드.
