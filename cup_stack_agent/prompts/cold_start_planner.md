@@ -62,12 +62,13 @@ Rules:
 - One step per target_slot, in build order. Step count = min(cup_budget, available cups); stop early when cups run out (a partial build is fine).
 - Track remaining color counts as your plan consumes cups: each step decrements that color implicitly.
 - Honor color constraints in user_command. A constraint that names a layer/row (e.g. bottom, base, top, N번째 줄/단) applies to EVERY target slot in that layer, not just one. Assign colors layer by layer.
+- target.slot_colors: a map {target_slot: required color} recording the user's color CONSTRAINT per slot, or "any" where no constraint applies. A layer constraint (e.g. "bottom red") sets every slot in that layer to that color; every other slot is "any". With NO color constraint, set EVERY target slot to "any". slot_colors is the CONSTRAINT, not your free color pick — for an "any" slot the step may still use any available color, but slot_colors stays "any". Include one entry for every slot in target_slots.
 
 Output (JSON only, no markdown fences, no prose before or after):
 {
   "reasoning": "<one sentence>",
   "status": "ok" | "unsupported" | "insufficient_resources",
-  "target": null | {"base_levels": int, "cup_budget": int, "target_slots": [str]},
+  "target": null | {"base_levels": int, "cup_budget": int, "target_slots": [str], "slot_colors": {str: str}},
   "plan": null | {"steps": [{"step":int,"action":"pyramid","color":str,"target_slot":str}]},
   "error": null | {"code": "UNSUPPORTED_PATTERN"|"INSUFFICIENT_RESOURCES", "message": str}
 }
@@ -76,13 +77,13 @@ Few-shot example 1:
 Input:
 {"user_command":"Build a 1-level pyramid","current_world_state":{"cups_on_table":{"red":3},"stack":{"L1_left":null,"L1_mid":null,"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":0,"total_slots":6}}
 Output:
-{"reasoning":"1-level pyramid needs one cup, using an available red cup.","status":"ok","target":{"base_levels":1,"cup_budget":1,"target_slots":["L1_left"]},"plan":{"steps":[{"step":1,"action":"pyramid","color":"red","target_slot":"L1_left"}]},"error":null}
+{"reasoning":"1-level pyramid needs one cup, using an available red cup.","status":"ok","target":{"base_levels":1,"cup_budget":1,"target_slots":["L1_left"],"slot_colors":{"L1_left":"any"}},"plan":{"steps":[{"step":1,"action":"pyramid","color":"red","target_slot":"L1_left"}]},"error":null}
 
 Few-shot example 2:
 Input:
 {"user_command":"Stack a 3-level pyramid with red cups on the bottom","current_world_state":{"cups_on_table":{"red":3,"blue":2,"green":1},"stack":{"L1_left":null,"L1_mid":null,"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":0,"total_slots":6}}
 Output:
-{"reasoning":"3-level pyramid with red bottom uses red for L1, blue for L2, and green for L3.","status":"ok","target":{"base_levels":3,"cup_budget":6,"target_slots":["L1_left","L1_mid","L1_right","L2_left","L2_right","L3_top"]},"plan":{"steps":[{"step":1,"action":"pyramid","color":"red","target_slot":"L1_left"},{"step":2,"action":"pyramid","color":"red","target_slot":"L1_mid"},{"step":3,"action":"pyramid","color":"red","target_slot":"L1_right"},{"step":4,"action":"pyramid","color":"blue","target_slot":"L2_left"},{"step":5,"action":"pyramid","color":"blue","target_slot":"L2_right"},{"step":6,"action":"pyramid","color":"green","target_slot":"L3_top"}]},"error":null}
+{"reasoning":"3-level pyramid with red bottom uses red for L1, blue for L2, and green for L3.","status":"ok","target":{"base_levels":3,"cup_budget":6,"target_slots":["L1_left","L1_mid","L1_right","L2_left","L2_right","L3_top"],"slot_colors":{"L1_left":"red","L1_mid":"red","L1_right":"red","L2_left":"any","L2_right":"any","L3_top":"any"}},"plan":{"steps":[{"step":1,"action":"pyramid","color":"red","target_slot":"L1_left"},{"step":2,"action":"pyramid","color":"red","target_slot":"L1_mid"},{"step":3,"action":"pyramid","color":"red","target_slot":"L1_right"},{"step":4,"action":"pyramid","color":"blue","target_slot":"L2_left"},{"step":5,"action":"pyramid","color":"blue","target_slot":"L2_right"},{"step":6,"action":"pyramid","color":"green","target_slot":"L3_top"}]},"error":null}
 
 Few-shot example 3:
 Input:
@@ -94,13 +95,13 @@ Few-shot example 4:
 Input:
 {"user_command":"Build a 1-level pyramid with red cups","current_world_state":{"cups_on_table":{"red":0,"blue":3},"stack":{"L1_left":null,"L1_mid":null,"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":0,"total_slots":6}}
 Output:
-{"reasoning":"The requested red cups are unavailable, so the hard color constraint cannot be satisfied.","status":"insufficient_resources","target":{"base_levels":1,"cup_budget":1,"target_slots":["L1_left"]},"plan":null,"error":{"code":"INSUFFICIENT_RESOURCES","message":"Requested color or total cup count is unavailable."}}
+{"reasoning":"The requested red cups are unavailable, so the hard color constraint cannot be satisfied.","status":"insufficient_resources","target":{"base_levels":1,"cup_budget":1,"target_slots":["L1_left"],"slot_colors":{"L1_left":"red"}},"plan":null,"error":{"code":"INSUFFICIENT_RESOURCES","message":"Requested color or total cup count is unavailable."}}
 
 Few-shot example 5 (partial fill of a 3-level base; base_levels stays 3):
 Input:
 {"user_command":"3단에서 1단만 쌓아줘","current_world_state":{"cups_on_table":{"red":3,"blue":2,"green":1},"stack":{"L1_left":null,"L1_mid":null,"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":0,"total_slots":6}}
 Output:
-{"reasoning":"Building only level 1 of a 3-level pyramid uses the three bottom slots.","status":"ok","target":{"base_levels":3,"cup_budget":3,"target_slots":["L1_left","L1_mid","L1_right"]},"plan":{"steps":[{"step":1,"action":"pyramid","color":"red","target_slot":"L1_left"},{"step":2,"action":"pyramid","color":"red","target_slot":"L1_mid"},{"step":3,"action":"pyramid","color":"red","target_slot":"L1_right"}]},"error":null}
+{"reasoning":"Building only level 1 of a 3-level pyramid uses the three bottom slots.","status":"ok","target":{"base_levels":3,"cup_budget":3,"target_slots":["L1_left","L1_mid","L1_right"],"slot_colors":{"L1_left":"any","L1_mid":"any","L1_right":"any"}},"plan":{"steps":[{"step":1,"action":"pyramid","color":"red","target_slot":"L1_left"},{"step":2,"action":"pyramid","color":"red","target_slot":"L1_mid"},{"step":3,"action":"pyramid","color":"red","target_slot":"L1_right"}]},"error":null}
 
 Few-shot example 6 (fallen interrupt — recover before planning):
 Input:

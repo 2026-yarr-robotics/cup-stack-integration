@@ -113,6 +113,10 @@ def validate_cold_start(resp: dict, payload: dict | None = None) -> list[str]:
             errs.append(f'step count {len(steps)} exceeds available cups '
                         f'{total_available}')
         errs += _check_pyramid_steps(steps)
+        slot_colors = target.get('slot_colors')
+        if slot_colors is not None:
+            errs += _check_slot_colors(slot_colors, slots)
+            errs += _check_steps_match_slot_colors(steps, slot_colors)
     else:  # unsupported / insufficient_resources
         if resp.get('plan') is not None:
             errs.append(f'status={status} requires plan=null')
@@ -144,10 +148,30 @@ def validate_inflight(resp: dict, payload: dict) -> list[str]:
     """Structural + semantic checks for an in-flight decision (§8.3)."""
     errs: list[str] = []
     decision = resp.get('decision')
-    if decision not in ('continue', 'replan', 'done'):
+    if decision not in ('continue', 'replan', 'done', 'unstack'):
         errs.append(f'bad decision: {decision!r}')
-    if decision in ('continue', 'done') and resp.get('plan') is not None:
+    if decision in ('continue', 'done', 'unstack') and resp.get('plan') is not None:
         errs.append(f'decision={decision} requires plan=null')
+    if decision == 'unstack':
+        slot = resp.get('slot')
+        if slot not in STACK_SLOTS:
+            errs.append(
+                f'decision=unstack requires a valid slot, got {slot!r}')
+        else:
+            cw = payload.get('current_world_state') or {}
+            stack = cw.get('stack') or {}
+            target = (payload.get('current_plan') or {}).get('target') or {}
+            slot_colors = target.get('slot_colors')
+            try:
+                fallen = int(payload.get('fallen_count') or 0)
+            except (TypeError, ValueError):
+                fallen = 0
+            # Valid unstack = a TOP-EXPOSED slot that is ITSELF a color
+            # violation whose required color is available to refill.
+            errs += _check_unstack_removable(slot, stack)
+            errs += _check_unstack_is_violation(slot, slot_colors, stack)
+            errs += _check_unstack_replacement(
+                slot, slot_colors, cw.get('cups_on_table'), fallen)
     if decision == 'replan':
         plan = resp.get('plan')
         if not plan:
@@ -155,6 +179,11 @@ def validate_inflight(resp: dict, payload: dict) -> list[str]:
         else:
             steps = plan.get('steps') or []
             errs += _check_pyramid_steps(steps)
+            # Replan steps must honor the persisted per-slot color constraint.
+            cur_target = (payload.get('current_plan') or {}).get('target') or {}
+            sc = cur_target.get('slot_colors')
+            if sc is not None:
+                errs += _check_steps_match_slot_colors(steps, sc)
     if decision == 'done':
         plan = payload.get('current_plan') or {}
         if (plan.get('remaining_steps') or []):
@@ -170,6 +199,7 @@ def validate_inflight(resp: dict, payload: dict) -> list[str]:
         cw = payload.get('current_world_state') or {}
         stack = cw.get('stack') or {}
         target = plan.get('target') or {}
+        slot_colors = target.get('slot_colors') or {}
         null_targets = [s for s in (target.get('target_slots') or [])
                         if not stack.get(s)]
         cups = cw.get('cups_on_table') or {}
@@ -180,10 +210,27 @@ def validate_inflight(resp: dict, payload: dict) -> list[str]:
             fallen = int(payload.get('fallen_count') or 0)
         except (TypeError, ValueError):
             fallen = 0
-        if null_targets and (total_cups > 0 or fallen > 0):
+        # A null target is FILLABLE only when a cup that can fill it exists: its
+        # required color for a constrained slot, or any color for an "any" slot.
+        # A constrained null slot whose color is gone is NOT a reason to block
+        # done (it cannot be filled) — that is a legitimate partial.
+        fillable = []
+        for s in null_targets:
+            want = slot_colors.get(s)
+            if want and want != 'any':
+                if _color_available(cups, want):
+                    fillable.append(f'{s}({want})')
+            elif total_cups > 0:
+                fillable.append(s)
+        if fillable or (null_targets and fallen > 0):
             errs.append(
-                f'decision=done but null target slot(s) {null_targets} can '
-                f'still be filled (cups={total_cups}, fallen={fallen})')
+                f'decision=done but null target slot(s) can still be filled '
+                f'(fillable={fillable}, fallen={fallen})')
+        # Never accept done while a FIXABLE color violation remains — the loop
+        # must unstack+refill, not stop (and, with the done->shutdown hook, a
+        # wrong done here would terminate irrecoverably). An unfixable one
+        # (required color gone) is allowed as a partial.
+        errs += _check_no_color_violation(stack, slot_colors, cups, fallen)
     return errs
 
 
@@ -210,6 +257,149 @@ def validate_fallen_recovery(resp: dict, payload: dict | None = None) -> list[st
     return errs
 
 
+# Which slots rest ON a given slot — a slot is unstack-removable only when
+# every slot it supports is already empty (top-down teardown, mirrors
+# server/domains/robot.py UNSTACK_SEQUENCE and docs/dynamic_loop_plan.md §1).
+_UNSTACK_SUPPORTS: dict[str, tuple[str, ...]] = {
+    'L1_left': ('L2_left',),
+    'L1_mid': ('L2_left', 'L2_right'),
+    'L1_right': ('L2_right',),
+    'L2_left': ('L3_top',),
+    'L2_right': ('L3_top',),
+    'L3_top': (),
+}
+
+
+def _slot_occupied(stack: Any, slot: str) -> bool:
+    """True when ``slot`` holds a cup in a normalized payload stack
+    (``{slot: {"color": str}|null}``; tolerates a bare color string)."""
+    if not isinstance(stack, dict):
+        return False
+    val = stack.get(slot)
+    if val is None:
+        return False
+    if isinstance(val, str):
+        return val.strip().lower() not in ('', 'none', 'null', 'empty')
+    if isinstance(val, dict):
+        return bool(val.get('color'))
+    return bool(val)
+
+
+def _observed_color(stack: Any, slot: str) -> str | None:
+    """The color a normalized payload stack reports for ``slot`` (``{slot:
+    {"color": c}|null}``; tolerates a bare color string), or None when empty
+    or color-unknown."""
+    if not isinstance(stack, dict):
+        return None
+    val = stack.get(slot)
+    if isinstance(val, dict):
+        c = val.get('color')
+        return c if isinstance(c, str) else None
+    if isinstance(val, str):
+        v = val.strip().lower()
+        return None if v in ('', 'none', 'null', 'empty') else val
+    return None
+
+
+def _color_available(cups: Any, color: str) -> bool:
+    """True when cups_on_table has at least one cup of ``color``."""
+    if not isinstance(cups, dict):
+        return False
+    try:
+        return int(cups.get(color) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_exposed(stack: Any, slot: str) -> bool:
+    """True when no occupied slot rests on ``slot`` — it is the top of its
+    column and can be unstacked without disturbing a cup above it."""
+    return not any(_slot_occupied(stack, up)
+                   for up in _UNSTACK_SUPPORTS.get(slot, ()))
+
+
+def _check_no_color_violation(
+    stack: Any, slot_colors: Any, cups: Any, fallen: int,
+) -> list[str]:
+    """A filled slot whose color differs from its non-"any" slot_colors is a
+    color violation. done is blocked ONLY for a violation that is both FIXABLE
+    (its required color is still available, or a fallen cup could supply it)
+    AND TOP-EXPOSED (nothing correct rests on it — so the loop can unstack it
+    directly). A BURIED violation (under correct cups) is left intact as a
+    legitimate partial — we never tear down correct work — and an UNFIXABLE one
+    (required color gone) is also a partial, so neither blocks done."""
+    if not isinstance(slot_colors, dict):
+        return []
+    bad = []
+    for slot, want in slot_colors.items():
+        if not want or want == 'any':
+            continue
+        got = _observed_color(stack, slot)
+        if got is None or got == want:
+            continue
+        if not (_color_available(cups, want) or fallen > 0):
+            continue  # unfixable -> partial
+        if not _is_exposed(stack, slot):
+            continue  # buried under correct cups -> partial
+        bad.append(f'{slot}:{got}!={want}')
+    if bad:
+        return [f'decision=done but fixable top-exposed color violation(s) '
+                f'{bad} — unstack and refill first']
+    return []
+
+
+def _check_unstack_replacement(
+    slot: str, slot_colors: Any, cups: Any, fallen: int,
+) -> list[str]:
+    """Unstacking is only worth it when the slot's REQUIRED color can refill
+    it — that color is on the table, or a fallen cup could supply it. Removing
+    a wrong cup with no replacement just churns the build, so reject it (the
+    decider should done-partial instead)."""
+    if not isinstance(slot_colors, dict):
+        return []
+    want = slot_colors.get(slot)
+    if not want or want == 'any':
+        return []  # unconstrained slot — any cup can refill
+    if _color_available(cups, want) or fallen > 0:
+        return []
+    return [f'decision=unstack slot {slot!r} requires color {want!r} to '
+            f'refill but none is available — leave it (done partial)']
+
+
+def _check_unstack_removable(slot: str, stack: Any) -> list[str]:
+    """An unstack target must be FILLED and TOP-EXPOSED (nothing resting on it).
+
+    A buried violation is NOT unstacked — we never tear down correct cups to
+    reach it (it is left as a partial). Also guards an already-empty slot."""
+    errs: list[str] = []
+    if not _slot_occupied(stack, slot):
+        errs.append(f'decision=unstack but slot {slot!r} is already empty')
+        return errs
+    blockers = [s for s in _UNSTACK_SUPPORTS.get(slot, ())
+                if _slot_occupied(stack, s)]
+    if blockers:
+        errs.append(
+            f'decision=unstack slot {slot!r} is buried under {sorted(blockers)} '
+            f'— do not tear down correct cups; leave it (done partial)')
+    return errs
+
+
+def _check_unstack_is_violation(
+    slot: str, slot_colors: Any, stack: Any,
+) -> list[str]:
+    """Only a slot that is ITSELF a color violation may be unstacked — never a
+    correct cup. (A wrong cup buried under correct cups stays put as a partial;
+    we do not remove the correct cups above it.)"""
+    if not isinstance(slot_colors, dict):
+        return []
+    want = slot_colors.get(slot)
+    got = _observed_color(stack, slot)
+    if not want or want == 'any' or got is None or got == want:
+        return [f'decision=unstack slot {slot!r} is not a color violation '
+                f'(holds {got!r}, requires {want!r}) — do not unstack it']
+    return []
+
+
 def _check_pyramid_steps(steps: list) -> list[str]:
     """Each step is one atomic `pyramid` action with color + target_slot."""
     errs: list[str] = []
@@ -221,6 +411,44 @@ def _check_pyramid_steps(steps: list) -> list[str]:
             errs.append(f'step {i + 1}: pyramid step missing color')
         if not s.get('target_slot'):
             errs.append(f'step {i + 1}: pyramid step missing target_slot')
+    return errs
+
+
+def _check_slot_colors(slot_colors: Any, target_slots: list) -> list[str]:
+    """target.slot_colors (when present) must map EXACTLY the target_slots to a
+    known color or "any". (Optional field — callers only invoke this when it is
+    present, so absence is not an error.)"""
+    errs: list[str] = []
+    if not isinstance(slot_colors, dict):
+        errs.append('slot_colors must be an object {slot: color|"any"}')
+        return errs
+    valid = set(_COLOR_ALIASES.values()) | {'any'}
+    if set(slot_colors) != set(target_slots):
+        errs.append(
+            f'slot_colors keys {sorted(slot_colors)} must match target_slots '
+            f'{sorted(target_slots)}')
+    for slot, color in slot_colors.items():
+        if color not in valid:
+            errs.append(
+                f'slot_colors[{slot!r}]={color!r} is not a known color or "any"')
+    return errs
+
+
+def _check_steps_match_slot_colors(steps: Any, slot_colors: Any) -> list[str]:
+    """A step filling a CONSTRAINED slot (slot_colors[slot] != "any") must use
+    that exact color. "any" slots are unconstrained; a constrained slot with NO
+    step is fine (it may be unfillable for now) — only a wrong-color step errs."""
+    errs: list[str] = []
+    if not isinstance(slot_colors, dict) or not isinstance(steps, list):
+        return errs
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict):
+            continue
+        want = slot_colors.get(s.get('target_slot'))
+        if want and want != 'any' and s.get('color') != want:
+            errs.append(
+                f"step {i + 1}: slot {s.get('target_slot')!r} requires color "
+                f"{want!r} but step uses {s.get('color')!r}")
     return errs
 
 
