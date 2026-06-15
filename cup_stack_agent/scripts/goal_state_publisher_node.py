@@ -81,6 +81,12 @@ class GoalStatePublisher(Node):
         # Give up waiting for a fresh /cups_on_table after an action and
         # advance on the last world if perception stalls this long.
         self.declare_parameter('pending_fresh_timeout_s', 5.0)
+        # If perception never reflects an action's effect (verifier flicker /
+        # stack loss), publish the decision anyway after this long so the loop
+        # can NEVER hang on the reflection gate — the LLM then sees the current
+        # world and replans/decides (a "success but slot still null" reads as a
+        # contradicted success -> replan).
+        self.declare_parameter('reflect_timeout_s', 10.0)
         # Hand-eye fallen count {"count": N} published every frame by
         # upright_cup_pose_node (same camera/inference as /hand_eye/boxes).
         # Gated into the payload top-level `fallen_count` at the DECISION
@@ -98,6 +104,18 @@ class GoalStatePublisher(Node):
         # the stale pre-recovery sample. On timeout publish anyway so the LLM
         # can decide retry/replan.
         self.declare_parameter('recovery_clear_timeout_s', 8.0)
+        # After a recovery finishes, hold the post-recovery decision at least
+        # this long so exo cups_on_table reflects the stood-up cup (exo window
+        # ~1-2s) before the LLM decides — else it may decide on a world that
+        # hasn't shown the recovered cup yet.
+        self.declare_parameter('recovery_settle_s', 1.5)
+        # Done-race guard: after an action empties the last upright cup while
+        # the target still has null slots, hold the decision up to this long
+        # for a FRESH hand-eye fallen sample, so the decider sees the real
+        # fallen_count instead of a stale 0 (which would call a premature
+        # done(partial) and never recover the fallen cup). Bounded so a missing
+        # hand-eye never stalls the loop.
+        self.declare_parameter('fallen_settle_wait_s', 3.0)
 
         self._strict = bool(self.get_parameter('strict_json').value)
         self._on_world_change = bool(
@@ -120,15 +138,21 @@ class GoalStatePublisher(Node):
         self._next_slot_blocked = False   # next-step slot occupancy unresolved
         self._pending_fresh_timeout_s = float(
             self.get_parameter('pending_fresh_timeout_s').value)
+        self._reflect_timeout_s = float(
+            self.get_parameter('reflect_timeout_s').value)
         self._cups_seen_ns = 0            # last APPLIED /cups_on_table (ns)
         self._pending_action_at_ns = 0    # when the pending action arrived
         out_topic = str(self.get_parameter('llm_input_topic').value)
 
         self._recovery_clear_timeout_s = float(
             self.get_parameter('recovery_clear_timeout_s').value)
+        self._recovery_settle_s = float(
+            self.get_parameter('recovery_settle_s').value)
         self._fallen_ttl_s = float(self.get_parameter('fallen_ttl_s').value)
         self._fallen_count_sample = 0   # last accepted /fallen_cups count
         self._fallen_seen_ns = 0        # when that sample was accepted (ns)
+        self._fallen_settle_wait_s = float(
+            self.get_parameter('fallen_settle_wait_s').value)
 
         self._builder = GoalStateBuilder()
         self._pending_action_result = None
@@ -139,6 +163,21 @@ class GoalStatePublisher(Node):
         # fallen_recovery result awaiting a post-recovery hand-eye sample
         # before the next /llm_input: {'at_ns'}.
         self._pending_recovery = None
+        # Set when a pyramid pick just FAILED (e.g. select_failed: the exo cup
+        # the LLM tried to place had no graspable upright cup under the hand-eye
+        # — typically a fallen cup the exo mis-counted as upright). While set,
+        # _apply_fallen_to_payload exposes the hand-eye fallen_count even though
+        # exo still reports cups, so the next decision can route to
+        # fallen_recovery (which stands the cup and returns to HOME) instead of
+        # retrying the un-pickable cup forever. Cleared on a pyramid success or
+        # a new user command.
+        self._recover_after_pick_fail = False
+        # Set on a pyramid pick FAIL to DEFER the next /llm_input until a fresh
+        # post-unfreeze hand-eye fallen sample lands ({'at_ns'}). Without this
+        # the immediate publish runs while still frozen (stale sample) -> fallen
+        # gates to 0 -> the loop retries the un-pickable cup forever. Released by
+        # _on_fallen_cups on a fresh sample, or by _freeze_tick on timeout.
+        self._pending_pick_fail = None
 
         self._pub = self.create_publisher(String, out_topic, 10)
         self.create_subscription(
@@ -214,7 +253,19 @@ class GoalStatePublisher(Node):
             return  # arm mid-action — only at-HOME hand-eye reads may land
         self._fallen_count_sample = normalize_fallen_count(obj.get('count'))
         self._fallen_seen_ns = self.get_clock().now().nanoseconds
-        self._maybe_publish_pending_recovery()
+        if self._maybe_publish_pending_recovery():
+            return
+        # A fresh post-fail fallen sample releases a deferred pick-fail decision
+        # (now _apply_fallen_to_payload can expose the real fallen count so the
+        # loop routes to recovery instead of retrying the un-pickable cup).
+        if (self._pending_pick_fail is not None
+                and self._fallen_seen_ns > self._pending_pick_fail['at_ns']):
+            self._pending_pick_fail = None
+            self._publish()
+            return
+        # A fresh fallen sample may release a pending action held by the
+        # done-race guard (upright ran out with null target slots still left).
+        self._maybe_publish_pending_action()
 
     def _on_user_command(self, msg: String) -> None:
         # Plain text, not JSON. Empty string clears the command.
@@ -223,6 +274,8 @@ class GoalStatePublisher(Node):
         self._pending_action_result = None
         self._pending_action_before_world = None
         self._pending_recovery = None
+        self._recover_after_pick_fail = False
+        self._pending_pick_fail = None
         self._unfreeze_world('new user command')
         self._builder.set_user_command(cmd)
         self._publish()  # cold-start trigger
@@ -251,6 +304,8 @@ class GoalStatePublisher(Node):
                   or self._builder.current_world_state())
         self._builder.on_action_result(obj)
         if obj.get('result') == 'success' and obj.get('action') == 'pyramid':
+            self._recover_after_pick_fail = False  # progress made -> clear
+            self._pending_pick_fail = None
             self._pending_action_result = obj
             self._pending_action_at_ns = self.get_clock().now().nanoseconds
             self._pending_action_before_world = before
@@ -258,7 +313,21 @@ class GoalStatePublisher(Node):
                 self.get_logger().info(
                     f'/action_result pending world update: {obj}')
             return
-        self._publish()  # failures do not require a world-state delta
+        # A failed pyramid pick (no graspable upright cup at the exo target):
+        # likely a fallen cup the exo mis-counted as upright. DEFER the next
+        # decision until a FRESH hand-eye fallen sample lands AFTER unfreeze —
+        # publishing now (still frozen -> stale sample) gates fallen to 0 and the
+        # loop would retry the un-pickable cup forever. _on_fallen_cups releases
+        # it on a fresh sample; _freeze_tick times it out.
+        if obj.get('action') == 'pyramid' and obj.get('result') == 'fail':
+            self._recover_after_pick_fail = True
+            self._pending_pick_fail = {
+                'at_ns': self.get_clock().now().nanoseconds}
+            self.get_logger().info(
+                'pyramid pick failed -> awaiting fresh fallen sample before '
+                'deciding (recover vs retry)')
+            return
+        self._publish()  # other failures do not require a world-state delta
 
     def _on_llm_output(self, msg: String) -> None:
         # The future LLM node feeds its plan back so we can track goal/steps.
@@ -325,6 +394,14 @@ class GoalStatePublisher(Node):
                    - self._pending_recovery['at_ns']) * 1e-9
             if age >= self._recovery_clear_timeout_s:
                 self._maybe_publish_pending_recovery(timed_out=True)
+        if self._pending_pick_fail is not None:
+            age = (self.get_clock().now().nanoseconds
+                   - self._pending_pick_fail['at_ns']) * 1e-9
+            if age >= self._recovery_clear_timeout_s:
+                self._pending_pick_fail = None
+                self.get_logger().warn(
+                    'no fresh fallen sample after pick fail — deciding anyway')
+                self._publish()
         if not self._action_in_flight:
             return
         if (self._unfreeze_at is not None
@@ -356,8 +433,12 @@ class GoalStatePublisher(Node):
         """
         if self._pending_recovery is None:
             return False
+        age = (self.get_clock().now().nanoseconds
+               - self._pending_recovery['at_ns']) * 1e-9
         fresh = self._fallen_seen_ns > self._pending_recovery['at_ns']
-        if not (fresh or timed_out):
+        # Hold the fresh-sample publish until recovery_settle_s has elapsed so
+        # exo cups_on_table reflects the stood-up cup; timed_out always proceeds.
+        if not (timed_out or (fresh and age >= self._recovery_settle_s)):
             return False
         if fresh:
             self.get_logger().info(
@@ -393,13 +474,50 @@ class GoalStatePublisher(Node):
             self._pending_action_before_world,
             current,
         ):
-            return False
+            age = (self.get_clock().now().nanoseconds
+                   - self._pending_action_at_ns) * 1e-9
+            if age < self._reflect_timeout_s:
+                return False
+            self.get_logger().warn(
+                f'action not reflected in {self._reflect_timeout_s:.0f}s — '
+                'publishing anyway so the LLM can replan/decide')
+        # Done-race guard: the action reflected, but if upright cups are now
+        # exhausted and the target still has null slots, a fallen cup could
+        # finish it. Hold until a FRESH hand-eye fallen sample lands so the
+        # decider sees the real count (a stale gate-to-0 -> premature done).
+        if self._fallen_decision_pending(current):
+            age = (self.get_clock().now().nanoseconds
+                   - self._pending_action_at_ns) * 1e-9
+            if age < self._fallen_settle_wait_s:
+                return False
+            self.get_logger().warn(
+                'no fresh fallen sample after upright ran out — proceeding '
+                '(fallen_count gates to 0)')
         result = self._pending_action_result
         self._pending_action_result = None
         self._pending_action_before_world = None
         self.get_logger().info(
             f'/action_result reflected in world state: {result}')
         self._publish()
+        return True
+
+    def _fallen_decision_pending(self, current: dict | None) -> bool:
+        """True when this decision hinges on a fallen reading that is not yet
+        fresh: the action emptied the last upright cup(s) AND the target still
+        has null slots, but no fresh hand-eye fallen sample has landed. Mirrors
+        the gate in _apply_fallen_to_payload (exo empty AND no hand-eye fill)
+        so the guard fires only when fallen_count would actually be exposed."""
+        if self._fallen_fresh():
+            return False
+        if not self._builder.null_target_slots():
+            return False
+        cups = (current or {}).get('cups_on_table') or {}
+        total = sum(int(v) for v in cups.values()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool))
+        if total > 0:
+            return False
+        if self._handeye_fresh():
+            return False  # hand-eye fill will supply cups -> no done-race
         return True
 
     def _parse(self, raw: str, src: str) -> dict | None:
@@ -476,7 +594,12 @@ class GoalStatePublisher(Node):
         cups = cw.get('cups_on_table') or {}
         total = sum(int(v) for v in cups.values()
                     if isinstance(v, (int, float)) and not isinstance(v, bool))
-        if total > 0:
+        # Normally upright cups win (exo cups > 0 -> fallen stays hidden). But
+        # right after a FAILED pyramid pick, the exo cup count is suspect — the
+        # cup the LLM tried to place was not graspable (likely a fallen cup the
+        # exo mis-labeled upright). In that one case, expose fallen despite
+        # exo cups > 0 so the loop can recover instead of retrying forever.
+        if total > 0 and not self._recover_after_pick_fail:
             return
         if not self._fallen_fresh():
             return
@@ -515,15 +638,14 @@ class GoalStatePublisher(Node):
                 p = self._pending_future[slot]
             stable = (now - p['since']) * 1e-9 >= self._future_debounce_s
             if slot == next_slot:
-                # NEXT step's slot: a real occupancy here would collide with
-                # the next place, so HOLD the decision until it reverts (false
-                # positive) or stays stable (commit -> LLM replans/done/skip).
-                if stable:
-                    self.get_logger().info(
-                        f'next slot {slot} occupancy stable '
-                        f'{self._future_debounce_s:.0f}s -> commit (LLM replans)')
-                    # leave out[slot] = val (real occupancy)
-                else:
+                # The next step's slot must stay null in the payload until that
+                # step actually runs: a flickered/premature occupancy here would
+                # become the step's `before` state and deadlock its reflection.
+                # Never commit it; mask null and (while still debouncing) hold
+                # the decision. plan_executor's own raw-/stack occupied-skip
+                # guards against a genuine collision.
+                out[slot] = None
+                if not stable:
                     self._next_slot_blocked = True
             elif not stable:
                 out[slot] = None                       # later future -> mask

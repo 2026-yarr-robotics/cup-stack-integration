@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DRY_RUN=true
+# Default closes the loop on the REAL robot API (was dry-run before). Opt out of
+# robot motion with `./start.sh --dry-run` (logs request bodies only, pick_node
+# not launched). `--real-api` is kept as an explicit no-op for back-compat.
+DRY_RUN=false
 # Robot control API base. Default to localhost (nginx :80 → robot:8001) so the
 # robot pick/place/move calls do NOT traverse the Cloudflare tunnel, which times
 # out at ~60s (HTTP 504/530) on long arm motions. Override with the public host
@@ -69,9 +72,12 @@ HAND_EYE_SMOOTHING="${HAND_EYE_SMOOTHING:-true}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_ID}}"
 
-if [[ "${1:-}" == "--real-api" ]]; then
-  DRY_RUN=false
-fi
+case "${1:-}" in
+  --dry-run)  DRY_RUN=true ;;
+  --real-api) DRY_RUN=false ;;
+  "")         ;;
+  *) echo "[start.sh] unknown argument: ${1} (use --dry-run or --real-api)" >&2 ;;
+esac
 
 CLEANUP_STALE_AGENT_PROCESSES="${CLEANUP_STALE_AGENT_PROCESSES:-true}"
 
@@ -244,14 +250,34 @@ wait_for_ollama() {
   echo "[start.sh] Ollama connected: ${OLLAMA_BASE_URL} (${MODEL})"
 }
 
+# Teardown. The old version only ran on EXIT and only `kill $(jobs -p)`-ed the
+# nodes. Two gaps made agent processes pile up across runs:
+#   1. An untrapped SIGTERM/SIGHUP (e.g. `kill <pid>` or a closed tmux pane)
+#      terminated this script WITHOUT running the EXIT trap, orphaning the whole
+#      stack. → trap INT/TERM/HUP too.
+#   2. tee processes (and, with the old `>(tee)` form, an extra bash subshell per
+#      node) were not jobs of this script, so `jobs -p` missed them.
+# We run as a process-group leader (every bg job + its tee inherit our pgid —
+# verified), so one group-signal takes the entire stack down at once.
 cleanup() {
-  local pids
-  pids="$(jobs -p)"
-  if [[ -n "${pids}" ]]; then
-    kill ${pids} 2>/dev/null || true
+  # Disarm so the EXIT trap / a second signal can't re-enter this.
+  trap - EXIT INT TERM HUP
+  local pgid
+  pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+  if [[ -n "${pgid}" && "${pgid}" == "$$" ]]; then
+    # Ignore the signal in ourselves so this handler finishes; the nodes + tees
+    # (all in our group) still receive it.
+    trap '' TERM
+    kill -TERM -- "-${pgid}" 2>/dev/null || true
+  else
+    # Not a group leader (e.g. backgrounded launch): fall back to job leaders.
+    # For a `cmd | tee` pipeline `jobs -p` is the node PID; killing it EOFs tee.
+    local pids
+    pids="$(jobs -p)"
+    [[ -n "${pids}" ]] && kill -TERM ${pids} 2>/dev/null || true
   fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM HUP
 
 mkdir -p "${LOG_DIR}"
 export PYTHONUNBUFFERED=1
@@ -266,7 +292,12 @@ wait_for_ollama
 launch() {
   local name="$1"
   shift
-  "$@" > >(tee -a "${LOG_DIR}/${name}.log") 2>&1 &
+  # Pipe (not `> >(tee …)` process substitution): the latter spawns an extra
+  # bash subshell per node — N nodes meant N stray `bash start.sh` processes in
+  # the list. A pipe is just node + tee, and `jobs -p` reports the node PID.
+  # (stdout is block-buffered when piped, but PYTHONUNBUFFERED=1 above forces
+  # the nodes to flush, so the live log is unaffected.)
+  "$@" 2>&1 | tee -a "${LOG_DIR}/${name}.log" &
 }
 
 # file-only launch (no shared-console echo). For chatty nodes — e.g. the

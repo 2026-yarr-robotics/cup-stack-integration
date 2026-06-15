@@ -162,6 +162,28 @@ def validate_inflight(resp: dict, payload: dict) -> list[str]:
         lar = payload.get('last_action_result') or {}
         if lar.get('result') != 'success':
             errs.append('decision=done but last_action_result != success')
+        # Semantic guard: never accept done while a null TARGET slot can still
+        # be filled — a color with count > 0 remains, or a fallen cup is
+        # reported. The build must GROW (replan) / recover, not stop early.
+        # (Catches the model claiming "no cups remain" when cups_on_table
+        # actually has cups and a target slot is null.)
+        cw = payload.get('current_world_state') or {}
+        stack = cw.get('stack') or {}
+        target = plan.get('target') or {}
+        null_targets = [s for s in (target.get('target_slots') or [])
+                        if not stack.get(s)]
+        cups = cw.get('cups_on_table') or {}
+        total_cups = sum(int(v) for v in cups.values()
+                         if isinstance(v, (int, float))
+                         and not isinstance(v, bool))
+        try:
+            fallen = int(payload.get('fallen_count') or 0)
+        except (TypeError, ValueError):
+            fallen = 0
+        if null_targets and (total_cups > 0 or fallen > 0):
+            errs.append(
+                f'decision=done but null target slot(s) {null_targets} can '
+                f'still be filled (cups={total_cups}, fallen={fallen})')
     return errs
 
 

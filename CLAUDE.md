@@ -77,8 +77,9 @@ do not invent alternate topics or pass fake coordinates through CLI/params.
 
 ```bash
 cd cup_stack_agent
-./start.sh                 # dry-run: logs request bodies, no real API calls
-./start.sh --real-api      # closes the loop; POSTs the real robot API
+./start.sh                 # default: closes the loop; POSTs the real robot API
+./start.sh --real-api      # same as no-arg (explicit); closes the loop
+./start.sh --dry-run       # logs request bodies only, no real API calls
 ```
 
 `pick_node` (real-api) imports `moveit_py`; `start.sh` auto-sources

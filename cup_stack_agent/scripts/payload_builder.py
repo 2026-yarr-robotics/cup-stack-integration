@@ -147,11 +147,16 @@ def action_result_reflected(
 ) -> bool:
     """Whether world state reflects a successful atomic pyramid action.
 
-    For this experiment a successful pyramid action must fill the target slot.
-    In the normal flow the table count for that color decreases by one. In the
-    disturbance scenario another stacked cup may be removed at the same time,
-    making the table count stay unchanged. Publish once the target slot is
-    reflected and the table count has not increased beyond the previous count.
+    The authoritative, build-relevant signal is the target slot being observed
+    holding the right color. We deliberately do NOT gate on ``before`` or on the
+    cups_on_table count:
+      * a flickered/premature ``before`` that already showed the slot filled
+        used to deadlock the loop here (before==color -> never reflects);
+      * stacked cups can transiently leak into cups_on_table when the verifier
+        drops /stack_track_ids, making the table count spuriously high.
+    Disturbance detection still happens downstream: the LLM compares the
+    previous and current world state in the payload it then receives.
+    (``before`` is kept in the signature for call-site/test compatibility.)
     """
     if not result:
         return False
@@ -163,20 +168,9 @@ def action_result_reflected(
     target_slot = result.get('target_slot')
     if not isinstance(color, str) or not isinstance(target_slot, str):
         return False
-    if not before or not current:
+    if not current:
         return False
-    if stack_slot_color(before, target_slot) == color:
-        return False
-    if stack_slot_color(current, target_slot) != color:
-        return False
-    before_cups = before.get('cups_on_table') or {}
-    current_cups = current.get('cups_on_table') or {}
-    try:
-        before_count = int(before_cups.get(color, 0))
-        current_count = int(current_cups.get(color, 0))
-    except (TypeError, ValueError):
-        return False
-    return current_count <= before_count
+    return stack_slot_color(current, target_slot) == color
 
 
 class GoalStateBuilder:
@@ -332,6 +326,25 @@ class GoalStateBuilder:
         steps = self._current_plan.get('remaining_steps') or []
         return {str(s.get('target_slot')) for s in steps
                 if s.get('target_slot')}
+
+    def null_target_slots(self) -> set:
+        """Target slots that are still empty in the current stack.
+
+        Unlike ``remaining_slots`` (which tracks un-executed plan steps and so
+        empties out once a partial plan is consumed), this looks at the full
+        target intent — ``current_plan.target.target_slots`` — versus the
+        observed stack. It stays non-empty whenever the target is not yet
+        physically complete, which is what the done-race guard keys on: an
+        empty plan with null target slots still left to fill means the build
+        is NOT done if a cup (upright or recoverable fallen) could fill them.
+        Returns an empty set when there is no plan or no target.
+        """
+        if not self._current_plan:
+            return set()
+        target = self._current_plan.get('target') or {}
+        slots = target.get('target_slots') or []
+        stack = normalize_stack(self._stack)
+        return {str(s) for s in slots if stack.get(str(s)) is None}
 
     def mode(self) -> str:
         """cold_start while no plan exists, in_flight once a plan is set."""

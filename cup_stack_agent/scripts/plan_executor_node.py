@@ -26,9 +26,12 @@ So this node carries NO pick/place geometry and never touches the skill server.
 Its ONLY output is /move_result: on a successful move it carries the target color,
 the API slot key, and the coarse move target XY (pick_node's search center — it
 picks the nearest hand-eye cup to it); on failure it carries result="fail" with a
-reason and no slot. It never publishes /action_result — that
-GSP completion signal is pick_node's job, because the cup is only actually placed
-at pick_node's pyramid call, not at our move.
+reason and no slot. On the SUCCESS path pick_node owns the /action_result
+completion signal (the cup is actually placed at pick_node's pyramid call, not at
+our move). This node DOES emit /action_result in the two cases pick_node cannot:
+fallen_recovery (handled here directly) and a coarse-move-stage FAILURE (no
+graspable cup → pick_node never runs, so we report the fail ourselves to unfreeze
+GSP and let it recover/replan).
 
 LLM plan steps are still the combined `pyramid` action:
     {"step": 1, "action": "pyramid", "color": "red", "target_slot": "L1_left"}
@@ -607,17 +610,40 @@ class PlanExecutorNode(Node):
         except Exception as exc:  # noqa: BLE001
             outcome = _MoveOutcome('fail', f'executor exception: {exc}')
 
-        # Single output channel: /move_result carries success (with slot, handed
-        # off to pick_node) or failure. We never talk to GSP — pick_node owns the
-        # /action_result completion signal. Advance only on a successful move so
-        # the next LLM `continue` (which only arrives after pick_node finishes
-        # this cup) fires the next move.
+        # /move_result carries success (with slot, handed off to pick_node) or
+        # failure. On SUCCESS pick_node owns the /action_result completion signal.
+        # On FAILURE at this coarse-move stage (e.g. no graspable cup), pick_node
+        # never runs and never emits /action_result — so GSP would stay frozen on
+        # the dispatched action until its safety timeout. We therefore emit the
+        # failure on /action_result ourselves so GSP unfreezes and routes to
+        # recovery/replan. Advance only on a successful move.
         self._publish_move_result(step, outcome)
+        if outcome.result != 'success' and action == 'pyramid':
+            self._publish_action_fail(step, outcome)
         with self._state_lock:
             if outcome.result == 'success':
                 self._reserve_source_track(outcome.source_tid)
                 self._step_idx += 1
             self._busy = False
+
+    def _publish_action_fail(self, step: dict, outcome: _MoveOutcome) -> None:
+        """Report a coarse-move-stage pyramid failure on /action_result so GSP
+        (which only hears pick_node's /action_result on the success path)
+        unfreezes and can recover/replan instead of waiting out the freeze."""
+        out = {
+            'step': step.get('step'),
+            'action': 'pyramid',
+            'color': step.get('color'),
+            'target_slot': step.get('target_slot'),
+            'result': 'fail',
+            'failure_reason': outcome.reason,
+        }
+        try:
+            self._action_pub.publish(String(data=json.dumps(out)))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f'/action_result publish failed: {exc}')
+            return
+        self.get_logger().info(f'/action_result fail (move stage): {out}')
 
     # ── pyramid step: resolve color→cup, move arm above it ───────────────────
 

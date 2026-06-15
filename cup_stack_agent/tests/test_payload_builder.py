@@ -176,6 +176,29 @@ class GoalStateBuilderTest(unittest.TestCase):
 
         self.assertTrue(action_result_reflected(result, before, disturbed))
 
+    def test_action_result_reflects_despite_premature_before_and_phantom_cups(self):
+        # Regression: a flickered verifier can show the target slot already
+        # filled in `before`, and stacked cups can leak into cups_on_table as a
+        # phantom overcount. A success whose slot is correctly filled in
+        # `current` must STILL reflect (this combination used to deadlock the
+        # loop at the old before==color / current<=before guards).
+        result = {
+            'step': 5,
+            'action': 'pyramid',
+            'result': 'success',
+            'color': 'blue',
+            'target_slot': 'L2_right',
+        }
+        before = {
+            'cups_on_table': {'blue': 1},
+            'stack': {'L2_right': {'color': 'blue'}},  # premature/flickered
+        }
+        current = {
+            'cups_on_table': {'blue': 5},              # phantom overcount
+            'stack': {'L2_right': {'color': 'blue'}},
+        }
+        self.assertTrue(action_result_reflected(result, before, current))
+
     def test_previous_world_state_is_last_published_snapshot(self):
         builder = GoalStateBuilder()
         builder.set_world({'blue': 6}, {'L1_left': None})

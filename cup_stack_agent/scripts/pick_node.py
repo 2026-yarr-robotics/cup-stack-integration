@@ -118,7 +118,13 @@ class PickNode(Node):
         self.declare_parameter("box_wait_sec", 1.5)   # 마커 수집 최대 대기
         self.declare_parameter("post_move_box_ignore_sec", 0.3)  # 이동 직후 큐/잔상 버림
         self.declare_parameter("box_settle_sec", 0.5)  # 첫 마커 이후 안정화 대기
-        self.declare_parameter("max_pick_distance_m", 0.20)  # coarse target 과 허용 거리
+        # coarse target(= plan_executor가 고른 그 컵의 XY)과 hand-eye 후보의
+        # 허용 거리. 너무 크면(구 0.20) 의도한 컵이 hand-eye에 안 보일 때 가장
+        # 가까운 '다른' 컵 — 피라미드에 이미 놓인 컵까지 — 을 집어 빌드를
+        # 망친다(L2_right가 L1_right 컵 강탈). 실측 정상 pick은 ≤0.022m,
+        # cannibalize한 오선택은 0.064m 였으므로 0.05m면 분리된다: 멀면 거부
+        # → select_failed(안전) → recover/replan 으로 흐른다.
+        self.declare_parameter("max_pick_distance_m", 0.05)
         self.declare_parameter("box_top_ns", "box_top")
         self.declare_parameter("box_labels_ns", "box_labels")
         self.declare_parameter("filter_by_color", False)  # 색은 근거리 tie-break 에만 사용
