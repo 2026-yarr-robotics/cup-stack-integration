@@ -25,7 +25,14 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from std_msgs.msg import String
+
+# Default cold-start command. Also the fallback when the `user_command`
+# parameter override is empty/null (e.g. start.sh's `-p user_command:=` with an
+# empty USER_COMMAND leaves the param NOT_SET), so the relay never crashes on an
+# uninitialized read and a missing command still kicks off the default build.
+DEFAULT_COMMAND = '3단 피라미드 쌓아줘'
 
 
 def _cup_count(payload: str) -> int:
@@ -49,7 +56,7 @@ class AggregatorNode(Node):
         self.declare_parameter('cups_out_topic', '/cups_on_table')
         self.declare_parameter('stack_out_topic', '/stack')
         self.declare_parameter('user_command_topic', '/user_command')
-        self.declare_parameter('user_command', '3단 피라미드 쌓아줘')
+        self.declare_parameter('user_command', DEFAULT_COMMAND)
         # Minimum floor before the command may fire.
         self.declare_parameter('initial_command_delay_s', 2.0)
         # Gate the command on vision readiness (see module docstring).
@@ -155,7 +162,18 @@ class AggregatorNode(Node):
             if now - self._cups_seen_at < float(
                     self.get_parameter('command_settle_s').value):
                 return
-        command = str(self.get_parameter('user_command').value)
+        # Defensive read: an empty/null override (`-p user_command:=` with an
+        # empty USER_COMMAND) leaves the param NOT_SET, and get_parameter()
+        # raises ParameterUninitializedException — which crashed this node and
+        # silently killed the world relay. Fall back to DEFAULT_COMMAND so the
+        # relay never dies and a missing command still triggers the build.
+        param = self.get_parameter_or(
+            'user_command',
+            Parameter('user_command', Parameter.Type.STRING, DEFAULT_COMMAND))
+        # NOT_SET (get_parameter_or fallback), None, '' or whitespace-only
+        # (`USER_COMMAND=' '`) all fall back to the default build command.
+        command = (str(param.value).strip() if param.value is not None
+                   else '') or DEFAULT_COMMAND
         self._command_pub.publish(String(data=command))
         self._command_published = True
         self.get_logger().info(f'/user_command published: {command!r}')
