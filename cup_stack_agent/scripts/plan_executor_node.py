@@ -48,8 +48,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
-import signal
 import threading
 import time
 import urllib.error
@@ -715,19 +713,18 @@ class PlanExecutorNode(Node):
                 f'/llm_output unknown shape: {list(data.keys())}')
 
     def _shutdown_agent(self, reason: str) -> None:
-        """On `done`, start a cancellable GRACE window, then terminate the stack.
+        """On `done`, start a cancellable GRACE window before the loop goes idle.
 
-        Without a shutdown a ``done`` loop left every rclpy node spinning forever
-        (the host bringup agent reported it ``running`` indefinitely). But #7
-        wants the loop to still react to an idle disturbance after done, so we do
-        not kill immediately: we wait ``done_grace_s``. If a non-done decision
-        arrives in the window (a disturbance re-engaged the loop), _cancel_grace
-        aborts the shutdown. If the window passes quietly, _finalize_shutdown
-        emits the success sentinel and signals the group.
+        #7 wants the loop to still react to an idle disturbance after done, so we
+        wait ``done_grace_s`` before settling. If a non-done decision arrives in
+        the window (a disturbance re-engaged the loop), _cancel_grace aborts it;
+        if the window passes quietly, _finalize_shutdown clears the latch and the
+        agent stays idle.
 
-        start.sh is the process-group leader and every node + tee shares its
-        pgid, so one group SIGINT takes the whole stack down: the rclpy nodes
-        shut down gracefully and start.sh's cleanup() trap reaps stragglers.
+        The agent runs **always-on** (start.sh keeps every node spinning), so
+        ``done`` no longer terminates the process group — it just settles to
+        idle, ready for the next command. (Reverts 0e5dac8's on-done SIGINT,
+        which existed only for the now-reverted host-delegated on-demand launch.)
         """
         if self._shutting_down:
             return  # grace already pending; a repeated done must not restart it
@@ -751,21 +748,13 @@ class PlanExecutorNode(Node):
         self.get_logger().info(f'done-grace cancelled — loop re-engaged ({reason})')
 
     def _finalize_shutdown(self) -> None:
-        """Grace elapsed with no disturbance: emit the success sentinel (so the
-        signal-driven non-zero exit maps to ``idle``, not ``failed``, in
-        bringup_agent._decide_task_status), then signal the group a beat later so
-        the sentinel + final logs flush through the tee pipeline first."""
-        self.get_logger().info(
-            'plan complete — TASK_RESULT=SUCCESS; shutting down agent')
-        threading.Timer(1.0, self._terminate_process_group).start()
-
-    def _terminate_process_group(self) -> None:
-        try:
-            os.killpg(os.getpgid(0), signal.SIGINT)
-        except (ProcessLookupError, PermissionError) as exc:
-            self.get_logger().warn(
-                f'group shutdown signal failed ({exc}); exiting self')
-            os._exit(0)
+        """Grace elapsed with no disturbance: the build is complete. The agent
+        runs **always-on** (start.sh keeps every node spinning and consumes the
+        next ``/user_command``), so we do NOT terminate the process group —
+        clear the latch and stay idle, ready for the next command/disturbance."""
+        self._shutting_down = False
+        self._grace_timer = None
+        self.get_logger().info('plan complete — agent idle (always-on)')
 
     def _adopt_plan(self, steps: list[dict], reason: str) -> None:
         raw_steps = list(steps) if isinstance(steps, list) else []
