@@ -443,12 +443,11 @@ class PlanExecutorNode(Node):
         self.declare_parameter('unstack_dest_xy', [0.30, -0.15])
         self.declare_parameter('unstack_dest_spacing', 0.08)
         self.declare_parameter('unstack_dest_slots', 6)
-        # On `done`, keep the agent alive this long before shutting down so an
-        # idle disturbance (a built slot's cup removed) can re-engage the loop
-        # (#7). A non-done decision arriving in the window cancels the shutdown;
-        # if the window passes quietly, the success sentinel is emitted and the
-        # stack terminates.
-        self.declare_parameter('done_grace_s', 10.0)
+        # On `done`, shut down after this grace window (a non-done decision in
+        # the window cancels it). DEFERRED to 0 = immediate shutdown — the grace
+        # only mattered with #7 idle-disturbance watch (now off). Restore >0
+        # when the stop-based disturbance reaction lands.
+        self.declare_parameter('done_grace_s', 0.0)
         # A planned step is skipped as "already filled" ONLY if its slot has
         # been occupied in /stack continuously for this long — a transient
         # verifier phantom (a cup carried over a slot's region during a pick)

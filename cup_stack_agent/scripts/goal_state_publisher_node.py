@@ -51,12 +51,13 @@ class GoalStatePublisher(Node):
         self.declare_parameter('action_result_topic', '/action_result')
         self.declare_parameter('llm_output_topic', '/llm_output')
         self.declare_parameter('llm_input_topic', '/llm_input')
-        # Re-emit the payload when the world MEANINGFULLY changes while idle, so
-        # a disturbance (a built slot's cup removed/swapped) reaches the decider
-        # — including the post-done grace window. Delta-gated (see
-        # _should_republish_on_change) so it fires once per real change, not
-        # every perception frame.
-        self.declare_parameter('publish_on_world_change', True)
+        # DEFERRED (#7): re-emit on idle world change for disturbance reaction.
+        # Turned OFF — the always-on polling published an llm_input per verifier
+        # flicker, creating a decision backlog that broke step atomicity. The
+        # disturbance reaction will be redone via the stop mechanism (#8) later;
+        # the machinery (_should_republish_on_change/world_changed) stays inert
+        # for that. Set true only to experiment.
+        self.declare_parameter('publish_on_world_change', False)
         self.declare_parameter('strict_json', True)
         # Freeze the perception world-state while a pyramid action is in
         # flight (arm in view -> counts fluctuate). Resume on /action_result.
@@ -387,13 +388,9 @@ class GoalStatePublisher(Node):
         elif decision == 'replan' and obj.get('plan') is not None:
             self._builder.set_plan(obj.get('plan'))
         elif decision == 'done':
-            # KEEP the plan/target (do NOT clear) so the post-done grace window
-            # can still measure a disturbance against the completed target — a
-            # built slot's cup removed -> world_changed -> in_flight re-publish ->
-            # the decider replans/unstacks to fix it. A new user_command clears
-            # it (set_user_command); plan_executor's grace timer ends the run if
-            # nothing disturbs it.
-            pass
+            # done = task complete: clear the plan (idle). (#7 post-done
+            # disturbance watch is deferred to the stop-based approach.)
+            self._builder.set_plan(None)
         # decision == 'continue' (or other): keep the existing plan.
 
         # Freeze ONLY when a step will actually execute. current_goal() is
