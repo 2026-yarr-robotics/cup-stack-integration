@@ -4,10 +4,6 @@
 [submodule "ros2-cup-stack"]
 	path = ros2-cup-stack
 	url = https://github.com/2026-yarr-robotics/ros2-cup-stack.git
-[submodule "fallen-cup-recovery"]
-	path = fallen-cup-recovery
-	url = https://github.com/2026-yarr-robotics/fallen-cup-recovery.git
-	branch = released
 [submodule "frontend"]
 	path = frontend
 	url = https://github.com/2026-yarr-robotics/frontend.git
@@ -20,3 +16,7 @@
 [submodule "ros2-skill-manager"]
 	path = ros2-skill-manager
 	url = https://github.com/2026-yarr-robotics/ros2-skill-manager.git
+[submodule "outlier-cup-recovery"]
+	path = outlier-cup-recovery
+	url = https://github.com/2026-yarr-robotics/outlier-cup-recovery.git
+	branch = main

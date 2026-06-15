@@ -273,6 +273,12 @@ class UprightCupPoseNode(Node):
 
         self.declare_parameter("target_class_name", "upright-cup")
         self.declare_parameter("min_mask_area", 300.0)
+        # top-rim masks often put the pick center on the cup opening, where the
+        # center depth can be empty or table/background. For those detections,
+        # prefer a robust depth sampled from valid pixels inside the mask.
+        self.declare_parameter("depth_mask_fallback", True)
+        self.declare_parameter("depth_mask_radius_px", 45.0)
+        self.declare_parameter("depth_mask_percentile", 50.0)
 
         # ── fallen-cup count (같은 추론, 별도 채널) ──────────
         # 같은 YOLO 프레임에서 fallen-cup 클래스 검출 개수만 세서
@@ -363,6 +369,12 @@ class UprightCupPoseNode(Node):
 
         self.target_class_name = str(self.get_parameter("target_class_name").value)
         self.min_mask_area = float(self.get_parameter("min_mask_area").value)
+        self.depth_mask_fallback = as_bool(
+            self.get_parameter("depth_mask_fallback").value)
+        self.depth_mask_radius_px = float(
+            self.get_parameter("depth_mask_radius_px").value)
+        self.depth_mask_percentile = float(
+            self.get_parameter("depth_mask_percentile").value)
         self.fallen_class_name = str(
             self.get_parameter("fallen_class_name").value)
         self.fallen_count_topic = str(
@@ -535,6 +547,47 @@ class UprightCupPoseNode(Node):
         if valid.size == 0:
             return None
         return float(np.median(valid))
+
+    def _depth_from_detection_mask(self, det, u, v):
+        if self.last_depth_m is None:
+            return None
+        mask = det.get("mask")
+        if mask is None:
+            return None
+        depth = self.last_depth_m
+        if mask.shape[:2] != depth.shape[:2]:
+            return None
+        valid_mask = mask > 0
+        if self.depth_mask_radius_px > 0:
+            ys, xs = np.nonzero(valid_mask)
+            if xs.size:
+                d2 = (xs.astype(float) - float(u)) ** 2 + (ys.astype(float) - float(v)) ** 2
+                local = d2 <= self.depth_mask_radius_px ** 2
+                if np.any(local):
+                    local_mask = np.zeros_like(valid_mask, dtype=bool)
+                    local_mask[ys[local], xs[local]] = True
+                    valid_mask = local_mask
+        vals = depth[valid_mask]
+        vals = vals[np.isfinite(vals)]
+        vals = vals[vals > 0.05]
+        if vals.size == 0:
+            return None
+        pct = min(100.0, max(0.0, self.depth_mask_percentile))
+        return float(np.percentile(vals, pct))
+
+    def get_depth_for_detection(self, det, u, v, window=7):
+        # For top-rim, the center pixel can lie inside the cup opening. Sample
+        # the detected rim mask first, then fall back to the old center window.
+        if self.depth_mask_fallback and det.get("cls_name") == "top-rim":
+            z = self._depth_from_detection_mask(det, u, v)
+            if z is not None:
+                return z
+        z = self.get_depth_at_pixel(u, v, window=window)
+        if z is not None:
+            return z
+        if self.depth_mask_fallback:
+            return self._depth_from_detection_mask(det, u, v)
+        return None
 
     def deproject_pixel_to_3d(self, u, v, z):
         if None in (self.fx, self.fy, self.cx, self.cy):
@@ -915,7 +968,7 @@ class UprightCupPoseNode(Node):
         cups = []  # [{"xy_base":(x,y), "z_base":z, "color":str, "center":(u,v)}]
         for det in targets:
             u, v = det["center"]
-            z = self.get_depth_at_pixel(u, v, window=7)
+            z = self.get_depth_for_detection(det, u, v, window=7)
             if z is None:
                 continue
             p_cam = self.deproject_pixel_to_3d(u, v, z)
@@ -1008,7 +1061,7 @@ class UprightCupPoseNode(Node):
             label.pose.position.y = y
             label.pose.position.z = z
             label.pose.orientation.w = 1.0
-            label.text = f"#{mid}_c={color}_upright-cup"
+            label.text = f"#{mid}_c={color}_{self.target_class_name}"
             markers.markers.append(label)
 
         self.boxes_pub.publish(markers)

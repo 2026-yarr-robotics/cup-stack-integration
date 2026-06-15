@@ -53,8 +53,8 @@ STABILIZE_MERGE_DISTANCE_M="${STABILIZE_MERGE_DISTANCE_M:-0.055}"
 #   real = upright_cup_pose_node (real hand camera YOLO-seg -> base_link /tf)
 #   fake = fake_hand_eye_node (GT). Revert with: HAND_EYE_MODE=fake ./start.sh
 HAND_EYE_MODE="${HAND_EYE_MODE:-real}"
-HAND_EYE_WEIGHTS="${HAND_EYE_WEIGHTS:-/home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt}"
-HAND_EYE_CALIB="${HAND_EYE_CALIB:-/home/ssu/cup-stack-integration/fallen-cup-recovery/dsr_practice/config/T_gripper2camera.npy}"
+HAND_EYE_WEIGHTS="${HAND_EYE_WEIGHTS:-/home/ssu/Downloads/hand_eye_yolo26s_seg_top-rim.pt}"
+HAND_EYE_CALIB="${HAND_EYE_CALIB:-/home/ssu/cup-stack-integration/outlier-cup-recovery/dsr_practice/config/T_gripper2camera.npy}"
 HAND_EYE_DEVICE="${HAND_EYE_DEVICE:-cuda}"
 # pick point 선택 방식. centroid = 검증된 기본 (마스크 무게중심 — 솔리드
 # 영역이라 depth 가 항상 유효). top_ellipse(hand_pick 최신)는 pick 픽셀이
@@ -342,7 +342,7 @@ if [[ "${HAND_EYE_MODE}" == "real" ]]; then
     -p imgsz:=1280 \
     -p conf:=0.35 \
     -p base_frame:=base_link \
-    -p target_class_name:=upright-cup \
+    -p target_class_name:=top-rim \
     -p pick_point_method:="${HAND_EYE_PICK_METHOD}" \
     -p enable_temporal_smoothing:="${HAND_EYE_SMOOTHING}"
 else

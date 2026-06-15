@@ -11,8 +11,8 @@ export ROS_LOCALHOST_ONLY=0
 source /opt/ros/humble/setup.bash
 source /home/ssu/cup-stack-integration/ros2-depth-point-cloude/install/setup.bash
 
-YOLO=/home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt
-CALIB=/home/ssu/cup-stack-integration/fallen-cup-recovery/dsr_practice/config/T_gripper2camera.npy
+YOLO=/home/ssu/Downloads/hand_eye_yolo26s_seg_top-rim.pt
+CALIB=/home/ssu/cup-stack-integration/outlier-cup-recovery/dsr_practice/config/T_gripper2camera.npy
 
 cd /home/ssu/cup-stack-integration/cup_stack_agent
 exec python3 scripts/upright_cup_pose_node.py --ros-args \
@@ -26,4 +26,5 @@ exec python3 scripts/upright_cup_pose_node.py --ros-args \
   -p imgsz:=1280 \
   -p conf:=0.35 \
   -p base_frame:=base_link \
-  -p target_class_name:=upright-cup
+  -p target_class_name:=top-rim \
+  -p pick_point_method:=centroid
