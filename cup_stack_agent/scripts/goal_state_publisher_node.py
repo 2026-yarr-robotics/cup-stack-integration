@@ -36,6 +36,7 @@ from std_msgs.msg import String
 
 from payload_builder import (
     GoalStateBuilder, action_result_reflected, normalize_fallen_count,
+    world_changed,
 )
 
 
@@ -50,10 +51,12 @@ class GoalStatePublisher(Node):
         self.declare_parameter('action_result_topic', '/action_result')
         self.declare_parameter('llm_output_topic', '/llm_output')
         self.declare_parameter('llm_input_topic', '/llm_input')
-        # Re-emit the payload whenever /system_state changes, so a disturbance
-        # detected by perception while idle reaches the decider. Off by default
-        # until expected-state simulation lands with the executor integration.
-        self.declare_parameter('publish_on_world_change', False)
+        # Re-emit the payload when the world MEANINGFULLY changes while idle, so
+        # a disturbance (a built slot's cup removed/swapped) reaches the decider
+        # — including the post-done grace window. Delta-gated (see
+        # _should_republish_on_change) so it fires once per real change, not
+        # every perception frame.
+        self.declare_parameter('publish_on_world_change', True)
         self.declare_parameter('strict_json', True)
         # Freeze the perception world-state while a pyramid action is in
         # flight (arm in view -> counts fluctuate). Resume on /action_result.
@@ -224,8 +227,8 @@ class GoalStatePublisher(Node):
         self._cups_seen_ns = self.get_clock().now().nanoseconds
         if self._maybe_publish_pending_action():
             return
-        if self._on_world_change:
-            self._publish()  # in-flight: perception-detected change while idle
+        if self._should_republish_on_change():
+            self._publish()  # idle disturbance: real world change while no action
 
     def _on_stack(self, msg: String) -> None:
         obj = self._parse(msg.data, '/stack')
@@ -237,8 +240,8 @@ class GoalStatePublisher(Node):
         self._builder.set_world(None, obj)
         if self._maybe_publish_pending_action():
             return
-        if self._on_world_change:
-            self._publish()  # in-flight: perception-detected change while idle
+        if self._should_republish_on_change():
+            self._publish()  # idle disturbance: real world change while no action
 
     def _on_robot_state(self, msg: String) -> None:
         obj = self._parse(msg.data, '/robot_state')
@@ -299,6 +302,32 @@ class GoalStatePublisher(Node):
                 f"recovery {obj.get('result')} — waiting for a fresh "
                 'hand-eye fallen sample')
             return
+        if obj.get('action') == 'unstack':
+            # Interrupt: plan NOT advanced. Hold the next decision until the
+            # removal reflects (the slot reads null), then the LLM replans to
+            # refill it with the correct color. Reuse the pyramid pending-action
+            # reflection path (action_result_reflected handles the unstack case
+            # = slot now empty). A failed unstack publishes immediately so the
+            # LLM can re-decide from the current world.
+            self._schedule_unfreeze('post-unstack home settle')
+            before = (self._builder.previous_world_state()
+                      or self._builder.current_world_state())
+            self._builder.on_action_result(obj)  # plan NOT advanced (interrupt)
+            if obj.get('result') == 'success':
+                # Progress was made — any pending pyramid-pick-fail recovery
+                # assumption is now stale; clear it so it can't leak fallen
+                # exposure into a later decision.
+                self._recover_after_pick_fail = False
+                self._pending_pick_fail = None
+                self._pending_action_result = obj
+                self._pending_action_at_ns = self.get_clock().now().nanoseconds
+                self._pending_action_before_world = before
+                if not self._maybe_publish_pending_action():
+                    self.get_logger().info(
+                        f'/action_result pending world update: {obj}')
+                return
+            self._publish()  # failed unstack — let the LLM re-decide
+            return
         self._schedule_unfreeze('post-place home settle')
         before = (self._builder.previous_world_state()
                   or self._builder.current_world_state())
@@ -313,20 +342,26 @@ class GoalStatePublisher(Node):
                 self.get_logger().info(
                     f'/action_result pending world update: {obj}')
             return
-        # A failed pyramid pick (no graspable upright cup at the exo target):
-        # likely a fallen cup the exo mis-counted as upright. DEFER the next
-        # decision until a FRESH hand-eye fallen sample lands AFTER unfreeze —
-        # publishing now (still frozen -> stale sample) gates fallen to 0 and the
-        # loop would retry the un-pickable cup forever. _on_fallen_cups releases
-        # it on a fresh sample; _freeze_tick times it out.
+        # A pyramid pick that failed with error='no_graspable_cup' (hand-eye saw
+        # cups but none graspable at the exo target) is likely a fallen cup the
+        # exo mis-counted as upright. ONLY this case opens recover-after-pick-fail
+        # (expose the hand-eye fallen count despite exo cups>0) and DEFERS until a
+        # FRESH hand-eye fallen sample lands. A 'hand_eye_no_markers' fail (the
+        # hand-eye vision is down/not ready) is a SYSTEM fault, NOT a fallen cup —
+        # do not route to recovery; just re-publish so the LLM retries/replans
+        # from the real world (exo still shows the cups).
         if obj.get('action') == 'pyramid' and obj.get('result') == 'fail':
-            self._recover_after_pick_fail = True
-            self._pending_pick_fail = {
-                'at_ns': self.get_clock().now().nanoseconds}
-            self.get_logger().info(
-                'pyramid pick failed -> awaiting fresh fallen sample before '
-                'deciding (recover vs retry)')
-            return
+            if obj.get('error') == 'no_graspable_cup':
+                self._recover_after_pick_fail = True
+                self._pending_pick_fail = {
+                    'at_ns': self.get_clock().now().nanoseconds}
+                self.get_logger().info(
+                    'pyramid pick not graspable -> awaiting fresh fallen sample '
+                    'before deciding (recover vs retry)')
+                return
+            self.get_logger().warn(
+                f"pyramid pick failed ({obj.get('error')}) — not a fallen "
+                'signal; re-deciding from current world')
         self._publish()  # other failures do not require a world-state delta
 
     def _on_llm_output(self, msg: String) -> None:
@@ -341,12 +376,24 @@ class GoalStatePublisher(Node):
             # exactly like a pyramid action (released by its /action_result).
             self._freeze_world('fallen recovery dispatched')
             return
+        if decision == 'unstack':
+            # Interrupt like fallen_recovery: current_plan/current_goal stay
+            # untouched. The unstack arm motion crosses the exo view, so freeze
+            # the world (released by its /action_result).
+            self._freeze_world('unstack dispatched')
+            return
         if obj.get('status') == 'ok':
             self._builder.set_plan(obj)
         elif decision == 'replan' and obj.get('plan') is not None:
             self._builder.set_plan(obj.get('plan'))
         elif decision == 'done':
-            self._builder.set_plan(None)
+            # KEEP the plan/target (do NOT clear) so the post-done grace window
+            # can still measure a disturbance against the completed target — a
+            # built slot's cup removed -> world_changed -> in_flight re-publish ->
+            # the decider replans/unstacks to fix it. A new user_command clears
+            # it (set_user_command); plan_executor's grace timer ends the run if
+            # nothing disturbs it.
+            pass
         # decision == 'continue' (or other): keep the existing plan.
 
         # Freeze ONLY when a step will actually execute. current_goal() is
@@ -420,6 +467,20 @@ class GoalStatePublisher(Node):
     def _world_frozen(self) -> bool:
         # Pure gate (no side effects); release timing is the timer's job.
         return self._freeze_enabled and self._action_in_flight
+
+    def _should_republish_on_change(self) -> bool:
+        """Idle disturbance gate: re-publish only when (a) the feature is on,
+        (b) a task is active — a plan/target exists (in_flight), covering both
+        between-steps idle AND the post-done grace window where the target is
+        retained, and (c) the world actually changed since the last publish (so
+        we fire once per real disturbance, not every perception frame)."""
+        if not self._on_world_change:
+            return False
+        if self._builder.mode() != 'in_flight':
+            return False  # no active task -> nothing to measure a disturbance against
+        return world_changed(
+            self._builder.previous_world_state(),
+            self._builder.current_world_state())
 
     def _maybe_publish_pending_recovery(self, timed_out: bool = False) -> bool:
         """Publish the post-recovery /llm_input once a hand-eye fallen sample

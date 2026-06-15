@@ -140,20 +140,37 @@ def stack_slot_color(world_state: dict | None, slot: str | None) -> str | None:
     return None
 
 
+def world_changed(prev: dict | None, current: dict | None) -> bool:
+    """Whether the buildable world differs between two WorldState snapshots.
+
+    Compares only the meaningful fields — the slot ``stack`` and
+    ``cups_on_table`` — ignoring the derived ``filled_slots`` count. Used by the
+    idle disturbance trigger to re-publish ONLY on a real change (a built slot
+    lost/changed its cup, or table cups changed), never every perception frame.
+    """
+    if prev is None or current is None:
+        return prev is not current
+    return (prev.get('stack') != current.get('stack')
+            or prev.get('cups_on_table') != current.get('cups_on_table'))
+
+
 def action_result_reflected(
     result: dict | None,
     before: dict | None,
     current: dict | None,
 ) -> bool:
-    """Whether world state reflects a successful atomic pyramid action.
+    """Whether world state reflects a successful atomic action.
 
-    The authoritative, build-relevant signal is the target slot being observed
-    holding the right color. We deliberately do NOT gate on ``before`` or on the
-    cups_on_table count:
+    For a ``pyramid`` place, the authoritative, build-relevant signal is the
+    target slot being observed holding the right color. For an ``unstack``
+    removal it is the mirror image: the slot is now observed EMPTY. In both
+    cases we deliberately gate ONLY on the slot state, NOT on ``before`` or on
+    the cups_on_table count:
       * a flickered/premature ``before`` that already showed the slot filled
         used to deadlock the loop here (before==color -> never reflects);
       * stacked cups can transiently leak into cups_on_table when the verifier
-        drops /stack_track_ids, making the table count spuriously high.
+        drops /stack_track_ids, making the table count spuriously high (so an
+        unstack's "table[color] +1" would be just as flickery — we skip it).
     Disturbance detection still happens downstream: the LLM compares the
     previous and current world state in the payload it then receives.
     (``before`` is kept in the signature for call-site/test compatibility.)
@@ -162,7 +179,14 @@ def action_result_reflected(
         return False
     if result.get('result') != 'success':
         return True
-    if result.get('action') != 'pyramid':
+    action = result.get('action')
+    if action == 'unstack':
+        # Reverse reflection: the removed slot must read empty now.
+        slot = result.get('target_slot')
+        if not isinstance(slot, str) or not current:
+            return False
+        return stack_slot_color(current, slot) is None
+    if action != 'pyramid':
         return True
     color = result.get('color')
     target_slot = result.get('target_slot')
@@ -264,11 +288,12 @@ class GoalStateBuilder:
         self._last_action_result = result
         if not result:
             return
-        if result.get('action') == 'fallen_recovery':
-            # Recovery is an INTERRUPT, not a plan step: remaining_steps,
-            # current_goal, and held color all stay untouched (its step is
-            # null so the step-match below would skip anyway — this guard
-            # makes the contract explicit).
+        if result.get('action') in ('fallen_recovery', 'unstack'):
+            # Recovery and unstack are INTERRUPTS, not plan steps:
+            # remaining_steps, current_goal, and held color all stay untouched
+            # (their step is null so the step-match below would skip anyway —
+            # this guard makes the contract explicit). An unstack frees a slot;
+            # the loop replans to refill it with the correct color afterward.
             return
         # Track held color from successful picks/places (color the gripper
         # can't sense). A successful pick holds that color; a place empties it.

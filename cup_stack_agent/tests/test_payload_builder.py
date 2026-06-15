@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from payload_builder import (  # noqa: E402
     GoalStateBuilder,
     action_result_reflected,
+    world_changed,
 )
 
 
@@ -261,6 +262,66 @@ class GoalStateBuilderTest(unittest.TestCase):
         self.assertEqual(payload['current_goal']['step'], 1)
         self.assertEqual(
             payload['last_action_result']['action'], 'fallen_recovery')
+
+
+class UnstackReflectionTest(unittest.TestCase):
+    """Phase 3: unstack reflects when the removed slot reads null; the
+    interrupt never advances the plan."""
+
+    def _result(self, slot='L3_top', color='blue'):
+        return {'step': None, 'action': 'unstack', 'target_slot': slot,
+                'color': color, 'result': 'success', 'failure_reason': None}
+
+    def test_reflected_when_slot_empty(self):
+        current = {'stack': {'L3_top': None}}
+        self.assertTrue(action_result_reflected(self._result(), None, current))
+
+    def test_not_reflected_while_slot_still_filled(self):
+        current = {'stack': {'L3_top': {'color': 'blue'}}}
+        self.assertFalse(action_result_reflected(self._result(), None, current))
+
+    def test_does_not_advance_plan(self):
+        builder = GoalStateBuilder()
+        builder.set_plan({'status': 'ok', 'plan': {'steps': [
+            {'step': 1, 'action': 'pyramid', 'color': 'red',
+             'target_slot': 'L1_left'}]}})
+        builder.on_action_result(self._result())
+        self.assertEqual(
+            len(builder._current_plan['remaining_steps']), 1)
+
+
+class WorldChangedTest(unittest.TestCase):
+    """#7 idle-disturbance delta gate: fire only on a real stack/cups change."""
+
+    def _w(self, stack, cups=None):
+        return {'stack': stack, 'cups_on_table': cups or {},
+                'filled_slots': sum(1 for v in stack.values() if v),
+                'total_slots': 6}
+
+    def test_identical_is_no_change(self):
+        w = self._w({'L1_left': {'color': 'red'}}, {'blue': 1})
+        self.assertFalse(world_changed(w, dict(w)))
+
+    def test_stack_slot_removed_is_change(self):
+        before = self._w({'L1_left': {'color': 'red'}})
+        after = self._w({'L1_left': None})
+        self.assertTrue(world_changed(before, after))
+
+    def test_stack_color_swapped_is_change(self):
+        before = self._w({'L1_left': {'color': 'red'}})
+        after = self._w({'L1_left': {'color': 'blue'}})
+        self.assertTrue(world_changed(before, after))
+
+    def test_cups_change_is_change(self):
+        before = self._w({'L1_left': {'color': 'red'}}, {'blue': 1})
+        after = self._w({'L1_left': {'color': 'red'}}, {'blue': 2})
+        self.assertTrue(world_changed(before, after))
+
+    def test_none_prev_is_change(self):
+        self.assertTrue(world_changed(None, self._w({'L1_left': None})))
+
+    def test_both_none_is_no_change(self):
+        self.assertFalse(world_changed(None, None))
 
 
 if __name__ == '__main__':
