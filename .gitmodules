@@ -1,21 +1,27 @@
 [submodule "server"]
 	path = server
 	url = https://github.com/2026-yarr-robotics/server.git
+	branch = main
 [submodule "ros2-cup-stack"]
 	path = ros2-cup-stack
 	url = https://github.com/2026-yarr-robotics/ros2-cup-stack.git
+	branch = main
 [submodule "frontend"]
 	path = frontend
 	url = https://github.com/2026-yarr-robotics/frontend.git
+	branch = main
 [submodule "ros2-depth-point-cloude"]
 	path = ros2-depth-point-cloude
 	url = https://github.com/2026-yarr-robotics/ros2-depth-point-cloude.git
+	branch = main
 [submodule "vision-node"]
 	path = vision-node
 	url = https://github.com/2026-yarr-robotics/vision-node.git
+	branch = main
 [submodule "ros2-skill-manager"]
 	path = ros2-skill-manager
 	url = https://github.com/2026-yarr-robotics/ros2-skill-manager.git
+	branch = main
 [submodule "outlier-cup-recovery"]
 	path = outlier-cup-recovery
 	url = https://github.com/2026-yarr-robotics/outlier-cup-recovery.git
