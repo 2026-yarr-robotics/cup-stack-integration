@@ -68,6 +68,11 @@ class DigitalTwinStabilizerNode(Node):
         self.declare_parameter('window_s', 1.0)
         # Hard timeout: only after this much silence do we DELETE a track.
         self.declare_parameter('track_timeout_s', 30.0)
+        # A track not measured by upstream within this window is still PUBLISHED
+        # (coasted from memory for pick stability / RViz) but its label is tagged
+        # '_coast' so a consumer can tell it is a stale ghost, not a freshly seen
+        # graspable cup (plan_executor skips coasting tracks in coarse pick — F2).
+        self.declare_parameter('fresh_ttl_s', 1.5)
         self.declare_parameter('publish_period_s', 0.1)
         self.declare_parameter('smooth_alpha', 0.25)
         self.declare_parameter('momentum_beta', 0.7)
@@ -80,6 +85,7 @@ class DigitalTwinStabilizerNode(Node):
         self._method = str(self.get_parameter('method').value)
         self._track_timeout_s = float(
             self.get_parameter('track_timeout_s').value)
+        self._fresh_ttl_s = float(self.get_parameter('fresh_ttl_s').value)
         self._alpha = float(self.get_parameter('smooth_alpha').value)
         self._beta = float(self.get_parameter('momentum_beta').value)
         self._max_step_m = float(self.get_parameter('max_step_m').value)
@@ -220,9 +226,11 @@ class DigitalTwinStabilizerNode(Node):
             if label is None:
                 continue
             x, y, z = self._smoothed[tid]
+            fresh = (now - last_seen) <= self._fresh_ttl_s
             live.add(tid)
             markers.markers.append(self._top_marker(tid, x, y, z))
-            markers.markers.append(self._label_marker(tid, x, y, z, label))
+            markers.markers.append(
+                self._label_marker(tid, x, y, z, label, fresh))
 
         for tid in self._published_ids - live:
             markers.markers.append(self._delete_marker('box_top', tid))
@@ -253,7 +261,7 @@ class DigitalTwinStabilizerNode(Node):
         return m
 
     def _label_marker(self, tid: int, x: float, y: float, z: float,
-                      text: str) -> Marker:
+                      text: str, fresh: bool = True) -> Marker:
         m = Marker()
         self._stamp(m)
         m.ns = 'box_labels'
@@ -266,7 +274,9 @@ class DigitalTwinStabilizerNode(Node):
         m.pose.orientation.w = 1.0
         m.scale.z = 0.025
         m.color.r = m.color.g = m.color.b = m.color.a = 1.0
-        m.text = text
+        # Tag a coasted (upstream not currently seeing it) track so consumers can
+        # skip the stale ghost; a fresh track keeps the upstream label verbatim.
+        m.text = text if fresh else f'{text}_coast'
         return m
 
     def _delete_marker(self, ns: str, tid: int) -> Marker:

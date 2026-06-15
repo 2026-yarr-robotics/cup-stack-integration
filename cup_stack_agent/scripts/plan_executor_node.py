@@ -54,6 +54,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -116,6 +117,7 @@ class TrackedCup:
     color: str = 'unknown'
     cls: str = 'unknown'
     locked: bool = False
+    stale: bool = False   # stabilizer is COASTING this track (upstream not seeing it)
 
 
 @dataclass
@@ -219,6 +221,27 @@ def drop_occupied_steps(
     return kept, skipped
 
 
+def stably_occupied(
+    stack: dict[str, Any],
+    occ_since: dict[str, float],
+    slot: str | None,
+    now: float,
+    debounce_s: float,
+) -> bool:
+    """Whether ``slot`` is occupied AND has been so continuously for at least
+    ``debounce_s`` (per ``occ_since``: slot→start-ts of the current occupied
+    streak). A transient/phantom occupancy — verifier flicker, or a cup the arm
+    carries over a slot's match region during a pick — is NOT stable, so it must
+    NOT be used to skip a real planned step (the root cause of the L2_left
+    phantom-skip desync). Only a slot stably occupied across the debounce
+    window counts as "really filled" for step-skipping."""
+    canonical = canonical_slot(slot)
+    if not stack_slot_occupied(stack, canonical):
+        return False
+    since = occ_since.get(canonical)
+    return since is not None and (now - since) >= debounce_s
+
+
 def llm_to_api_slot(slot: str | None) -> str | None:
     """Map a canonical LLM/verifier slot to the server API key."""
     canonical = canonical_slot(slot)
@@ -245,6 +268,8 @@ def select_cup(
     for tid, cup in cups.items():
         if cup.cls == 'fallen-cup':
             continue
+        if cup.stale:
+            continue  # coasting ghost (stabilizer holding a vanished track) — not graspable
         # `tid in stacked` (via /stack_track_ids) handles "already placed".
         # cup.locked is orthogonal (every tracked cup is locked) — do not skip.
         if tid in stacked:
@@ -287,6 +312,47 @@ def parse_fallen_count(obj: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return max(0, count)
+
+
+def select_unstack_dest(
+    spots: list[tuple[float, float]],
+    occupied_xy: tuple[tuple[float, float], ...],
+    radius_m: float,
+    fallback_base: tuple[float, float],
+    fallback_spacing: float,
+    fallback_slots: int,
+) -> tuple[tuple[float, float], int | None]:
+    """Choose a table spot to drop an unstacked cup.
+
+    Prefers a remembered pyramid-pick spot (most recent first) that is
+    currently EMPTY — no live cup within ``radius_m`` — so each removed cup
+    lands in a known reachable, in-view, unoccupied spot and exo re-recognizes
+    its color. Returns ``(xy, index)`` where ``index`` is the position in
+    ``spots`` to consume, or ``None`` when a fallback grid spot was used.
+
+    Fallback walks a small lateral grid (0, +s, -s, +2s, -2s, …) off
+    ``fallback_base`` until one reads empty, so several fallbacks in a row do
+    not pile onto each other; degrades to the base if the whole grid is busy.
+    """
+    r2 = max(0.0, radius_m) ** 2
+
+    def is_empty(x: float, y: float) -> bool:
+        return not any((x - ox) ** 2 + (y - oy) ** 2 <= r2
+                       for ox, oy in occupied_xy)
+
+    for i in range(len(spots) - 1, -1, -1):
+        x, y = spots[i]
+        if is_empty(x, y):
+            return (x, y), i
+    bx, by = fallback_base
+    offsets = [0.0]
+    for k in range(1, max(1, fallback_slots)):
+        offsets.append(fallback_spacing * ((k + 1) // 2)
+                       * (1 if k % 2 == 1 else -1))
+    for off in offsets:
+        if is_empty(bx, by + off):
+            return (bx, by + off), None
+    return (bx, by), None
 
 
 class PlanExecutorNode(Node):
@@ -361,6 +427,33 @@ class PlanExecutorNode(Node):
         # Recovery completion goes straight to GSP (pick_node owns the
         # pyramid /action_result; recovery never reaches pick_node).
         self.declare_parameter('action_result_topic', '/action_result')
+        # ── Unstack correction (LLM interrupt — pull a wrong-color cup) ─────
+        # Inverse of pyramid: pick a cup OUT of a pyramid slot and nest it at a
+        # destination. The server takes the pick coords from its slot config
+        # cache, so we only supply the destination XY (and nested=1: each cup
+        # to its OWN spot so exo re-recognizes its color).
+        self.declare_parameter(
+            'api_url_unstack',
+            'https://yarr-api-31.simplyimg.com/api/robot/skill/unstack')
+        # Destinations reuse the table spots recent successful pyramid picks
+        # emptied (known reachable + in exo FOV). This many are remembered.
+        self.declare_parameter('pick_spot_memory', 6)
+        # Fallback destination (safe area, base_link m) when no remembered pick
+        # spot is currently free; a small lateral grid avoids piling cups.
+        self.declare_parameter('unstack_dest_xy', [0.30, -0.15])
+        self.declare_parameter('unstack_dest_spacing', 0.08)
+        self.declare_parameter('unstack_dest_slots', 6)
+        # On `done`, keep the agent alive this long before shutting down so an
+        # idle disturbance (a built slot's cup removed) can re-engage the loop
+        # (#7). A non-done decision arriving in the window cancels the shutdown;
+        # if the window passes quietly, the success sentinel is emitted and the
+        # stack terminates.
+        self.declare_parameter('done_grace_s', 10.0)
+        # A planned step is skipped as "already filled" ONLY if its slot has
+        # been occupied in /stack continuously for this long — a transient
+        # verifier phantom (a cup carried over a slot's region during a pick)
+        # must not skip a real step (caused the L2_left phantom-skip desync).
+        self.declare_parameter('skip_debounce_s', 5.0)
 
         llm_out = str(self.get_parameter('llm_output_topic').value)
         move_topic = str(self.get_parameter('move_result_topic').value)
@@ -401,20 +494,41 @@ class PlanExecutorNode(Node):
             self.get_parameter('detection_warmup_s').value)
         fallen_topic = str(self.get_parameter('fallen_cups_topic').value)
         action_topic = str(self.get_parameter('action_result_topic').value)
+        self._api_url_unstack = str(
+            self.get_parameter('api_url_unstack').value)
+        dest = list(self.get_parameter('unstack_dest_xy').value or [0.30, -0.15])
+        self._unstack_dest_xy = (float(dest[0]), float(dest[1]))
+        self._unstack_dest_spacing = float(
+            self.get_parameter('unstack_dest_spacing').value)
+        self._unstack_dest_slots = int(
+            self.get_parameter('unstack_dest_slots').value)
+        self._pick_spot_memory = max(
+            1, int(self.get_parameter('pick_spot_memory').value))
+        self._done_grace_s = max(0.0, float(
+            self.get_parameter('done_grace_s').value))
+        self._skip_debounce_s = max(0.0, float(
+            self.get_parameter('skip_debounce_s').value))
 
         self._state_lock = threading.Lock()
         self._cups: dict[int, TrackedCup] = {}
         self._handeye_cups: dict[int, dict] = {}   # /hand_eye/boxes id->{xy,color}
         self._stacked_ids: set[int] = set()
         self._stack: dict[str, Any] = normalize_stack(None)
+        # slot -> monotonic ts when its current occupied streak began (for the
+        # stable-occupancy skip debounce; cleared when the slot reads empty).
+        self._slot_occ_since: dict[str, float] = {}
         self._stack_slot_xy: dict[str, tuple[float, float]] = default_stack_slot_xy(
             self._stack_center_x, self._stack_center_y, self._stack_degree)
         self._reserved_ids: dict[int, float] = {}
         self._plan: list[dict] = []
         self._step_idx: int = 0
         self._busy: bool = False
-        self._shutting_down: bool = False  # guards one-shot done-shutdown
+        self._shutting_down: bool = False  # grace pending / shutdown latched
+        self._grace_timer: threading.Timer | None = None  # cancellable done grace
         self._last_fallen: tuple[int, float] | None = None  # (count, mono ts)
+        # Table spots recent successful pyramid picks emptied (confirmed pick
+        # xy from pick_node's /action_result) — drop destinations for unstack.
+        self._pick_spots: deque = deque(maxlen=self._pick_spot_memory)
 
         self._move_pub = self.create_publisher(String, move_topic, 10)
         self.create_subscription(String, llm_out, self._on_llm_output, 10)
@@ -429,6 +543,12 @@ class PlanExecutorNode(Node):
         self.create_subscription(
             MarkerArray, handeye_boxes_topic, self._on_handeye_boxes, 10)
         self.create_subscription(String, fallen_topic, self._on_fallen_cups, 10)
+        # Listen to /action_result (we also publish to it) only to remember the
+        # spot each successful pyramid pick emptied. pick_node is the sole
+        # emitter of pyramid SUCCESS (we publish pyramid only on FAIL), so the
+        # success+xy filter never picks up our own messages.
+        self.create_subscription(
+            String, action_topic, self._on_action_result_spot, 10)
         self.create_timer(0.5, self._publish_handeye_counts)
         self.create_timer(2.0, self._refresh_pyramid_slots)
         self._refresh_pyramid_slots()
@@ -499,6 +619,10 @@ class PlanExecutorNode(Node):
                         float(m.pose.position.z))
                 elif m.ns == 'box_labels':
                     entry.color, entry.cls, entry.locked = parse_label(m.text)
+                    # stabilizer appends '_coast' to a track it is holding from
+                    # memory (upstream stopped seeing it) — a stale ghost, not a
+                    # graspable cup. Skip it in coarse selection (F2).
+                    entry.stale = 'coast' in (m.text or '')
 
     def _on_stack_ids(self, msg) -> None:
         with self._state_lock:
@@ -515,6 +639,21 @@ class PlanExecutorNode(Node):
             return
         with self._state_lock:
             self._stack = normalize_stack(data)
+            # Track each slot's continuous-occupied streak start for the skip
+            # debounce: a fresh occupancy stamps now; an empty reading clears it
+            # (so a phantom that flickers away never accrues stable time).
+            now = time.monotonic()
+            for slot in _STACK_SLOTS:
+                if stack_slot_occupied(self._stack, slot):
+                    self._slot_occ_since.setdefault(slot, now)
+                else:
+                    self._slot_occ_since.pop(slot, None)
+
+    def _slot_stably_occupied(self, slot) -> bool:
+        """Occupied-skip gate (caller holds _state_lock): only a slot occupied
+        continuously for skip_debounce_s skips a planned step — never a phantom."""
+        return stably_occupied(self._stack, self._slot_occ_since, slot,
+                               time.monotonic(), self._skip_debounce_s)
 
     # ── /llm_output handling ────────────────────────────────────────────────
 
@@ -525,11 +664,24 @@ class PlanExecutorNode(Node):
             self.get_logger().error(f'/llm_output invalid JSON: {e}')
             return
 
+        # Any decision other than `done` during the post-done grace window means a
+        # disturbance re-engaged the loop — cancel the pending shutdown and
+        # resume. (cold-start carries 'status', not 'decision'.)
+        if self._shutting_down and data.get('decision') != 'done':
+            self._cancel_grace(f"decision={data.get('decision') or 'cold_start'}")
+
         if data.get('decision') == 'fallen_recovery':
             # INTERRUPT (cold-start or in-flight): stand the fallen cup via
             # the server task, leaving _plan/_step_idx untouched — the LLM
             # resumes the existing plan with `continue` once fallen clears.
             self._execute_fallen_recovery()
+            return
+
+        if data.get('decision') == 'unstack':
+            # INTERRUPT: pull a wrong-color cup out of a pyramid slot, leaving
+            # _plan/_step_idx untouched — the LLM replans to refill the now-null
+            # slot with the correct color afterward.
+            self._execute_unstack(data.get('slot'))
             return
 
         if 'status' in data:  # cold-start
@@ -564,26 +716,48 @@ class PlanExecutorNode(Node):
                 f'/llm_output unknown shape: {list(data.keys())}')
 
     def _shutdown_agent(self, reason: str) -> None:
-        """Cleanly terminate the whole cup_stack_agent stack once the loop is done.
+        """On `done`, start a cancellable GRACE window, then terminate the stack.
 
-        Without this a ``done`` loop left every rclpy node spinning forever, so the
-        agent process stayed alive after the build finished (and the host bringup
-        agent reported it ``running`` indefinitely). start.sh runs as the process-
-        group leader and every node + tee shares its pgid, so one group SIGINT
-        takes the whole stack down: the rclpy nodes catch it and shut down
-        gracefully, and start.sh's cleanup() trap reaps any stragglers and exits.
+        Without a shutdown a ``done`` loop left every rclpy node spinning forever
+        (the host bringup agent reported it ``running`` indefinitely). But #7
+        wants the loop to still react to an idle disturbance after done, so we do
+        not kill immediately: we wait ``done_grace_s``. If a non-done decision
+        arrives in the window (a disturbance re-engaged the loop), _cancel_grace
+        aborts the shutdown. If the window passes quietly, _finalize_shutdown
+        emits the success sentinel and signals the group.
 
-        Emits the host success sentinel (``TASK_RESULT=SUCCESS``) first so the
-        signal-driven (non-zero) exit is mapped to ``idle``, not ``failed``, by
-        bringup_agent._decide_task_status. The actual group signal is deferred a
-        beat so the sentinel + final logs flush through the tee pipeline before
-        teardown.
+        start.sh is the process-group leader and every node + tee shares its
+        pgid, so one group SIGINT takes the whole stack down: the rclpy nodes
+        shut down gracefully and start.sh's cleanup() trap reaps stragglers.
         """
         if self._shutting_down:
-            return
+            return  # grace already pending; a repeated done must not restart it
         self._shutting_down = True
         self.get_logger().info(
-            f'plan complete — TASK_RESULT=SUCCESS; shutting down agent ({reason})')
+            f'plan complete — grace {self._done_grace_s:.0f}s before shutdown '
+            f'(a disturbance will cancel it) ({reason})')
+        self._grace_timer = threading.Timer(
+            self._done_grace_s, self._finalize_shutdown)
+        self._grace_timer.start()
+
+    def _cancel_grace(self, reason: str) -> None:
+        """A non-done decision arrived during the grace window — the loop is
+        re-engaged, so abort the pending shutdown."""
+        if not self._shutting_down:
+            return
+        self._shutting_down = False
+        if self._grace_timer is not None:
+            self._grace_timer.cancel()
+            self._grace_timer = None
+        self.get_logger().info(f'done-grace cancelled — loop re-engaged ({reason})')
+
+    def _finalize_shutdown(self) -> None:
+        """Grace elapsed with no disturbance: emit the success sentinel (so the
+        signal-driven non-zero exit maps to ``idle``, not ``failed``, in
+        bringup_agent._decide_task_status), then signal the group a beat later so
+        the sentinel + final logs flush through the tee pipeline first."""
+        self.get_logger().info(
+            'plan complete — TASK_RESULT=SUCCESS; shutting down agent')
         threading.Timer(1.0, self._terminate_process_group).start()
 
     def _terminate_process_group(self) -> None:
@@ -597,7 +771,19 @@ class PlanExecutorNode(Node):
     def _adopt_plan(self, steps: list[dict], reason: str) -> None:
         raw_steps = list(steps) if isinstance(steps, list) else []
         with self._state_lock:
-            plan, skipped = drop_occupied_steps(raw_steps, self._stack)
+            if reason == 'cold-start':
+                # A fresh build: drop pick spots remembered from a prior build
+                # (a stale cross-build spot could be reused as an unstack drop
+                # target). Live perception would filter occupied ones anyway,
+                # but this keeps the memory scoped to the current build.
+                self._pick_spots.clear()
+            plan, skipped = [], []
+            for step in raw_steps:
+                if (step.get('action') == 'pyramid'
+                        and self._slot_stably_occupied(step.get('target_slot'))):
+                    skipped.append(step)
+                else:
+                    plan.append(step)
             self._plan = plan
             self._step_idx = 0
         if skipped:
@@ -618,7 +804,7 @@ class PlanExecutorNode(Node):
                 step = self._plan[self._step_idx]
                 if (
                     step.get('action') == 'pyramid'
-                    and stack_slot_occupied(self._stack, step.get('target_slot'))
+                    and self._slot_stably_occupied(step.get('target_slot'))
                 ):
                     skipped.append((step.get('step'), step.get('target_slot')))
                     self._step_idx += 1
@@ -756,6 +942,26 @@ class PlanExecutorNode(Node):
         with self._state_lock:
             self._last_fallen = (count, time.monotonic())
 
+    def _on_action_result_spot(self, msg: String) -> None:
+        """Remember the table spot a successful pyramid pick emptied.
+
+        pick_node reports the confirmed pick xy on success; that spot is now
+        empty, reachable, and in the exo FOV — an ideal drop destination for a
+        later unstack. We publish to this topic too, but only pyramid FAIL, so
+        the success+xy filter never captures our own messages."""
+        try:
+            obj = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if obj.get('action') != 'pyramid' or obj.get('result') != 'success':
+            return
+        x, y = obj.get('x'), obj.get('y')
+        if (not isinstance(x, (int, float)) or isinstance(x, bool)
+                or not isinstance(y, (int, float)) or isinstance(y, bool)):
+            return
+        with self._state_lock:
+            self._pick_spots.append((float(x), float(y)))
+
     # ── fallen-cup recovery (LLM interrupt — current plan untouched) ───────
 
     def _execute_fallen_recovery(self) -> None:
@@ -791,6 +997,102 @@ class PlanExecutorNode(Node):
         self.get_logger().info(f'/action_result {result}: {out}')
         with self._state_lock:
             self._busy = False
+
+    # ── unstack correction (LLM interrupt — pull a wrong-color cup) ─────────
+
+    def _execute_unstack(self, llm_slot) -> None:
+        with self._state_lock:
+            if self._busy:
+                self.get_logger().warn('unstack ignored — executor busy')
+                return
+            self._busy = True
+        threading.Thread(
+            target=self._do_unstack_step, args=(llm_slot,), daemon=True).start()
+
+    def _do_unstack_step(self, llm_slot) -> None:
+        try:
+            result, reason, color = self._do_unstack(llm_slot)
+        except Exception as exc:  # noqa: BLE001
+            result, reason, color = 'fail', f'unstack exception: {exc}', None
+        # Like fallen_recovery this goes straight to GSP with step=null (not a
+        # plan step → GSP never advances the plan). target_slot is canonical so
+        # GSP's reverse reflection can confirm the slot went null; color is the
+        # removed cup's color (for logging / the LLM's re-recognition context).
+        out = {
+            'step': None,
+            'action': 'unstack',
+            'target_slot': canonical_slot(llm_slot),
+            'color': color,
+            'result': result,
+            'failure_reason': reason,
+        }
+        try:
+            self._action_pub.publish(String(data=json.dumps(out)))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f'/action_result publish failed: {exc}')
+        self.get_logger().info(f'/action_result {result}: {out}')
+        with self._state_lock:
+            self._busy = False
+
+    def _do_unstack(self, llm_slot) -> tuple[str, str | None, str | None]:
+        api_slot = llm_to_api_slot(llm_slot)
+        if api_slot is None:
+            return 'fail', f'unknown slot {llm_slot!r}', None
+        canonical = canonical_slot(llm_slot)
+        with self._state_lock:
+            slot_color = self._slot_color_unlocked(canonical)
+            dest = self._pick_unstack_dest_unlocked()
+        x, y = dest
+        # nested=1: each cup to its OWN spot (server grows place_z per nested
+        # cup; we never want a hidden column). Pick coords come from the
+        # server's slot config cache, so the body carries only slot + dest.
+        body = {'slot': api_slot, 'x': round(x, 4), 'y': round(y, 4),
+                'nested': 1}
+        if self._dry_run:
+            self.get_logger().info(
+                f'[dry-run] POST {self._api_url_unstack} {body}')
+            return 'success', None, slot_color
+        if not self._api_url_unstack:
+            return 'fail', 'api_url_unstack is empty', slot_color
+        self.get_logger().info(f'POST {self._api_url_unstack} {body}')
+        res = self._http_post_json(self._api_url_unstack, body)
+        if not res.ok:
+            return 'fail', f'unstack failed: {res.detail}', slot_color
+        return 'success', None, slot_color
+
+    def _slot_color_unlocked(self, canonical: str | None) -> str | None:
+        val = self._stack.get(canonical) if canonical else None
+        if isinstance(val, dict):
+            c = val.get('color')
+            return c if isinstance(c, str) else None
+        return val if isinstance(val, str) else None
+
+    def _pick_unstack_dest_unlocked(self) -> tuple[float, float]:
+        """Pick a drop destination, consuming a remembered pick spot when one
+        is currently free. Caller holds _state_lock."""
+        occ: list[tuple[float, float]] = []
+        for c in self._cups.values():
+            if c.pos is not None:
+                occ.append((float(c.pos[0]), float(c.pos[1])))
+        now = time.monotonic()
+        for hc in self._handeye_cups.values():
+            xy = hc.get('xy')
+            if xy is not None and now - hc.get('seen_at', 0.0) <= self._handeye_ttl_s:
+                occ.append((float(xy[0]), float(xy[1])))
+        dest, idx = select_unstack_dest(
+            list(self._pick_spots), tuple(occ),
+            self._stack_exclude_radius_m,
+            self._unstack_dest_xy, self._unstack_dest_spacing,
+            self._unstack_dest_slots)
+        if idx is not None:
+            try:
+                del self._pick_spots[idx]   # consume the reused spot
+            except (IndexError, ValueError):
+                pass
+        else:
+            self.get_logger().warn(
+                f'unstack: no free remembered pick spot — fallback {dest}')
+        return dest
 
     def _do_fallen_recovery(self) -> tuple[str, str | None]:
         # Fail-fast on a FRESH hand-eye count=0 — the LLM decided from a

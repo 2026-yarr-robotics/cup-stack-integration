@@ -298,7 +298,10 @@ class PickNode(Node):
         if not cands:
             log.error(
                 f"[select] 컵 마커 없음 ({self.hand_eye_boxes_topic} 흐르는지 확인)")
-            return None
+            # hand-eye has NO markers at all = the hand-eye vision is down/not
+            # ready (a system fault), NOT a fallen cup. Distinct code so GSP does
+            # NOT open fallen_recovery for it.
+            return "hand_eye_no_markers"
 
         scored = sorted(
             (
@@ -331,7 +334,10 @@ class PickNode(Node):
                 f"move target=({ref_xy[0]:.3f},{ref_xy[1]:.3f}) → "
                 f"cup#{cid} pick=({x:.3f},{y:.3f}) dist={dist:.3f}m "
                 f"> limit={self.max_pick_distance_m:.3f}m")
-            return None
+            # Markers exist but the nearest is too far from the exo target = the
+            # exo "upright" cup is not graspable (likely a mislabeled fallen cup
+            # or phantom). This IS the case fallen_recovery is for.
+            return "no_graspable_cup"
 
         preview = ", ".join(
             f"#{i}:{d:.3f}m/{b.get('color') or '?'}"
@@ -415,9 +421,13 @@ class PickNode(Node):
                 return
             ref_xy = np.array([float(raw["x"]), float(raw["y"])], dtype=float)
             p = self._select_pick_xy(color, ref_xy)
-            if p is None:
+            if not isinstance(p, np.ndarray):
+                # _select_pick_xy returns a distinct failure code (str) so GSP
+                # can tell a hand-eye outage from a not-graspable (maybe-fallen)
+                # cup; bare None falls back to the generic code.
                 self._publish_result(
-                    req, None, None, False, None, None, "select_failed")
+                    req, None, None, False, None, None,
+                    p if isinstance(p, str) else "select_failed")
                 return
             x, y = float(p[0]), float(p[1])
 

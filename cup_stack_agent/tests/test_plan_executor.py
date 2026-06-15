@@ -14,6 +14,8 @@ from plan_executor_node import (  # noqa: E402
     parse_fallen_count,
     parse_label,
     select_cup,
+    select_unstack_dest,
+    stably_occupied,
 )
 
 
@@ -64,6 +66,85 @@ class PlanExecutorTest(unittest.TestCase):
 
     def test_parse_fallen_count_clamps_negative(self):
         self.assertEqual(parse_fallen_count({'count': -1}), 0)
+
+
+class SelectUnstackDestTest(unittest.TestCase):
+    """Phase 3: unstack drop-spot selection (reuse empty pick spots)."""
+
+    FB = (0.30, -0.15)   # fallback base
+    RAD = 0.06
+
+    def test_prefers_most_recent_empty_spot(self):
+        spots = [(0.40, 0.00), (0.40, 0.10)]
+        dest, idx = select_unstack_dest(spots, (), self.RAD, self.FB, 0.08, 6)
+        self.assertEqual(dest, (0.40, 0.10))   # most recent first
+        self.assertEqual(idx, 1)
+
+    def test_skips_occupied_spot(self):
+        spots = [(0.40, 0.00), (0.40, 0.10)]
+        # the most-recent spot now has a cup -> fall through to the older one
+        dest, idx = select_unstack_dest(
+            spots, ((0.40, 0.10),), self.RAD, self.FB, 0.08, 6)
+        self.assertEqual(dest, (0.40, 0.00))
+        self.assertEqual(idx, 0)
+
+    def test_fallback_when_all_spots_occupied(self):
+        spots = [(0.40, 0.00)]
+        dest, idx = select_unstack_dest(
+            spots, ((0.40, 0.00),), self.RAD, self.FB, 0.08, 6)
+        self.assertIsNone(idx)
+        self.assertEqual(dest, self.FB)
+
+    def test_fallback_grid_avoids_occupied_base(self):
+        # base busy -> nudge laterally to the next free grid slot
+        dest, idx = select_unstack_dest(
+            [], (self.FB,), self.RAD, self.FB, 0.08, 6)
+        self.assertIsNone(idx)
+        self.assertNotEqual(dest, self.FB)
+
+
+class SelectCupStaleTest(unittest.TestCase):
+    """F2: coarse pick must skip a coasting (stale) exo ghost track."""
+
+    def test_skips_stale_picks_fresh(self):
+        cups = {
+            1: TrackedCup(pos=(0.78, -0.26, 0.2), color='blue',
+                          cls='upright-cup', stale=True),    # far ghost
+            2: TrackedCup(pos=(0.35, -0.10, 0.2), color='blue',
+                          cls='upright-cup', stale=False),   # real, fresh
+        }
+        res = select_cup(cups, set(), 'blue')
+        self.assertIsNotNone(res)
+        self.assertEqual(res[0], 2)
+
+    def test_all_stale_returns_none(self):
+        cups = {1: TrackedCup(pos=(0.78, -0.26, 0.2), color='blue',
+                              cls='upright-cup', stale=True)}
+        self.assertIsNone(select_cup(cups, set(), 'blue'))
+
+
+class StablyOccupiedTest(unittest.TestCase):
+    """A1: a planned step is skipped only if its slot is occupied continuously
+    for skip_debounce_s — a transient phantom must not skip a real step."""
+
+    STACK = {'L1_left': {'color': 'blue'}, 'L2_left': {'color': 'blue'}}
+    DB = 5.0
+
+    def test_stable_when_old_enough(self):
+        occ = {'L1_left': 100.0}
+        self.assertTrue(stably_occupied(self.STACK, occ, 'L1_left', 106.0, self.DB))
+
+    def test_phantom_too_recent_not_stable(self):
+        # L2_left occupied but only 2.4s ago (the observed phantom) -> NOT skipped
+        occ = {'L2_left': 100.0}
+        self.assertFalse(
+            stably_occupied(self.STACK, occ, 'L2_left', 102.4, self.DB))
+
+    def test_empty_slot_not_occupied(self):
+        self.assertFalse(stably_occupied(self.STACK, {}, 'L1_right', 999.0, self.DB))
+
+    def test_occupied_but_no_since_not_stable(self):
+        self.assertFalse(stably_occupied(self.STACK, {}, 'L1_left', 999.0, self.DB))
 
 
 if __name__ == '__main__':
