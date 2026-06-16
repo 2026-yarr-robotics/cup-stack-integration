@@ -286,7 +286,12 @@ class UprightCupPoseNode(Node):
         # goal_state_publisher 가 decision 시점(집을 upright 이 하나도 없을
         # 때)에만 payload 의 fallen_count 로 게이트해 싣는다. /hand_eye/boxes
         # (pick 좌표 경로)와 world_state 에는 절대 관여하지 않는다 — count 만.
-        self.declare_parameter("fallen_class_name", "fallen-cup")
+        # Classes that NEED recovery (not pickable-upright): fallen + mouth-up.
+        # Both are counted into /fallen_cups; the outlier recovery task tells
+        # them apart. exo publishes only upright cups so these never enter
+        # cups_on_table — this count is solely the recovery trigger.
+        self.declare_parameter(
+            "recovery_class_names", ["fallen-cup", "mouth-up-cup"])
         self.declare_parameter("fallen_count_topic", "/fallen_cups")
         # 중복 검출 제거: pick point 가 이 거리(px) 안인 같은 클래스 검출은
         # conf 높은 것만 남긴다. 0 이하면 비활성. (YOLO NMS 가 못 거른 겹침 정리)
@@ -375,8 +380,8 @@ class UprightCupPoseNode(Node):
             self.get_parameter("depth_mask_radius_px").value)
         self.depth_mask_percentile = float(
             self.get_parameter("depth_mask_percentile").value)
-        self.fallen_class_name = str(
-            self.get_parameter("fallen_class_name").value)
+        self.recovery_classes = {
+            str(c) for c in self.get_parameter("recovery_class_names").value}
         self.fallen_count_topic = str(
             self.get_parameter("fallen_count_topic").value)
         self.dedup_min_dist_px = float(
@@ -475,11 +480,35 @@ class UprightCupPoseNode(Node):
         self.fx = self.fy = self.cx = self.cy = None
 
         self.get_logger().info(f"Loading YOLO model: {self.weights_path}")
+        cuda_name = "none"
+        if torch.cuda.is_available():
+            try:
+                cuda_name = torch.cuda.get_device_name(0)
+            except Exception as e:
+                cuda_name = f"unknown ({e})"
+        self.get_logger().info(
+            "YOLO runtime request: "
+            f"device={self.device} half={self.half} "
+            f"torch_cuda={torch.cuda.is_available()} "
+            f"torch_cuda_version={getattr(torch.version, 'cuda', None)} "
+            f"cuda_device0={cuda_name}")
         self.model = YOLO(self.weights_path)
         try:
             self.model.fuse()
         except Exception as e:
             self.get_logger().warn(f"model.fuse() skipped: {e}")
+        if self.device and self.device != "cpu":
+            try:
+                self.model.to(self.device)
+            except Exception as e:
+                self.get_logger().warn(
+                    f"model.to({self.device}) failed; predict() will still "
+                    f"receive device={self.device}: {e}")
+        try:
+            model_device = next(self.model.model.parameters()).device
+        except Exception as e:
+            model_device = f"unknown ({e})"
+        self.get_logger().info(f"YOLO model parameter device: {model_device}")
 
         qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -506,7 +535,7 @@ class UprightCupPoseNode(Node):
         self.get_logger().info(f"  boxes_topic : {self.boxes_topic} ({self.base_frame})")
         self.get_logger().info(f"  target_class: '{self.target_class_name}'")
         self.get_logger().info(
-            f"  fallen count: '{self.fallen_class_name}' -> "
+            f"  recovery count: {sorted(self.recovery_classes)} -> "
             f"{self.fallen_count_topic}")
         self.get_logger().info(f"  model classes: {getattr(self.model, 'names', None)}")
 
@@ -956,12 +985,13 @@ class UprightCupPoseNode(Node):
         detections = self.extract_detections(results[0], frame_bgr, h, w)
         targets = self.filter_target_detections(detections)
 
-        # fallen-cup 개수 — 같은 추론 결과에서 세서 매 프레임(0 포함) 발행.
-        # 0 도 발행해야 구독자가 "fallen 없음"과 "노드 안 돎"을 신선도(TTL)로
-        # 구분한다. 좌표/색은 싣지 않는다 (count 만 — world 불관여).
+        # recovery-needed 개수 (fallen + mouth-up) — 같은 추론에서 세서 매 프레임
+        # (0 포함) 발행. 0 도 발행해야 구독자가 "없음"과 "노드 안 돎"을 신선도(TTL)
+        # 로 구분한다. 좌표/색은 싣지 않는다 (count 만 — world 불관여). 종류 구분은
+        # outlier recovery 태스크가.
         fallen_n = sum(
             1 for d in detections
-            if d.get("cls_name") == self.fallen_class_name)
+            if d.get("cls_name") in self.recovery_classes)
         self.fallen_pub.publish(
             String(data=json.dumps({"count": int(fallen_n)})))
 

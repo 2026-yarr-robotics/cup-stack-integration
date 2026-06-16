@@ -1218,45 +1218,55 @@ class PlanExecutorNode(Node):
             count, at = last
             if count <= 0 and time.monotonic() - at <= self._handeye_ttl_s:
                 return 'fail', 'hand-eye sees no fallen cup (count=0)'
-        url = f'{self._api_base}/api/robot/fallen-cup/recovery'
-        # The recovery task does its OWN hand-eye perception (fallen_cup_detect
-        # → /fallen_cup/* grasp pose) — the API takes no coordinates and no
-        # color; the task stands the nearest fallen cup it sees.
-        # multi_cup=false keeps the contract one interrupt = one cup;
-        # remaining fallen cups re-trigger on the next LLM cycle.
+        url = f'{self._api_base}/api/robot/outlier-cup/recovery'
+        # Outlier recovery orchestrator: does its OWN hand-eye perception and, in
+        # one run, stands ALL fallen cups then flips ALL mouth-up cups, then HOME.
+        # The API takes no coordinates/color; the recovery task distinguishes
+        # fallen vs mouth-up itself. multi_cup is forced ON by the orchestrator
+        # (not a field). One interrupt clears every non-upright cup; the loop
+        # resumes once the hand-eye recovery count drops to 0.
         body = {
             'mode': self._recovery_mode,
-            'multi_cup': False,
             'dry_run': False,
             'sim': False,
         }
         if self._dry_run:
             self.get_logger().info(f'[dry-run] POST {url} {body}')
             return 'success', None
-        if not self._ensure_fallen_detection():
-            return 'fail', 'fallen_cup_detect service unavailable'
+        if not self._ensure_recovery_detection():
+            return 'fail', 'recovery detection service(s) unavailable'
         self.get_logger().info(f'POST {url} {body}')
         res = self._http_post_json(url, body)
         if not res.ok:
             return 'fail', f'recovery start failed: {res.detail}'
         return self._wait_recovery_task()
 
-    def _ensure_fallen_detection(self) -> bool:
-        """Start the hand-eye fallen_cup_detect service if it is not running.
-
-        Service start loads YOLO weights, so poll detection_running up to
-        detection_warmup_s. The recovery task still does its own topic
-        sensing with retries, so "running" (not "publishing") is enough here.
+    def _ensure_recovery_detection(self) -> bool:
+        """Ensure BOTH hand-eye detection services the outlier recovery
+        subscribes to are running: fallen-cup (/fallen_cup/*) and mouth-up-cup
+        (/mouth_up_cup/grasp_pose). If either is down, that stage of the
+        orchestrator sees nothing. (exo stays upright-only; these are hand-eye.)
         """
-        state_url = f'{self._api_base}/api/robot/fallen-cup/state'
+        return (self._ensure_detection('fallen-cup')
+                and self._ensure_detection('mouth-up-cup'))
+
+    def _ensure_detection(self, kind: str) -> bool:
+        """Start the hand-eye <kind> detection service if it is not running
+        (kind = 'fallen-cup' | 'mouth-up-cup'). Service start loads YOLO weights,
+        so poll detection_running up to detection_warmup_s. The recovery task
+        still does its own topic sensing with retries, so "running" (not yet
+        "publishing") is enough here. Same /<kind>/state + /<kind>/detection/
+        start contract for both.
+        """
+        state_url = f'{self._api_base}/api/robot/{kind}/state'
         res = self._http_get_json(state_url)
         if res.ok and (res.data or {}).get('detection_running'):
             return True
         start = self._http_post_json(
-            f'{self._api_base}/api/robot/fallen-cup/detection/start', {})
+            f'{self._api_base}/api/robot/{kind}/detection/start', {})
         if not start.ok and 'HTTP 409' not in start.detail:
             self.get_logger().warn(
-                f'fallen detection start failed: {start.detail}')
+                f'{kind} detection start failed: {start.detail}')
             return False
         deadline = time.monotonic() + self._detection_warmup_s
         while time.monotonic() < deadline:
@@ -1267,10 +1277,12 @@ class PlanExecutorNode(Node):
         return False
 
     def _wait_recovery_task(self) -> tuple[str, str | None]:
-        """Poll /api/robot/status until fallen_cup_recovery leaves running.
+        """Poll /api/robot/status until outlier_cup_recovery leaves running.
 
-        LaunchManager marks the one-shot task idle on exit code 0 and failed
-        otherwise; transient poll errors are retried until the deadline.
+        outlier_cup_recovery is the task started by /api/robot/outlier-cup/
+        recovery (the fallen + mouth-up orchestrator). LaunchManager marks the
+        one-shot task idle on exit code 0 and failed otherwise; transient poll
+        errors are retried until the deadline.
         """
         url = f'{self._api_base}/api/robot/status'
         deadline = time.monotonic() + self._recovery_timeout_s
@@ -1281,7 +1293,7 @@ class PlanExecutorNode(Node):
                 continue
             status = None
             for task in (res.data or {}).get('tasks') or []:
-                if task.get('name') == 'fallen_cup_recovery':
+                if task.get('name') == 'outlier_cup_recovery':
                     status = str(task.get('status') or '')
                     break
             if status in ('running', 'stopping'):
@@ -1289,9 +1301,9 @@ class PlanExecutorNode(Node):
             if status == 'idle':
                 return 'success', None
             if status == 'failed':
-                return 'fail', ('fallen_cup_recovery task failed '
+                return 'fail', ('outlier_cup_recovery task failed '
                                 '(see /api/robot/task/log)')
-            return 'fail', 'fallen_cup_recovery task not found on server'
+            return 'fail', 'outlier_cup_recovery task not found on server'
         return 'fail', (
             f'recovery timed out after {self._recovery_timeout_s:.0f}s')
 
