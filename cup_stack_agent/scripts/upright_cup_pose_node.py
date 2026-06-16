@@ -156,7 +156,10 @@ def classify_color_bgr(mean_bgr):
         return "blue"
     if h < 160:
         return "purple"
-    return "red"
+    # h in [160,170): reddish-magenta gap. Don't fabricate a confident "red"
+    # (that's how an ambiguous read masquerades as a real red cup and gets
+    # picked for a red slot) — return "unknown" so it won't match a color slot.
+    return "unknown"
 
 
 class CupTracker:
