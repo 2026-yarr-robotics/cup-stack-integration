@@ -166,12 +166,12 @@ def validate_inflight(resp: dict, payload: dict) -> list[str]:
                 fallen = int(payload.get('fallen_count') or 0)
             except (TypeError, ValueError):
                 fallen = 0
-            # Valid unstack = a TOP-EXPOSED slot that is ITSELF a color
-            # violation whose required color is available to refill.
+            # Valid unstack = a TOP-EXPOSED slot that is EITHER itself a
+            # fixable color violation, OR a correct cup blocking access to a
+            # FIXABLE buried violation below it (peel, top-down).
             errs += _check_unstack_removable(slot, stack)
-            errs += _check_unstack_is_violation(slot, slot_colors, stack)
-            errs += _check_unstack_replacement(
-                slot, slot_colors, cw.get('cups_on_table'), fallen)
+            errs += _check_unstack_justified(
+                slot, slot_colors, stack, cw.get('cups_on_table'), fallen)
     if decision == 'replan':
         plan = resp.get('plan')
         if not plan:
@@ -322,12 +322,13 @@ def _check_no_color_violation(
     stack: Any, slot_colors: Any, cups: Any, fallen: int,
 ) -> list[str]:
     """A filled slot whose color differs from its non-"any" slot_colors is a
-    color violation. done is blocked ONLY for a violation that is both FIXABLE
-    (its required color is still available, or a fallen cup could supply it)
-    AND TOP-EXPOSED (nothing correct rests on it — so the loop can unstack it
-    directly). A BURIED violation (under correct cups) is left intact as a
-    legitimate partial — we never tear down correct work — and an UNFIXABLE one
-    (required color gone) is also a partial, so neither blocks done."""
+    color violation. done is blocked for any FIXABLE violation: TOP-EXPOSED
+    (its required color is on the table / a fallen cup supplies it — unstack
+    directly) OR BURIED but reachable (its required color is held by a cup
+    above it that a top-down peel would free, or is on the table). Only a
+    violation whose required color cannot be obtained at all (not on the table,
+    no fallen cup, not among the cups above it) is a legitimate partial that
+    done may leave intact."""
     if not isinstance(slot_colors, dict):
         return []
     bad = []
@@ -337,40 +338,139 @@ def _check_no_color_violation(
         got = _observed_color(stack, slot)
         if got is None or got == want:
             continue
-        if not (_color_available(cups, want) or fallen > 0):
-            continue  # unfixable -> partial
-        if not _is_exposed(stack, slot):
-            continue  # buried under correct cups -> partial
-        bad.append(f'{slot}:{got}!={want}')
+        if _is_exposed(stack, slot):
+            # top-exposed: fixable iff the required color is on the table now
+            # (or a fallen cup could supply it).
+            if _color_available(cups, want) or fallen > 0:
+                bad.append(f'{slot}:{got}!={want}')
+        elif _required_color_obtainable(
+                want, stack, _above(slot), cups, fallen):
+            # buried but reachable: a top-down peel frees the cups above it,
+            # one of which (or the table) supplies the required color.
+            bad.append(f'{slot}:{got}!={want}(buried-fixable)')
     if bad:
-        return [f'decision=done but fixable top-exposed color violation(s) '
-                f'{bad} — unstack and refill first']
+        return [f'decision=done but fixable color violation(s) {bad} — '
+                f'unstack/peel and refill first']
     return []
 
 
-def _check_unstack_replacement(
-    slot: str, slot_colors: Any, cups: Any, fallen: int,
+def _above(slot: str) -> set[str]:
+    """Transitive set of slots resting on ``slot`` — every one must be empty
+    before ``slot`` is exposed. A top-down teardown removes them outer-first."""
+    out: set[str] = set()
+    for up in _UNSTACK_SUPPORTS.get(slot, ()):
+        out.add(up)
+        out |= _above(up)
+    return out
+
+
+def _is_color_violation(slot: str, slot_colors: Any, stack: Any) -> bool:
+    """True when ``slot`` holds a cup whose color differs from its non-"any"
+    required color."""
+    if not isinstance(slot_colors, dict):
+        return False
+    want = slot_colors.get(slot)
+    got = _observed_color(stack, slot)
+    return bool(want and want != 'any' and got is not None and got != want)
+
+
+def _required_color_obtainable(
+    want: str, stack: Any, blockers: Any, cups: Any, fallen: int,
+) -> bool:
+    """``want`` can refill a slot: it is on the table, a fallen cup could
+    supply it, or one of ``blockers`` (cups currently above the slot) holds it
+    and a teardown would free it back onto the table."""
+    if _color_available(cups, want) or fallen > 0:
+        return True
+    return any(_observed_color(stack, b) == want for b in (blockers or ()))
+
+
+def _blocks_fixable_violation(
+    slot: str, slot_colors: Any, stack: Any, cups: Any, fallen: int,
+) -> bool:
+    """True when top-exposed ``slot`` is a correct cup sitting above a FIXABLE
+    buried color violation — removing it (peel) clears access so the violation
+    below can eventually be reached and refilled with its required color."""
+    if not isinstance(slot_colors, dict):
+        return False
+    for s, want in slot_colors.items():
+        if not want or want == 'any':
+            continue
+        if slot not in _above(s):
+            continue  # slot does not rest above s
+        if not _is_color_violation(s, slot_colors, stack):
+            continue
+        if _required_color_obtainable(want, stack, _above(s), cups, fallen):
+            return True
+    return False
+
+
+def _check_unstack_justified(
+    slot: str, slot_colors: Any, stack: Any, cups: Any, fallen: int,
 ) -> list[str]:
-    """Unstacking is only worth it when the slot's REQUIRED color can refill
-    it — that color is on the table, or a fallen cup could supply it. Removing
-    a wrong cup with no replacement just churns the build, so reject it (the
-    decider should done-partial instead)."""
+    """A top-exposed unstack is justified when the slot is ITSELF a fixable
+    color violation (its required color is obtainable to refill it), OR it is a
+    correct cup blocking access to a FIXABLE buried violation below it (peel,
+    top-down — it is replaced during the later refill). Otherwise removing it
+    just churns correct work, so reject it."""
     if not isinstance(slot_colors, dict):
         return []
-    want = slot_colors.get(slot)
-    if not want or want == 'any':
-        return []  # unconstrained slot — any cup can refill
-    if _color_available(cups, want) or fallen > 0:
-        return []
-    return [f'decision=unstack slot {slot!r} requires color {want!r} to '
-            f'refill but none is available — leave it (done partial)']
+    if _is_color_violation(slot, slot_colors, stack):
+        want = slot_colors.get(slot)
+        if _required_color_obtainable(want, stack, _above(slot), cups, fallen):
+            return []
+        return [f'decision=unstack slot {slot!r} requires color {want!r} to '
+                f'refill but none is available — leave it (done partial)']
+    if _blocks_fixable_violation(slot, slot_colors, stack, cups, fallen):
+        return []  # peel: clears access to a fixable buried violation below
+    got = _observed_color(stack, slot)
+    return [f'decision=unstack slot {slot!r} is not a color violation '
+            f'(holds {got!r}) and clears no fixable buried violation below — '
+            f'do not unstack it']
+
+
+def compute_color_check(stack: Any, slot_colors: Any, cups: Any,
+                        fallen: int = 0) -> dict | None:
+    """Precompute the color-violation facts a no-CoT decider otherwise has to
+    derive by multi-hop. For each constrained slot holding the wrong color, list
+    the colors of the cups TRANSITIVELY ABOVE it and whether it is FIXABLE (its
+    required color is on the table, supplied by a fallen cup, or held by one of
+    those cups above — which a top-down peel frees). Injected into /llm_input so
+    the fast decider reads the relationship off instead of inferring it (the
+    model otherwise anchors on "buried -> done partial" and never inspects the
+    cup above). Returns {"violations": [...]} or None when there is no color
+    violation. Pure/deterministic — mirrors validate_inflight's own checks."""
+    if not isinstance(slot_colors, dict) or not isinstance(stack, dict):
+        return None
+    try:
+        fallen = int(fallen or 0)
+    except (TypeError, ValueError):
+        fallen = 0
+    viols = []
+    for slot, want in slot_colors.items():
+        if not want or want == 'any':
+            continue
+        if not _is_color_violation(slot, slot_colors, stack):
+            continue
+        ab = _above(slot)
+        viols.append({
+            'slot': slot,
+            'holds': _observed_color(stack, slot),
+            'requires': want,
+            'exposed': _is_exposed(stack, slot),
+            'cups_above': {b: _observed_color(stack, b)
+                           for b in sorted(ab) if _slot_occupied(stack, b)},
+            'fixable': _required_color_obtainable(want, stack, ab, cups, fallen),
+        })
+    return {'violations': viols} if viols else None
 
 
 def _check_unstack_removable(slot: str, stack: Any) -> list[str]:
     """An unstack target must be FILLED and TOP-EXPOSED (nothing resting on it).
 
-    A buried violation is NOT unstacked — we never tear down correct cups to
-    reach it (it is left as a partial). Also guards an already-empty slot."""
+    A still-buried slot is never unstacked DIRECTLY — peel the cups above it
+    first (one top-exposed cup per cycle), then it becomes removable. Also
+    guards an already-empty slot."""
     errs: list[str] = []
     if not _slot_occupied(stack, slot):
         errs.append(f'decision=unstack but slot {slot!r} is already empty')
@@ -380,24 +480,8 @@ def _check_unstack_removable(slot: str, stack: Any) -> list[str]:
     if blockers:
         errs.append(
             f'decision=unstack slot {slot!r} is buried under {sorted(blockers)} '
-            f'— do not tear down correct cups; leave it (done partial)')
+            f'— peel the cup(s) above it first (unstack the top-exposed one)')
     return errs
-
-
-def _check_unstack_is_violation(
-    slot: str, slot_colors: Any, stack: Any,
-) -> list[str]:
-    """Only a slot that is ITSELF a color violation may be unstacked — never a
-    correct cup. (A wrong cup buried under correct cups stays put as a partial;
-    we do not remove the correct cups above it.)"""
-    if not isinstance(slot_colors, dict):
-        return []
-    want = slot_colors.get(slot)
-    got = _observed_color(stack, slot)
-    if not want or want == 'any' or got is None or got == want:
-        return [f'decision=unstack slot {slot!r} is not a color violation '
-                f'(holds {got!r}, requires {want!r}) — do not unstack it']
-    return []
 
 
 def _check_pyramid_steps(steps: list) -> list[str]:

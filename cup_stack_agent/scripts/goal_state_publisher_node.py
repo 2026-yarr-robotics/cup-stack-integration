@@ -38,6 +38,7 @@ from payload_builder import (
     GoalStateBuilder, action_result_reflected, normalize_fallen_count,
     world_changed,
 )
+from llm_client import compute_color_check
 
 
 class GoalStatePublisher(Node):
@@ -705,6 +706,26 @@ class GoalStatePublisher(Node):
                 f'fallen_count={self._fallen_count_sample}')
         payload['fallen_count'] = self._fallen_count_sample
 
+    def _apply_color_check_to_payload(self, payload: dict) -> None:
+        """Inject precomputed color-violation facts so the fast (no-CoT) decider
+        reads off whether a buried wrong-color cup is fixable (its required color
+        sits in a cup above it that a peel frees) instead of multi-hopping it —
+        without this the model anchors on "buried -> done partial" and never
+        inspects the cup above. In-flight only (cold start has no stack/target to
+        correct); runs AFTER _apply_fallen_to_payload so fallen_count is set."""
+        if payload.get('mode') != 'in_flight':
+            return
+        cw = payload.get('current_world_state')
+        if not isinstance(cw, dict):
+            return
+        target = (payload.get('current_plan') or {}).get('target') or {}
+        slot_colors = target.get('slot_colors')
+        cc = compute_color_check(cw.get('stack'), slot_colors,
+                                 cw.get('cups_on_table'),
+                                 payload.get('fallen_count', 0))
+        if cc:
+            payload['color_check'] = cc
+
     def _debounce_future_slots(self, raw_stack: dict) -> dict:
         """Reflect the just-built slot immediately, but hold a FUTURE step's
         slot at null until its occupancy is stable for future_slot_debounce_s
@@ -753,6 +774,7 @@ class GoalStatePublisher(Node):
             if self._handeye_fallback:
                 self._apply_handeye_to_payload(payload)
             self._apply_fallen_to_payload(payload)
+            self._apply_color_check_to_payload(payload)
             msg = String()
             msg.data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             self._pub.publish(msg)

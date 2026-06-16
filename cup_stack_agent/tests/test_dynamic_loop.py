@@ -215,13 +215,37 @@ class Scenario4TopDownAndStaleGuard(unittest.TestCase):
             {'decision': 'unstack', 'slot': 'L1_mid', 'plan': None}, pay)
         self.assertTrue(any('buried' in e for e in errs), errs)
 
-    def test_buried_violation_done_allowed(self):
-        # the wrong cup is buried under correct cups: leave it, partial done is
-        # valid (we never tear down correct work), and unstack is refused.
+    def test_buried_fixable_violation_blocks_done(self):
+        # new policy: a buried wrong cup whose required color is obtainable is
+        # FIXABLE -> done is refused; the loop must peel to reach it.
+        target = _full_target(self.SC_BURIED)
+        pay = _payload({'red': 1}, self.BURIED, target, _SUCCESS)
+        errs = validate_inflight({'decision': 'done', 'plan': None}, pay)
+        self.assertTrue(any('color violation' in e for e in errs), errs)
+
+    def test_buried_fixable_peel_top_blocker_allowed(self):
+        # to reach buried L1_mid, peel the topmost cup above it (L3_top) — a
+        # correct cup, allowed only because it clears a fixable violation below.
         target = _full_target(self.SC_BURIED)
         pay = _payload({'red': 1}, self.BURIED, target, _SUCCESS)
         self.assertEqual(
+            validate_inflight(
+                {'decision': 'unstack', 'slot': 'L3_top', 'plan': None}, pay),
+            [])
+
+    def test_buried_unfixable_violation_done_allowed(self):
+        # no red anywhere (table empty, L3_top blue, red siblings are not above
+        # L1_mid) -> genuinely unfixable -> partial done is valid, peel refused.
+        unfixable = dict(self.BURIED, L3_top='blue')
+        sc = dict(self.SC_BURIED, L3_top='any')
+        target = _full_target(sc)
+        pay = _payload({}, unfixable, target, _SUCCESS)
+        self.assertEqual(
             validate_inflight({'decision': 'done', 'plan': None}, pay), [])
+        self.assertTrue(any(
+            'clears no fixable buried violation' in e
+            for e in validate_inflight(
+                {'decision': 'unstack', 'slot': 'L3_top', 'plan': None}, pay)))
 
     def test_stale_stack_after_unstack_not_reflected(self):
         # /stack still shows the removed cup's old color -> not reflected ->

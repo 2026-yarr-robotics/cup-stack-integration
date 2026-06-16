@@ -11,6 +11,9 @@ DRY_RUN=false
 # only if running off-box: ROBOT_API_BASE=https://yarr-api-31.simplyimg.com.
 ROBOT_API_BASE="${ROBOT_API_BASE:-http://localhost}"
 API_URL="${API_URL:-${ROBOT_API_BASE}/api/robot/move}"
+# unstack must share the same base as move/pyramid/home — else it alone traverses
+# the Cloudflare tunnel (remote host), desyncing from the localhost pick path.
+API_URL_UNSTACK="${API_URL_UNSTACK:-${ROBOT_API_BASE}/api/robot/skill/unstack}"
 API_TIMEOUT_S="${API_TIMEOUT_S:-180.0}"
 # (Post-place arm retreat to HOME is handled server-side in /skill/pyramid_step
 #  via try_move_home — no client-side home move needed here.)
@@ -42,7 +45,7 @@ DISTURBANCE_REMOVED_SLOT="${DISTURBANCE_REMOVED_SLOT:-L2_left}"
 # Real-vision integration: the exo view is now real perception, not GT.
 # aggregator_node relays the real world state; digital_twin_stabilizer_node
 # median-filters the real point_cloud_node boxes.
-USER_COMMAND="${USER_COMMAND:-3단 피라미드 쌓아줘}"
+USER_COMMAND="${USER_COMMAND:-3단 피라미드 쌓는데 1단은 빨간색으로 쌓아줘}"
 STABILIZE_METHOD="${STABILIZE_METHOD:-ema}"
 STABILIZE_WINDOW_S="${STABILIZE_WINDOW_S:-1.0}"
 # Hold a track this long after its last fresh detection so a brief boxes
@@ -365,6 +368,7 @@ launch llm_node python3 scripts/llm_node.py \
 launch plan_executor python3 scripts/plan_executor_node.py \
   --ros-args \
   -p api_url_move:="${API_URL}" \
+  -p api_url_unstack:="${API_URL_UNSTACK}" \
   -p api_timeout_s:="${API_TIMEOUT_S}" \
   -p move_z:="${MOVE_Z}" \
   -p api_base_robot:="${ROBOT_API_BASE}" \

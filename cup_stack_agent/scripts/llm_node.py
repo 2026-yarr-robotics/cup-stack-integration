@@ -101,7 +101,7 @@ class LLMNode(Node):
                              else self._inflight_num_predict))
             if err:
                 self.get_logger().error(f'LLM call failed: {err}')
-                return  # transport errors are not retried here
+                break  # transport error -> HITL cold-start fallback below
             content = (result.get('message') or {}).get('content', '')
             try:
                 parsed = parse_model_json(content)
@@ -125,8 +125,45 @@ class LLMNode(Node):
             self._publish(parsed, mode, ms)
             return
 
-        self.get_logger().error(
-            f'{mode}: validation failed twice — dropping (needs HITL)')
+        # HITL fallback: rather than silently stalling the loop (no /llm_output
+        # -> no action -> GSP never re-triggers), re-plan from scratch on the
+        # CURRENT world (cold-start). plan_executor adopts it as a fresh plan and
+        # skips already-filled slots, so the build resumes instead of hanging.
+        if not self._hitl_cold_start(payload):
+            self.get_logger().error(
+                f'{mode}: unrecoverable, cold-start fallback failed — '
+                'dropping (needs HITL)')
+
+    def _hitl_cold_start(self, payload: dict) -> bool:
+        """Re-decide a stuck in-flight step via the cold-start planner on the
+        current world. Returns True if a valid fresh plan was published."""
+        if payload.get('mode') == 'cold_start':
+            return False  # a failing cold-start cannot be cold-started again
+        cold = dict(payload)
+        cold['mode'] = 'cold_start'
+        cold.pop('current_goal', None)
+        # Keep current_plan: in-flight payloads carry user_command=null, so the
+        # ONLY record of the original color constraint is current_plan.target.
+        # slot_colors. The cold planner reuses that target and plans just the
+        # still-null slots (mid-build), so the re-plan keeps "1단 빨강" etc.
+        result, ms, err = call_ollama(
+            self._model, self._cold_prompt, cold, ollama_url=self._url,
+            timeout_seconds=self._timeout, num_predict=self._cold_num_predict)
+        if err:
+            self.get_logger().error(f'HITL cold-start call failed: {err}')
+            return False
+        try:
+            parsed = parse_model_json((result.get('message') or {}).get('content', ''))
+        except json.JSONDecodeError:
+            return False
+        errs = validate_cold_start(parsed, cold)
+        if errs:
+            self.get_logger().error(f'HITL cold-start invalid: {errs}')
+            return False
+        self.get_logger().warn(
+            'HITL fallback → cold-start replan from current world')
+        self._publish(parsed, 'cold_start', ms)
+        return True
 
     def _publish(self, decision: dict, mode: str, ms: float) -> None:
         msg = String()

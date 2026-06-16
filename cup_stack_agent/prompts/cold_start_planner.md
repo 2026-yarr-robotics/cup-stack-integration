@@ -39,7 +39,7 @@ Examples:
 - "3단에서 2단까지만" -> base_levels=3, cup_budget=5 (fill up to level 2).
 - "3단에서 1단만" -> base_levels=3, cup_budget=3 (fill level 1 only; do NOT collapse to base_levels=1).
 
-Normalize target from user_command (level / 단 / cup count). Default to base_levels=3, cup_budget=6 if unspecified.
+If current_plan.target is already present (a mid-build re-plan after recovery/HITL — user_command may be null then), REUSE that target verbatim (its base_levels, cup_budget, target_slots, slot_colors — including any color constraint like "1단 빨강"); do NOT re-derive or drop the constraint. Otherwise normalize target from user_command (level / 단 / cup count). Default to base_levels=3, cup_budget=6 if unspecified.
 Requests for 4 levels, 5 levels, or any level above 3 are unsupported. Do not approximate them as 3-level plans.
 
 Cups are referenced by color only (same-color cups are interchangeable). cups_on_table is a {color: count} map of graspable cups scattered in the safe area. It is not a nested/stacked storage count. The stack field is the build output area.
@@ -61,6 +61,7 @@ Rules:
 - Each step is one "pyramid" action carrying both "color" and "target_slot".
 - One step per target_slot, in build order. Step count = min(cup_budget, available cups); stop early when cups run out (a partial build is fine).
 - Track remaining color counts as your plan consumes cups: each step decrements that color implicitly.
+- MID-BUILD (the stack may already be partly built — a cold-start re-plan after a recovery/HITL fallback): read current_world_state.stack. Every NON-NULL target slot is already DONE — emit NO step for it. Plan steps ONLY for target slots whose stack value is null, in build order, finishing the build from where it stands. target/cup_budget/slot_colors still describe the FULL target, but steps cover only the still-null target slots and the COUNT check uses the number of STILL-NULL target slots (not the full cup_budget). Cold-start NEVER removes or recolors a filled slot — leave a wrong-color filled slot as-is (the in-flight decider does color correction).
 - Honor color constraints in user_command. A constraint that names a layer/row (e.g. bottom, base, top, N번째 줄/단) applies to EVERY target slot in that layer, not just one. Assign colors layer by layer.
 - target.slot_colors: a map {target_slot: required color} recording the user's color CONSTRAINT per slot, or "any" where no constraint applies. A layer constraint (e.g. "bottom red") sets every slot in that layer to that color; every other slot is "any". With NO color constraint, set EVERY target slot to "any". slot_colors is the CONSTRAINT, not your free color pick — for an "any" slot the step may still use any available color, but slot_colors stays "any". Include one entry for every slot in target_slots.
 
@@ -108,4 +109,10 @@ Input:
 {"user_command":"3단 피라미드 쌓아줘","current_world_state":{"cups_on_table":{"red":0,"blue":0},"stack":{"L1_left":null,"L1_mid":null,"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":0,"total_slots":6},"fallen_count":1}
 Output:
 {"reasoning":"A cup is fallen, so it must be recovered before planning the pyramid.","decision":"fallen_recovery","plan":null}
+
+Few-shot example 7 (MID-BUILD cold-start — L1_left/L1_mid already filled, plan only the null slots):
+Input:
+{"user_command":"3단 피라미드 쌓는데 1단은 빨간색으로 쌓아줘","current_world_state":{"cups_on_table":{"red":1,"blue":3},"stack":{"L1_left":{"color":"red"},"L1_mid":{"color":"red"},"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":2,"total_slots":6}}
+Output:
+{"reasoning":"L1_left and L1_mid are already filled, so finish only the null slots: L1_right red, then L2/L3 blue.","status":"ok","target":{"base_levels":3,"cup_budget":6,"target_slots":["L1_left","L1_mid","L1_right","L2_left","L2_right","L3_top"],"slot_colors":{"L1_left":"red","L1_mid":"red","L1_right":"red","L2_left":"any","L2_right":"any","L3_top":"any"}},"plan":{"steps":[{"step":1,"action":"pyramid","color":"red","target_slot":"L1_right"},{"step":2,"action":"pyramid","color":"blue","target_slot":"L2_left"},{"step":3,"action":"pyramid","color":"blue","target_slot":"L2_right"},{"step":4,"action":"pyramid","color":"blue","target_slot":"L3_top"}]},"error":null}
 ```
