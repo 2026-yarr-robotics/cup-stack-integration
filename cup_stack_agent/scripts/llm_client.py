@@ -171,7 +171,8 @@ def validate_inflight(resp: dict, payload: dict) -> list[str]:
             # FIXABLE buried violation below it (peel, top-down).
             errs += _check_unstack_removable(slot, stack)
             errs += _check_unstack_justified(
-                slot, slot_colors, stack, cw.get('cups_on_table'), fallen)
+                slot, slot_colors, stack, cw.get('cups_on_table'), fallen,
+                payload.get('fix_extra_colors'))
     if decision == 'replan':
         plan = resp.get('plan')
         if not plan:
@@ -247,8 +248,11 @@ def validate_inflight(resp: dict, payload: dict) -> list[str]:
         # Never accept done while a FIXABLE color violation remains — the loop
         # must unstack+refill, not stop (and, with the done->shutdown hook, a
         # wrong done here would terminate irrecoverably). An unfixable one
-        # (required color gone) is allowed as a partial.
-        errs += _check_no_color_violation(stack, slot_colors, cups, fallen)
+        # (required color gone from BOTH exo and hand-eye) is allowed as a
+        # partial; fix_extra_colors lets a hand-eye-visible colour count as
+        # obtainable so an exo blind-spot can't fake "unfixable".
+        errs += _check_no_color_violation(
+            stack, slot_colors, cups, fallen, payload.get('fix_extra_colors'))
     return errs
 
 
@@ -337,7 +341,7 @@ def _is_exposed(stack: Any, slot: str) -> bool:
 
 
 def _check_no_color_violation(
-    stack: Any, slot_colors: Any, cups: Any, fallen: int,
+    stack: Any, slot_colors: Any, cups: Any, fallen: int, extra: Any = None,
 ) -> list[str]:
     """A filled slot whose color differs from its non-"any" slot_colors is a
     color violation. done is blocked for any FIXABLE violation: TOP-EXPOSED
@@ -358,11 +362,11 @@ def _check_no_color_violation(
             continue
         if _is_exposed(stack, slot):
             # top-exposed: fixable iff the required color is on the table now
-            # (or a fallen cup could supply it).
-            if _color_available(cups, want) or fallen > 0:
+            # (or a fallen cup could supply it, or the hand-eye sees it).
+            if _color_available(cups, want) or fallen > 0 or (extra and want in extra):
                 bad.append(f'{slot}:{got}!={want}')
         elif _required_color_obtainable(
-                want, stack, _above(slot), cups, fallen):
+                want, stack, _above(slot), cups, fallen, extra):
             # buried but reachable: a top-down peel frees the cups above it,
             # one of which (or the table) supplies the required color.
             bad.append(f'{slot}:{got}!={want}(buried-fixable)')
@@ -394,17 +398,24 @@ def _is_color_violation(slot: str, slot_colors: Any, stack: Any) -> bool:
 
 def _required_color_obtainable(
     want: str, stack: Any, blockers: Any, cups: Any, fallen: int,
+    extra: Any = None,
 ) -> bool:
-    """``want`` can refill a slot: it is on the table, a fallen cup could
-    supply it, or one of ``blockers`` (cups currently above the slot) holds it
-    and a teardown would free it back onto the table."""
+    """``want`` can refill a slot: it is on the (exo) table, a fallen cup could
+    supply it, the hand-eye sees it (``extra`` — a colour the exo camera missed
+    but the eye-in-hand view has, picked via plan_executor's hand-eye fallback),
+    or one of ``blockers`` (cups currently above the slot) holds it and a
+    teardown would free it back onto the table. ``extra`` defaults to None so
+    callers that don't supply it behave exactly as before (exo-only)."""
     if _color_available(cups, want) or fallen > 0:
+        return True
+    if extra and want in extra:
         return True
     return any(_observed_color(stack, b) == want for b in (blockers or ()))
 
 
 def _blocks_fixable_violation(
     slot: str, slot_colors: Any, stack: Any, cups: Any, fallen: int,
+    extra: Any = None,
 ) -> bool:
     """True when top-exposed ``slot`` is a correct cup sitting above a FIXABLE
     buried color violation — removing it (peel) clears access so the violation
@@ -418,13 +429,14 @@ def _blocks_fixable_violation(
             continue  # slot does not rest above s
         if not _is_color_violation(s, slot_colors, stack):
             continue
-        if _required_color_obtainable(want, stack, _above(s), cups, fallen):
+        if _required_color_obtainable(want, stack, _above(s), cups, fallen, extra):
             return True
     return False
 
 
 def _check_unstack_justified(
     slot: str, slot_colors: Any, stack: Any, cups: Any, fallen: int,
+    extra: Any = None,
 ) -> list[str]:
     """A top-exposed unstack is justified when the slot is ITSELF a fixable
     color violation (its required color is obtainable to refill it), OR it is a
@@ -435,11 +447,11 @@ def _check_unstack_justified(
         return []
     if _is_color_violation(slot, slot_colors, stack):
         want = slot_colors.get(slot)
-        if _required_color_obtainable(want, stack, _above(slot), cups, fallen):
+        if _required_color_obtainable(want, stack, _above(slot), cups, fallen, extra):
             return []
         return [f'decision=unstack slot {slot!r} requires color {want!r} to '
                 f'refill but none is available — leave it (done partial)']
-    if _blocks_fixable_violation(slot, slot_colors, stack, cups, fallen):
+    if _blocks_fixable_violation(slot, slot_colors, stack, cups, fallen, extra):
         return []  # peel: clears access to a fixable buried violation below
     got = _observed_color(stack, slot)
     return [f'decision=unstack slot {slot!r} is not a color violation '
@@ -448,7 +460,7 @@ def _check_unstack_justified(
 
 
 def compute_color_check(stack: Any, slot_colors: Any, cups: Any,
-                        fallen: int = 0) -> dict | None:
+                        fallen: int = 0, fix_extra: Any = None) -> dict | None:
     """Precompute the color-violation facts a no-CoT decider otherwise has to
     derive by multi-hop. For each constrained slot holding the wrong color, list
     the colors of the cups TRANSITIVELY ABOVE it and whether it is FIXABLE (its
@@ -472,7 +484,8 @@ def compute_color_check(stack: Any, slot_colors: Any, cups: Any,
         if not _is_color_violation(slot, slot_colors, stack):
             continue
         ab = _above(slot)
-        fixable = _required_color_obtainable(want, stack, ab, cups, fallen)
+        fixable = _required_color_obtainable(want, stack, ab, cups, fallen,
+                                             fix_extra)
         viols.append({
             'slot': slot,
             'holds': _observed_color(stack, slot),

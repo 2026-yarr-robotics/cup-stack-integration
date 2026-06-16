@@ -67,10 +67,13 @@ class GoalStatePublisher(Node):
         self.declare_parameter('freeze_world_during_action', True)
         self.declare_parameter('freeze_timeout_s', 60.0)
         # After /action_result (arm homed) keep the world frozen this much
-        # longer so perception settles before resuming. 0.5s keeps the loop
-        # tight now that the arm parks at the exact joint HOME (no lifted-
-        # home drift to wait out); raise it if post-place counts flicker.
-        self.declare_parameter('unfreeze_settle_s', 0.5)
+        # longer so perception settles before resuming. 1.0s (was 0.5s) gives
+        # the eye-in-hand view time to settle at HOME and actually register a
+        # cup the exo camera can't see before the decision reads it — so the
+        # color-violation fixability supplement (fix_extra in
+        # _apply_color_check_to_payload) isn't judged off a not-yet-settled
+        # hand-eye frame and the loop doesn't done-partial prematurely.
+        self.declare_parameter('unfreeze_settle_s', 1.0)
         # Hand-eye fallback at the DECISION moment only (cold-start /
         # post-action unfreeze): if exo cups_on_table is empty THEN, use the
         # hand-eye counts. Not a continuous supplement.
@@ -121,6 +124,15 @@ class GoalStatePublisher(Node):
         # freeze expires mid-recovery and starts accepting garbage mid-motion
         # /fallen_cups samples that poison the gate.
         self.declare_parameter('recovery_freeze_timeout_s', 260.0)
+        # No-progress watchdog: a non-done decision (e.g. a replan that resolves
+        # to 0 executable steps, or an llm decision that left nothing to run)
+        # leaves the loop "awaiting LLM decision" with no action, no
+        # /action_result, and no world change — so nothing ever re-triggers a
+        # decision and the loop locks. After this many seconds with no executable
+        # step, force a fresh cold-start re-plan from the current world (same
+        # recovery as llm_node's HITL fallback, but triggered by the stuck loop
+        # instead of an llm failure). 0 disables the watchdog.
+        self.declare_parameter('decision_watchdog_s', 15.0)
         # Anti-runaway: cap consecutive fallen_recovery dispatches that make no
         # progress (e.g. the orchestrator no-ops because its grasp detector
         # cannot see the cup the gate sees). Reset on pyramid progress / new
@@ -171,6 +183,14 @@ class GoalStatePublisher(Node):
             self.get_parameter('recovery_freeze_timeout_s').value)
         self._max_consecutive_recoveries = int(
             self.get_parameter('max_consecutive_recoveries').value)
+        self._decision_watchdog_s = float(
+            self.get_parameter('decision_watchdog_s').value)
+        # When a non-done decision left no executable step (loop awaiting a
+        # decision that nothing will re-trigger). None = not armed. _freeze_tick
+        # forces a cold-start re-plan once it has been set this long.
+        self._no_exec_since_ns = None
+        # consecutive watchdog cold-start re-plans without intervening progress.
+        self._consecutive_watchdog = 0
         # True while a fallen_recovery is the in-flight (frozen) action.
         self._recovery_in_flight = False
         # consecutive fallen_recovery dispatches without intervening progress.
@@ -420,9 +440,19 @@ class GoalStatePublisher(Node):
             self._freeze_world(f"action dispatched ({decision or 'cold_start'})")
         else:
             self._unfreeze_world('no executable step / done')
+            if decision == 'done':
+                self._no_exec_since_ns = None       # terminal, not stuck
+            elif self._no_exec_since_ns is None:
+                # A non-done decision produced NO executable step and nothing
+                # will re-trigger a decision -> arm the no-progress watchdog.
+                self._no_exec_since_ns = self.get_clock().now().nanoseconds
 
     # ── World freeze during action execution ──────────────────────────────
     def _freeze_world(self, reason: str) -> None:
+        # An action is dispatching = the loop is progressing: disarm the
+        # no-progress watchdog and reset its anti-runaway counter.
+        self._no_exec_since_ns = None
+        self._consecutive_watchdog = 0
         if not self._freeze_enabled:
             return
         if not self._action_in_flight:
@@ -465,6 +495,37 @@ class GoalStatePublisher(Node):
                 self.get_logger().warn(
                     'no fresh fallen sample after pick fail — deciding anyway')
                 self._publish()
+        # No-progress watchdog: a non-done decision left nothing to execute and
+        # nothing will re-trigger a decision (loop stuck "awaiting LLM
+        # decision"). Force a cold-start re-plan from the current world. Runs
+        # only while idle (no action/recovery/pick-fail in flight, all handled
+        # above). Re-arms on fire so a still-stuck cold-start re-fires; capped to
+        # avoid a busy cold-start loop when the state is genuinely unbuildable.
+        if (self._decision_watchdog_s > 0
+                and self._no_exec_since_ns is not None
+                and not self._action_in_flight
+                and self._pending_recovery is None
+                and self._pending_pick_fail is None):
+            stuck = (self.get_clock().now().nanoseconds
+                     - self._no_exec_since_ns) * 1e-9
+            if stuck >= self._decision_watchdog_s:
+                self._consecutive_watchdog += 1
+                self._no_exec_since_ns = self.get_clock().now().nanoseconds
+                if (self._max_consecutive_recoveries > 0
+                        and self._consecutive_watchdog
+                        > self._max_consecutive_recoveries):
+                    self.get_logger().error(
+                        f'no-progress watchdog fired '
+                        f'{self._consecutive_watchdog}x without progress — '
+                        'stopping cold-start retries (needs HITL)')
+                    self._no_exec_since_ns = None
+                else:
+                    self.get_logger().warn(
+                        f'no executable step for {stuck:.0f}s (stuck awaiting '
+                        'decision) — forcing cold-start re-plan from current '
+                        'world')
+                    self._builder.set_plan(None)   # -> cold_start mode
+                    self._publish()
         if not self._action_in_flight:
             return
         if (self._unfreeze_at is not None
@@ -720,11 +781,31 @@ class GoalStatePublisher(Node):
             return
         target = (payload.get('current_plan') or {}).get('target') or {}
         slot_colors = target.get('slot_colors')
+        # FIXABILITY supplement (separate from the exo-empty hand-eye fill in
+        # _apply_handeye_to_payload, which is left untouched): a violation's
+        # required colour may sit in a cup the exo camera can't see but the
+        # hand-eye view does (e.g. a blue cup out of exo FOV). Pass those colours
+        # as `fix_extra` so a real-but-exo-invisible colour is judged FIXABLE
+        # instead of unfixable->keep_empty->premature done. This NEVER touches
+        # cups_on_table (exo owns the world / picking count); it only affects the
+        # fixable flag. Reuses the same enable + freshness gate as the exo-empty
+        # fallback, so it is consistent and a no-op when hand-eye is stale/off.
+        fix_extra = []
+        if self._handeye_fallback and self._handeye_fresh():
+            fix_extra = sorted(
+                c for c, n in self._handeye_counts.items()
+                if isinstance(n, (int, float)) and not isinstance(n, bool)
+                and n > 0)
         cc = compute_color_check(cw.get('stack'), slot_colors,
                                  cw.get('cups_on_table'),
-                                 payload.get('fallen_count', 0))
+                                 payload.get('fallen_count', 0),
+                                 fix_extra=fix_extra)
         if cc:
             payload['color_check'] = cc
+        if fix_extra:
+            # surface to the in-flight validator (validate_inflight) so its
+            # done/unstack fixability guards agree with the injected color_check.
+            payload['fix_extra_colors'] = fix_extra
 
     def _debounce_future_slots(self, raw_stack: dict) -> dict:
         """Reflect the just-built slot immediately, but hold a FUTURE step's
