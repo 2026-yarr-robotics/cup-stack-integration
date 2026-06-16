@@ -438,11 +438,13 @@ class PlanExecutorNode(Node):
         self.declare_parameter(
             'api_url_unstack',
             'https://yarr-api-31.simplyimg.com/api/robot/skill/unstack')
-        # #11: on a pick failure the arm is left over the (wrong) exo target —
-        # both exo (mis-saw) and the hand-eye (now off-target) are blind there,
-        # a dead-end. POST /api/robot/stop returns the arm HOME so the retry sees
-        # a clean canonical view. Empty -> derived from api_base_robot.
-        self.declare_parameter('api_url_stop', '')
+        # #11: on a pick failure the arm is left over the (wrong) exo target,
+        # a dead-end for both cams. Ideally we return the arm HOME before the
+        # retry. There is NO clean bare-HOME endpoint yet (only /api/robot/stop,
+        # whose skill-interrupt + held-cup semantics do NOT belong on a no-cup
+        # pick fail). So HOME-on-fail is DORMANT: empty url -> no-op (retry in
+        # place). Wire a real /api/robot/home here when it exists. (See task.)
+        self.declare_parameter('api_url_home', '')
         # Destinations reuse the table spots recent successful pyramid picks
         # emptied (known reachable + in exo FOV). This many are remembered.
         self.declare_parameter('pick_spot_memory', 6)
@@ -508,8 +510,8 @@ class PlanExecutorNode(Node):
         action_topic = str(self.get_parameter('action_result_topic').value)
         self._api_url_unstack = str(
             self.get_parameter('api_url_unstack').value)
-        self._api_url_stop = (str(self.get_parameter('api_url_stop').value)
-                              or f'{self._api_base}/api/robot/stop')
+        # empty = HOME-on-fail dormant (no clean /home endpoint yet); NOT /stop.
+        self._api_url_home = str(self.get_parameter('api_url_home').value)
         self._pick_timeout_s = max(1.0, float(
             self.get_parameter('pick_timeout_s').value))
         dest = list(self.get_parameter('unstack_dest_xy').value or [0.30, -0.15])
@@ -1037,15 +1039,19 @@ class PlanExecutorNode(Node):
         self._execute_next()   # re-dispatch current plan step (or LLM's replan)
 
     def _return_home(self, reason) -> None:
-        """POST /api/robot/stop — interrupts any running skill and returns HOME.
-        Blocking; call from a worker thread."""
-        if self._dry_run or not self._api_url_stop:
-            self.get_logger().info(f'[dry-run/no-url] HOME ({reason})')
+        """Return the arm HOME via a bare-home endpoint (blocking; worker thread).
+        DORMANT until api_url_home is set — there is no clean /home endpoint yet
+        and /stop's skill-interrupt semantics are wrong for a no-cup pick fail.
+        With no url we skip HOME and retry in place (a known dead-end gap)."""
+        if self._dry_run or not self._api_url_home:
+            self.get_logger().warn(
+                f'HOME-on-fail deferred (no /home endpoint) — retrying in '
+                f'place after {reason}')
             return
-        self.get_logger().info(f'POST {self._api_url_stop} (HOME after {reason})')
-        res = self._http_post_json(self._api_url_stop, {})
+        self.get_logger().info(f'POST {self._api_url_home} (HOME after {reason})')
+        res = self._http_post_json(self._api_url_home, {})
         if not res.ok:
-            self.get_logger().warn(f'HOME (/stop) failed: {res.detail}')
+            self.get_logger().warn(f'HOME failed: {res.detail}')
 
     def _pick_timeout_tick(self) -> None:
         """pick_node never reported (crash/hang): free the executor after
