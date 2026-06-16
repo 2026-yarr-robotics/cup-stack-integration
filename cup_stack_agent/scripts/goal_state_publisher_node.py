@@ -113,6 +113,20 @@ class GoalStatePublisher(Node):
         # ~1-2s) before the LLM decides — else it may decide on a world that
         # hasn't shown the recovered cup yet.
         self.declare_parameter('recovery_settle_s', 1.5)
+        # Safety: while a fallen_recovery is the in-flight action the world
+        # stays frozen until its /action_result. recovery can take 88-214s
+        # (>> the 60s default freeze_timeout), so use a recovery-specific
+        # timeout ABOVE plan_executor's recovery_timeout_s(240) — else the
+        # freeze expires mid-recovery and starts accepting garbage mid-motion
+        # /fallen_cups samples that poison the gate.
+        self.declare_parameter('recovery_freeze_timeout_s', 260.0)
+        # Anti-runaway: cap consecutive fallen_recovery dispatches that make no
+        # progress (e.g. the orchestrator no-ops because its grasp detector
+        # cannot see the cup the gate sees). Reset on pyramid progress / new
+        # command. Normal single-run recovery clears the cup in one pass and
+        # never approaches this; it only breaks a pathological re-fire loop.
+        # 0 disables the cap.
+        self.declare_parameter('max_consecutive_recoveries', 6)
         # Done-race guard: after an action empties the last upright cup while
         # the target still has null slots, hold the decision up to this long
         # for a FRESH hand-eye fallen sample, so the decider sees the real
@@ -152,6 +166,14 @@ class GoalStatePublisher(Node):
             self.get_parameter('recovery_clear_timeout_s').value)
         self._recovery_settle_s = float(
             self.get_parameter('recovery_settle_s').value)
+        self._recovery_freeze_timeout_s = float(
+            self.get_parameter('recovery_freeze_timeout_s').value)
+        self._max_consecutive_recoveries = int(
+            self.get_parameter('max_consecutive_recoveries').value)
+        # True while a fallen_recovery is the in-flight (frozen) action.
+        self._recovery_in_flight = False
+        # consecutive fallen_recovery dispatches without intervening progress.
+        self._consecutive_recoveries = 0
         self._fallen_ttl_s = float(self.get_parameter('fallen_ttl_s').value)
         self._fallen_count_sample = 0   # last accepted /fallen_cups count
         self._fallen_seen_ns = 0        # when that sample was accepted (ns)
@@ -280,6 +302,7 @@ class GoalStatePublisher(Node):
         self._pending_recovery = None
         self._recover_after_pick_fail = False
         self._pending_pick_fail = None
+        self._consecutive_recoveries = 0
         self._unfreeze_world('new user command')
         self._builder.set_user_command(cmd)
         self._publish()  # cold-start trigger
@@ -336,6 +359,7 @@ class GoalStatePublisher(Node):
         if obj.get('result') == 'success' and obj.get('action') == 'pyramid':
             self._recover_after_pick_fail = False  # progress made -> clear
             self._pending_pick_fail = None
+            self._consecutive_recoveries = 0  # real progress -> reset cap
             self._pending_action_result = obj
             self._pending_action_at_ns = self.get_clock().now().nanoseconds
             self._pending_action_before_world = before
@@ -365,6 +389,10 @@ class GoalStatePublisher(Node):
             # recovery arm motion crosses the exo view, so freeze the world
             # exactly like a pyramid action (released by its /action_result).
             self._freeze_world('fallen recovery dispatched')
+            # Recovery freezes get a longer timeout (see _freeze_tick) and are
+            # counted for the anti-runaway cap (reset on progress / command).
+            self._recovery_in_flight = True
+            self._consecutive_recoveries += 1
             return
         if decision == 'unstack':
             # Interrupt like fallen_recovery: current_plan/current_goal stay
@@ -406,6 +434,7 @@ class GoalStatePublisher(Node):
         if self._action_in_flight:
             self.get_logger().info(f'world UNFROZEN ({reason})')
         self._action_in_flight = False
+        self._recovery_in_flight = False
         self._freeze_started_at = None
         self._unfreeze_at = None
 
@@ -444,7 +473,12 @@ class GoalStatePublisher(Node):
         if self._freeze_started_at is not None:
             elapsed = (self.get_clock().now()
                        - self._freeze_started_at).nanoseconds * 1e-9
-            if elapsed > self._freeze_timeout_s:
+            # Recovery runs far longer than a pyramid step; use its own timeout
+            # so the freeze does NOT expire mid-recovery and start accepting
+            # mid-motion /fallen_cups samples (which would poison the gate).
+            timeout = (self._recovery_freeze_timeout_s
+                       if self._recovery_in_flight else self._freeze_timeout_s)
+            if elapsed > timeout:
                 self.get_logger().warn(
                     'world freeze timed out (no /action_result) — resuming '
                     'perception')
@@ -649,6 +683,21 @@ class GoalStatePublisher(Node):
         if total > 0:
             return
         if not self._fallen_fresh():
+            return
+        # Anti-runaway: if recovery has been dispatched this many times in a row
+        # without progress (pyramid success / new command resets the counter),
+        # stop exposing fallen_count so the LLM cannot re-dispatch forever. Only
+        # trips on a pathological loop (orchestrator repeatedly no-ops on a cup
+        # the gate sees); a normal single-run recovery clears the cup in one
+        # pass — the just-recovered cup then shows up as a placeable cup
+        # (total > 0 above) and a pyramid step resets the counter.
+        if (self._max_consecutive_recoveries > 0
+                and self._consecutive_recoveries
+                >= self._max_consecutive_recoveries):
+            self.get_logger().error(
+                f'fallen_recovery dispatched {self._consecutive_recoveries}x '
+                'without progress — suppressing further recovery (check the '
+                'hand-eye grasp detector / cup reachability)')
             return
         if self._fallen_count_sample > 0:
             self.get_logger().info(
