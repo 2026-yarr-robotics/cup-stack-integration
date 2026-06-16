@@ -121,10 +121,10 @@ class PickNode(Node):
         # coarse target(= plan_executor가 고른 그 컵의 XY)과 hand-eye 후보의
         # 허용 거리. 너무 크면(구 0.20) 의도한 컵이 hand-eye에 안 보일 때 가장
         # 가까운 '다른' 컵 — 피라미드에 이미 놓인 컵까지 — 을 집어 빌드를
-        # 망친다(L2_right가 L1_right 컵 강탈). 실측 정상 pick은 ≤0.022m,
-        # cannibalize한 오선택은 0.064m 였으므로 0.05m면 분리된다: 멀면 거부
+        # 망칠 수 있다. exo/hand-eye 좌표 오차 여유를 위해 0.08m까지 허용하고,
+        # 그보다 멀면 거부
         # → select_failed(안전) → recover/replan 으로 흐른다.
-        self.declare_parameter("max_pick_distance_m", 0.05)
+        self.declare_parameter("max_pick_distance_m", 0.08)
         self.declare_parameter("box_top_ns", "box_top")
         self.declare_parameter("box_labels_ns", "box_labels")
         self.declare_parameter("filter_by_color", False)  # 색은 근거리 tie-break 에만 사용
@@ -311,6 +311,14 @@ class PickNode(Node):
             key=lambda dib: dib[0],
         )
 
+        all_preview = "; ".join(
+            f"#{i}:d={dist:.3f},xy=({float(b['xy'][0]):.3f},{float(b['xy'][1]):.3f}),c={b.get('color') or '?'}"
+            for dist, i, b in scored[:12])
+        log.info(
+            f"[select-debug] ref=({ref_xy[0]:.3f},{ref_xy[1]:.3f}) "
+            f"requested_color={str(color).strip().lower() if color else '?'} "
+            f"candidates={len(scored)} [{all_preview}]")
+
         if self.filter_by_color and color:
             cl = str(color).strip().lower()
             nearest_dist = scored[0][0]
@@ -320,6 +328,12 @@ class PickNode(Node):
                 if b.get("color") == cl and dist <= nearest_dist + 0.04
             ]
             if colored:
+                color_preview = "; ".join(
+                    f"#{i}:d={dist:.3f},xy=({float(b['xy'][0]):.3f},{float(b['xy'][1]):.3f}),c={b.get('color') or '?'}"
+                    for dist, i, b in colored[:12])
+                log.info(
+                    f"[select-debug] color_filter kept={len(colored)} "
+                    f"nearest_dist={nearest_dist:.3f} [{color_preview}]")
                 scored = colored
             else:
                 log.warn(

@@ -27,6 +27,11 @@ STRING_TOPICS = [
     '/action_result',
 ]
 
+BOX_TOPICS = [
+    '/digital_twin/boxes_filtered',
+    '/hand_eye/boxes',
+]
+
 
 class TopicLoggerNode(Node):
     def __init__(self) -> None:
@@ -52,12 +57,13 @@ class TopicLoggerNode(Node):
             self._log_stack_track_ids,
             10,
         )
-        self.create_subscription(
-            MarkerArray,
-            '/digital_twin/boxes_filtered',
-            self._log_boxes,
-            10,
-        )
+        for topic in BOX_TOPICS:
+            self.create_subscription(
+                MarkerArray,
+                topic,
+                lambda msg, topic=topic: self._log_boxes(topic, msg),
+                10,
+            )
 
         self.get_logger().info(
             f'topic_logger_node: writing topic logs to {self._log_dir}')
@@ -72,7 +78,7 @@ class TopicLoggerNode(Node):
     def _log_stack_track_ids(self, msg: Int32MultiArray) -> None:
         self._write('/stack_track_ids', [int(x) for x in msg.data])
 
-    def _log_boxes(self, msg: MarkerArray) -> None:
+    def _log_boxes(self, topic: str, msg: MarkerArray) -> None:
         markers = []
         for marker in msg.markers:
             markers.append({
@@ -80,13 +86,18 @@ class TopicLoggerNode(Node):
                 'id': int(marker.id),
                 'action': int(marker.action),
                 'text': marker.text,
+                'frame_id': marker.header.frame_id,
+                'stamp': {
+                    'sec': int(marker.header.stamp.sec),
+                    'nanosec': int(marker.header.stamp.nanosec),
+                },
                 'position': {
                     'x': float(marker.pose.position.x),
                     'y': float(marker.pose.position.y),
                     'z': float(marker.pose.position.z),
                 },
             })
-        self._write('/digital_twin/boxes_filtered', markers)
+        self._write(topic, markers)
 
     def _write(self, topic: str, payload: Any) -> None:
         encoded_payload = json.dumps(

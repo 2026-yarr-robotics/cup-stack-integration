@@ -107,7 +107,7 @@ _KNOWN_COLORS: frozenset[str] = frozenset({
     'white', 'black', 'gray', 'unknown',
 })
 _KNOWN_CLASSES: frozenset[str] = frozenset({
-    'upright-cup', 'fallen-cup', 'cup',
+    'upright-cup', 'fallen-cup', 'cup', 'mouth-up-cup',
 })
 
 
@@ -269,8 +269,8 @@ def select_cup(
     wanted = color.lower()
     r2 = max(0.0, exclude_radius_m) ** 2
     for tid, cup in cups.items():
-        if cup.cls == 'fallen-cup':
-            continue
+        if cup.cls in ('fallen-cup', 'mouth-up-cup'):
+            continue  # not a pickable upright cup — handled by outlier recovery
         if cup.stale:
             continue  # coasting ghost (stabilizer holding a vanished track) — not graspable
         # `tid in stacked` (via /stack_track_ids) handles "already placed".

@@ -45,6 +45,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.time import Time
+from rclpy.duration import Duration
+from collections import deque
 from tf2_ros import Buffer, TransformListener
 
 from sensor_msgs.msg import Image, CameraInfo
@@ -269,7 +271,7 @@ class UprightCupPoseNode(Node):
         self.declare_parameter("debug_image_topic", "/upright_cup/debug_image")
 
         self.declare_parameter("imgsz", 640)
-        self.declare_parameter("conf", 0.25)
+        self.declare_parameter("conf", 0.45)
         self.declare_parameter("iou", 0.45)
         self.declare_parameter("device", "cpu")
         self.declare_parameter("half", False)
@@ -296,6 +298,20 @@ class UprightCupPoseNode(Node):
         self.declare_parameter(
             "recovery_class_names", ["fallen-cup", "mouth-up-cup"])
         self.declare_parameter("fallen_count_topic", "/fallen_cups")
+        # fallen 카운트 확정 게이트: 매 프레임 raw 카운트를 그대로 내보내면 단일
+        # 프레임 오탐(튐)이 그대로 발행돼 소비자(GSP)가 HOME 에서 잘못된 fallen 으로
+        # recovery 를 트리거할 수 있다. 그래서 새 카운트 값이 이만큼 연속 프레임
+        # 동안 관측될 때만 확정해 발행한다 (증가/감소 양방향 동일). 1 이면 즉시
+        # 발행(기존 동작). 0 발행 자체는 매 프레임 유지 — 구독자 TTL 신선도 판정용.
+        self.declare_parameter("fallen_confirm_frames", 3)
+        # recovery 카운트 전용 conf 하한. pick 용 upright-cup 검출은 conf(0.45)로
+        # 민감하게 잡되, /fallen_cups 로 세는 fallen/mouth-up 은 이 값 이상만 센다.
+        # 이유: recovery 검출기(best.pt)가 conf 0.6 으로 도므로, upright 가 0.45 의
+        # 약한 mouth-up/fallen 을 세서 recovery 를 부르면 recovery 는 그 컵을 못 봐
+        # (타겟 0개) 못 고치고 → fallen_count 안 줄어 무한루프가 된다. 트리거를
+        # actor(recovery) 와 같은 임계로 맞춰 "recovery 가 실제로 처리할 수 있는
+        # 컵"만 트리거한다. (recovery 의 mouth-up conf 와 일치시킬 것.)
+        self.declare_parameter("recovery_min_conf", 0.6)
         # 중복 검출 제거: pick point 가 이 거리(px) 안인 같은 클래스 검출은
         # conf 높은 것만 남긴다. 0 이하면 비활성. (YOLO NMS 가 못 거른 겹침 정리)
         self.declare_parameter("dedup_min_dist_px", 25.0)
@@ -387,6 +403,15 @@ class UprightCupPoseNode(Node):
             str(c) for c in self.get_parameter("recovery_class_names").value}
         self.fallen_count_topic = str(
             self.get_parameter("fallen_count_topic").value)
+        self.fallen_confirm_frames = max(
+            1, int(self.get_parameter("fallen_confirm_frames").value))
+        self.recovery_min_conf = float(
+            self.get_parameter("recovery_min_conf").value)
+        # 확정 게이트 상태: _confirmed = 마지막으로 발행한(확정) 값,
+        # _candidate = 확정값과 다른 후보값, _streak = 그 후보가 연속 관측된 프레임 수.
+        self._fallen_confirmed = 0
+        self._fallen_candidate = 0
+        self._fallen_streak = 0
         self.dedup_min_dist_px = float(
             self.get_parameter("dedup_min_dist_px").value)
 
@@ -480,6 +505,17 @@ class UprightCupPoseNode(Node):
 
         # ── 카메라 내부 파라미터 / depth ────────────────────
         self.last_depth_m = None
+        # Eye-in-hand sync: the camera rides on link_6, so a frame's base
+        # projection must use the depth + TF OF THAT FRAME's capture time, not
+        # the latest — the arm moves between capture and YOLO/processing, so a
+        # latest-TF projection lands the cup in a different frame ("calibration
+        # jitter"). Buffer depth by stamp; look up TF at the image stamp.
+        self._depth_buf = deque(maxlen=8)   # (stamp_ns, depth_m)
+        self.tf_timeout_s = float(
+            self.declare_parameter("tf_timeout_s", 0.06).value)
+        self._tf_lookups = 0          # base<-link_6 lookups attempted
+        self._tf_stamp_miss = 0       # ... that fell back to the latest TF
+        self._boxes_log_t = 0.0       # throttle for the raw /hand_eye/boxes log
         self.fx = self.fy = self.cx = self.cy = None
 
         self.get_logger().info(f"Loading YOLO model: {self.weights_path}")
@@ -539,7 +575,8 @@ class UprightCupPoseNode(Node):
         self.get_logger().info(f"  target_class: '{self.target_class_name}'")
         self.get_logger().info(
             f"  recovery count: {sorted(self.recovery_classes)} -> "
-            f"{self.fallen_count_topic}")
+            f"{self.fallen_count_topic} (confirm {self.fallen_confirm_frames} frames, "
+            f"min_conf {self.recovery_min_conf})")
         self.get_logger().info(f"  model classes: {getattr(self.model, 'names', None)}")
 
     # ── Depth / camera info ──────────────────────────────────
@@ -555,6 +592,18 @@ class UprightCupPoseNode(Node):
             self.last_depth_m = depth.astype(np.float32)
         else:
             self.get_logger().warn(f"Unsupported depth encoding: {msg.encoding}")
+            return
+        # Buffer by stamp so image_callback can pick the depth nearest the COLOR
+        # frame's capture time (aligned depth + color arrive as separate msgs).
+        s = msg.header.stamp
+        self._depth_buf.append(
+            (s.sec * 1_000_000_000 + s.nanosec, self.last_depth_m))
+
+    def _depth_at_stamp(self, color_ns):
+        """Buffered depth whose stamp is nearest `color_ns`; None if empty."""
+        if not self._depth_buf:
+            return None
+        return min(self._depth_buf, key=lambda sd: abs(sd[0] - color_ns))[1]
 
     def camera_info_callback(self, msg: CameraInfo):
         self.fx = float(msg.k[0])
@@ -930,16 +979,44 @@ class UprightCupPoseNode(Node):
         return classify_color_bgr(mean_bgr)
 
     # ── 좌표 변환 (camera optical → base_link) ────────────────
-    def _ee_matrix_from_tf(self):
-        """base_frame <- link_6 4x4 (TF 최신). 미수신/실패 시 None."""
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.base_frame, self.ee_frame, Time())
-        except Exception as e:
-            self.get_logger().warn(
-                f"link_6 TF lookup 실패(FK 불가): {e}",
-                throttle_duration_sec=2.0)
-            return None
+    def _ee_matrix_from_tf(self, stamp=None):
+        """base_frame <- link_6 4x4 at the image's capture `stamp` (eye-in-hand:
+        the camera pose OF THAT FRAME, not a later one). Falls back to the latest
+        TF when the stamped pose isn't in the buffer; None if even that fails."""
+        self._tf_lookups += 1
+        tf = None
+        if stamp is not None:
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.base_frame, self.ee_frame, Time.from_msg(stamp),
+                    timeout=Duration(seconds=self.tf_timeout_s))
+            except Exception:
+                self._tf_stamp_miss += 1   # not yet / no longer in the buffer
+                if self._tf_stamp_miss % 30 == 1:
+                    # Diagnose WHY the stamped lookup misses: print the image
+                    # stamp vs the latest TF stamp. |delta| ~tens of ms => small
+                    # offset (fixable by a nearest-stamp TF buffer); |delta|
+                    # ~seconds => clock mismatch (camera not on ROS time).
+                    try:
+                        latest = self.tf_buffer.lookup_transform(
+                            self.base_frame, self.ee_frame, Time())
+                        img_s = stamp.sec + stamp.nanosec * 1e-9
+                        tf_s = (latest.header.stamp.sec
+                                + latest.header.stamp.nanosec * 1e-9)
+                        self.get_logger().warn(
+                            f"[tf-sync] miss: img_stamp={img_s:.3f} "
+                            f"latest_tf={tf_s:.3f} delta={img_s - tf_s:+.3f}s")
+                    except Exception:
+                        pass
+        if tf is None:
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.base_frame, self.ee_frame, Time())
+            except Exception as e:
+                self.get_logger().warn(
+                    f"link_6 TF lookup 실패(FK 불가): {e}",
+                    throttle_duration_sec=2.0)
+                return None
         t = tf.transform.translation
         q = tf.transform.rotation
         T = np.eye(4)
@@ -947,9 +1024,10 @@ class UprightCupPoseNode(Node):
         T[:3, 3] = [t.x, t.y, t.z]
         return T
 
-    def cam_to_base(self, p_cam):
-        """p_cam (camera optical frame, m) → base_link (m). 실패 시 None."""
-        T_base_ee = self._ee_matrix_from_tf()
+    def cam_to_base(self, p_cam, stamp=None):
+        """p_cam (camera optical frame, m) → base_link (m). 실패 시 None.
+        `stamp` = the image capture time for an eye-in-hand-correct TF."""
+        T_base_ee = self._ee_matrix_from_tf(stamp)
         if T_base_ee is None:
             return None
         T_base_cam = T_base_ee @ self.gripper2cam
@@ -964,6 +1042,15 @@ class UprightCupPoseNode(Node):
         except Exception as e:
             self.get_logger().error(f"image conversion failed: {e}")
             return
+
+        # Eye-in-hand sync: pin THIS color frame's depth (nearest stamp) and TF
+        # (at img_stamp, below) so the base projection uses the capture-time
+        # camera pose, not the latest.
+        img_stamp = msg.header.stamp
+        matched_depth = self._depth_at_stamp(
+            img_stamp.sec * 1_000_000_000 + img_stamp.nanosec)
+        if matched_depth is not None:
+            self.last_depth_m = matched_depth
 
         h, w = frame_bgr.shape[:2]
         debug = frame_bgr.copy()
@@ -992,9 +1079,27 @@ class UprightCupPoseNode(Node):
         # (0 포함) 발행. 0 도 발행해야 구독자가 "없음"과 "노드 안 돎"을 신선도(TTL)
         # 로 구분한다. 좌표/색은 싣지 않는다 (count 만 — world 불관여). 종류 구분은
         # outlier recovery 태스크가.
-        fallen_n = sum(
-            1 for d in detections
-            if d.get("cls_name") in self.recovery_classes)
+        fallen_dets = [
+            d for d in detections
+            if d.get("cls_name") in self.recovery_classes
+            and d.get("conf", 0.0) >= self.recovery_min_conf]
+        raw_fallen_n = len(fallen_dets)
+        # N프레임 연속 관측 게이트: 새 카운트 값이 fallen_confirm_frames 만큼
+        # 연속으로 관측돼야 확정값을 갱신한다. 단일 프레임 튐은 candidate 로만
+        # 머물다 사라져 발행값(_fallen_confirmed)을 흔들지 않는다.
+        if raw_fallen_n == self._fallen_confirmed:
+            self._fallen_candidate = raw_fallen_n
+            self._fallen_streak = 0
+        else:
+            if raw_fallen_n == self._fallen_candidate:
+                self._fallen_streak += 1
+            else:
+                self._fallen_candidate = raw_fallen_n
+                self._fallen_streak = 1
+            if self._fallen_streak >= self.fallen_confirm_frames:
+                self._fallen_confirmed = raw_fallen_n
+                self._fallen_streak = 0
+        fallen_n = self._fallen_confirmed
         self.fallen_pub.publish(
             String(data=json.dumps({"count": int(fallen_n)})))
 
@@ -1007,7 +1112,7 @@ class UprightCupPoseNode(Node):
             p_cam = self.deproject_pixel_to_3d(u, v, z)
             if p_cam is None:
                 continue
-            p_base = self.cam_to_base(p_cam)
+            p_base = self.cam_to_base(p_cam, img_stamp)
             if p_base is None:
                 continue
             color = self.detect_color(frame_bgr, det)
@@ -1017,6 +1122,21 @@ class UprightCupPoseNode(Node):
                 "color": color,
                 "center": (float(u), float(v)),
             })
+
+        # ── #3 raw /hand_eye/boxes diagnostic (BEFORE tracking/smoothing) ──
+        # If a static cup's base coord jitters frame-to-frame, it's an
+        # image/depth/TF sync problem. tf_stamp_miss/lookups shows how often the
+        # stamped (image-time) TF was unavailable and fell back to the latest.
+        now_s = time.time()
+        if cups and now_s - self._boxes_log_t >= 1.0:
+            self._boxes_log_t = now_s
+            preview = " ".join(
+                f"({c['xy_base'][0]:.3f},{c['xy_base'][1]:.3f},"
+                f"z{c['z_base']:.3f},{c['color']})" for c in cups[:8])
+            self.get_logger().info(
+                f"[boxes-raw] n={len(cups)} "
+                f"tf_stamp_miss={self._tf_stamp_miss}/{self._tf_lookups} "
+                f"{preview}")
 
         # 시간 평활/트래킹 (base_link 공간): per-frame 튐·outlier 제거.
         if self.enable_temporal_smoothing:
@@ -1039,18 +1159,47 @@ class UprightCupPoseNode(Node):
                 cv2.circle(debug, (int(ctr[0]), int(ctr[1])), 3, (160, 160, 160), -1)
             c = det["center"]
             cv2.circle(debug, (int(c[0]), int(c[1])), 4, (0, 0, 255), -1)
+
+        # ── fallen 으로 카운트된 검출 시각화 (진단용) ──
+        # /fallen_cups 에 들어가는 detection (recovery_classes) 을 빨강 contour +
+        # bounding box + 라벨(클래스/conf/면적)로 표시한다. HOME 에서 fallen 이
+        # 0 이 아닐 때 어떤 mask 가 fallen-cup/mouth-up-cup 으로 오분류되는지
+        # 디버그 이미지에서 바로 확인하기 위함. (targets 와 다른 색으로 구분)
+        fallen_breakdown = {}
+        for det in fallen_dets:
+            cls_name = det.get("cls_name") or "?"
+            fallen_breakdown[cls_name] = fallen_breakdown.get(cls_name, 0) + 1
+            cnt = det["contour"]
+            cv2.drawContours(debug, [cnt], -1, (0, 0, 255), 2)
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            cv2.rectangle(debug, (x, y), (x + bw, y + bh), (0, 0, 255), 2)
+            label = (f"{cls_name} {det.get('conf', 0.0):.2f} "
+                     f"a={int(det.get('area', 0))}")
+            ty = y - 6 if y - 6 > 12 else y + bh + 16
+            cv2.putText(debug, label, (x, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        breakdown_str = (
+            " [" + " ".join(f"{k}:{v}" for k, v in sorted(fallen_breakdown.items()))
+            + "]" if fallen_breakdown else "")
+        # fallen={확정·발행값} raw={이번 프레임 검출값}; cand 는 확정 대기 중인
+        # 후보값과 누적 연속 프레임 수 (게이트가 차오르는 과정 시각화).
+        pend_str = (
+            f" cand={self._fallen_candidate}x{self._fallen_streak}/{self.fallen_confirm_frames}"
+            if self._fallen_streak > 0 else "")
         cv2.putText(
             debug,
             f"upright cups={len(targets)} published={len(published)} "
-            f"fallen={fallen_n} pick={self.pick_point_method} "
-            f"smooth={self.enable_temporal_smoothing}",
+            f"fallen={fallen_n} raw={raw_fallen_n}{breakdown_str}{pend_str} "
+            f"pick={self.pick_point_method} smooth={self.enable_temporal_smoothing}",
             (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         self.publish_debug(debug, msg.header)
 
         elapsed = (time.time() - start) * 1000.0
         self.get_logger().info(
             f"upright cups={len(targets)} base={len(cups)} published={len(published)} "
-            f"fallen={fallen_n} time={elapsed:.1f} ms")
+            f"fallen={fallen_n} raw={raw_fallen_n}{breakdown_str}{pend_str} "
+            f"time={elapsed:.1f} ms")
 
     # ── Publish ───────────────────────────────────────────────
     def publish_boxes(self, cups):
