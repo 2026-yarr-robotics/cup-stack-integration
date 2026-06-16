@@ -364,5 +364,63 @@ class ComputeColorCheckTest(unittest.TestCase):
         self.assertIsNone(compute_color_check({}, None, {}, 0))
 
 
+class KeepEmptyTest(unittest.TestCase):
+    """Option-1: don't bury an UNFIXABLE color violation — keep the slots above
+    it empty so it stays correctable if its color reappears."""
+
+    SC = {'L1_left': 'red', 'L1_mid': 'red', 'L1_right': 'red',
+          'L2_left': 'any', 'L2_right': 'any', 'L3_top': 'any'}
+
+    def _stack(self):
+        # L1_mid blue (requires red), L2/L3 empty.
+        return {'L1_left': {'color': 'red'}, 'L1_mid': {'color': 'blue'},
+                'L1_right': {'color': 'red'}, 'L2_left': None,
+                'L2_right': None, 'L3_top': None}
+
+    def _payload(self, cups):
+        st = self._stack()
+        cc = compute_color_check(st, self.SC, cups, 0)
+        return {'current_world_state': {'stack': st, 'cups_on_table': cups},
+                'current_plan': {'target': {'target_slots': list(self.SC),
+                                            'slot_colors': self.SC},
+                                 'remaining_steps': []},
+                'last_action_result': {'action': 'pyramid', 'result': 'success'},
+                'fallen_count': 0, 'color_check': cc}
+
+    def test_keep_empty_when_unfixable(self):
+        cc = compute_color_check(self._stack(), self.SC, {'blue': 3}, 0)
+        self.assertFalse(cc['violations'][0]['fixable'])
+        self.assertEqual(set(cc['keep_empty']),
+                         {'L2_left', 'L2_right', 'L3_top'})
+
+    def test_no_keep_empty_when_fixable(self):
+        cc = compute_color_check(self._stack(), self.SC, {'red': 1}, 0)
+        self.assertTrue(cc['violations'][0]['fixable'])
+        self.assertNotIn('keep_empty', cc)
+
+    def test_done_allowed_leaving_keep_empty(self):
+        # unfixable L1_mid + L2/L3 are keep_empty -> done(partial) is OK even
+        # though blue cups remain (filling L2/L3 would bury it).
+        self.assertEqual(
+            validate_inflight({'decision': 'done', 'plan': None},
+                              self._payload({'blue': 3})), [])
+
+    def test_replan_into_keep_empty_rejected(self):
+        resp = {'decision': 'replan', 'plan': {'steps': [
+            {'action': 'pyramid', 'color': 'blue', 'target_slot': 'L2_left'}]}}
+        errs = validate_inflight(resp, self._payload({'blue': 3}))
+        self.assertTrue(any('bury' in e for e in errs), errs)
+
+    def test_done_allowed_with_remaining_keep_empty_steps(self):
+        # the old plan still lists L2/L3 steps, but they're keep_empty -> they
+        # must NOT block done(partial).
+        pay = self._payload({'blue': 3})
+        pay['current_plan']['remaining_steps'] = [
+            {'action': 'pyramid', 'color': 'blue', 'target_slot': 'L2_left'},
+            {'action': 'pyramid', 'color': 'blue', 'target_slot': 'L3_top'}]
+        self.assertEqual(
+            validate_inflight({'decision': 'done', 'plan': None}, pay), [])
+
+
 if __name__ == '__main__':
     unittest.main()

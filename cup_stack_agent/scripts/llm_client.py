@@ -184,9 +184,24 @@ def validate_inflight(resp: dict, payload: dict) -> list[str]:
             sc = cur_target.get('slot_colors')
             if sc is not None:
                 errs += _check_steps_match_slot_colors(steps, sc)
+            # Never fill a slot that would BURY an unfixable color violation
+            # below it (keep_empty) — that makes the violation permanently
+            # uncorrectable. Leave those empty (done-partial) instead.
+            keep_empty = set((payload.get('color_check') or {}).get('keep_empty') or [])
+            buried = [s.get('target_slot') for s in steps
+                      if s.get('target_slot') in keep_empty]
+            if buried:
+                errs.append(
+                    f'decision=replan steps fill {buried} which would bury an '
+                    f'unfixable color violation below — keep them empty')
     if decision == 'done':
         plan = payload.get('current_plan') or {}
-        if (plan.get('remaining_steps') or []):
+        keep_empty = set((payload.get('color_check') or {}).get('keep_empty') or [])
+        # Remaining steps that target a keep_empty slot are intentionally NOT
+        # executable (filling them would bury an unfixable violation), so they
+        # do NOT block done(partial).
+        if [s for s in (plan.get('remaining_steps') or [])
+                if s.get('target_slot') not in keep_empty]:
             errs.append('decision=done but remaining_steps not empty')
         lar = payload.get('last_action_result') or {}
         if lar.get('result') != 'success':
@@ -202,6 +217,9 @@ def validate_inflight(resp: dict, payload: dict) -> list[str]:
         slot_colors = target.get('slot_colors') or {}
         null_targets = [s for s in (target.get('target_slots') or [])
                         if not stack.get(s)]
+        # Slots intentionally kept empty above an unfixable violation must NOT
+        # block done — filling them would bury the violation permanently.
+        null_targets = [s for s in null_targets if s not in keep_empty]
         cups = cw.get('cups_on_table') or {}
         total_cups = sum(int(v) for v in cups.values()
                          if isinstance(v, (int, float))
@@ -447,12 +465,14 @@ def compute_color_check(stack: Any, slot_colors: Any, cups: Any,
     except (TypeError, ValueError):
         fallen = 0
     viols = []
+    keep_empty: set[str] = set()
     for slot, want in slot_colors.items():
         if not want or want == 'any':
             continue
         if not _is_color_violation(slot, slot_colors, stack):
             continue
         ab = _above(slot)
+        fixable = _required_color_obtainable(want, stack, ab, cups, fallen)
         viols.append({
             'slot': slot,
             'holds': _observed_color(stack, slot),
@@ -460,9 +480,19 @@ def compute_color_check(stack: Any, slot_colors: Any, cups: Any,
             'exposed': _is_exposed(stack, slot),
             'cups_above': {b: _observed_color(stack, b)
                            for b in sorted(ab) if _slot_occupied(stack, b)},
-            'fixable': _required_color_obtainable(want, stack, ab, cups, fallen),
+            'fixable': fixable,
         })
-    return {'violations': viols} if viols else None
+        # An UNFIXABLE wrong cup must not be BURIED — keep every still-empty slot
+        # above it empty so it stays top-exposed and correctable if its required
+        # color reappears later.
+        if not fixable:
+            keep_empty |= {b for b in ab if not _slot_occupied(stack, b)}
+    if not viols:
+        return None
+    out = {'violations': viols}
+    if keep_empty:
+        out['keep_empty'] = sorted(keep_empty)
+    return out
 
 
 def _check_unstack_removable(slot: str, stack: Any) -> list[str]:
