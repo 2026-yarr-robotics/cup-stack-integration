@@ -343,26 +343,15 @@ class GoalStatePublisher(Node):
                 self.get_logger().info(
                     f'/action_result pending world update: {obj}')
             return
-        # A pyramid pick that failed with error='no_graspable_cup' (hand-eye saw
-        # cups but none graspable at the exo target) is likely a fallen cup the
-        # exo mis-counted as upright. ONLY this case opens recover-after-pick-fail
-        # (expose the hand-eye fallen count despite exo cups>0) and DEFERS until a
-        # FRESH hand-eye fallen sample lands. A 'hand_eye_no_markers' fail (the
-        # hand-eye vision is down/not ready) is a SYSTEM fault, NOT a fallen cup —
-        # do not route to recovery; just re-publish so the LLM retries/replans
-        # from the real world (exo still shows the cups).
+        # A pyramid fail no longer opens a fallen-recovery exception (removed —
+        # it conflated "pick failed" with "cup is fallen" and mis-fired on exo
+        # phantoms). plan_executor returns the arm HOME and retries the step
+        # (#11); fallen recovery only triggers via the clean exo==0 policy. Here
+        # we just re-publish so the LLM re-decides from the current world.
         if obj.get('action') == 'pyramid' and obj.get('result') == 'fail':
-            if obj.get('error') == 'no_graspable_cup':
-                self._recover_after_pick_fail = True
-                self._pending_pick_fail = {
-                    'at_ns': self.get_clock().now().nanoseconds}
-                self.get_logger().info(
-                    'pyramid pick not graspable -> awaiting fresh fallen sample '
-                    'before deciding (recover vs retry)')
-                return
             self.get_logger().warn(
-                f"pyramid pick failed ({obj.get('error')}) — not a fallen "
-                'signal; re-deciding from current world')
+                f"pyramid pick failed ({obj.get('error')}) — re-deciding from "
+                'current world (plan_executor homes + retries)')
         self._publish()  # other failures do not require a world-state delta
 
     def _on_llm_output(self, msg: String) -> None:
@@ -652,12 +641,12 @@ class GoalStatePublisher(Node):
         cups = cw.get('cups_on_table') or {}
         total = sum(int(v) for v in cups.values()
                     if isinstance(v, (int, float)) and not isinstance(v, bool))
-        # Normally upright cups win (exo cups > 0 -> fallen stays hidden). But
-        # right after a FAILED pyramid pick, the exo cup count is suspect — the
-        # cup the LLM tried to place was not graspable (likely a fallen cup the
-        # exo mis-labeled upright). In that one case, expose fallen despite
-        # exo cups > 0 so the loop can recover instead of retrying forever.
-        if total > 0 and not self._recover_after_pick_fail:
+        # Upright cups always win: fallen_count is exposed ONLY when exo sees no
+        # graspable cup (total == 0). (The old pick-fail exception that exposed
+        # fallen despite exo cups > 0 was removed — it conflated "pick failed"
+        # with "cup is fallen" and mis-fired on exo phantoms. A pick fail now
+        # just retries from HOME (#11); a real fallen cup surfaces when exo == 0.)
+        if total > 0:
             return
         if not self._fallen_fresh():
             return

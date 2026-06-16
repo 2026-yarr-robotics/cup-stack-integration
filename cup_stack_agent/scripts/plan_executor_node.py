@@ -137,6 +137,9 @@ class _MoveOutcome:
     x: float | None = None       # coarse move target XY — pick_node's search center
     y: float | None = None
     source_tid: int | None = None
+    error: str | None = None     # machine-readable fail code carried to GSP via
+    #                              /action_result (e.g. 'no_upright_cup' -> route
+    #                              the coarse-move fail to fallen recovery)
 
 
 # ── Pure helpers (no ROS) — unit-tested in test_plan_executor.py ──────────
@@ -435,6 +438,11 @@ class PlanExecutorNode(Node):
         self.declare_parameter(
             'api_url_unstack',
             'https://yarr-api-31.simplyimg.com/api/robot/skill/unstack')
+        # #11: on a pick failure the arm is left over the (wrong) exo target —
+        # both exo (mis-saw) and the hand-eye (now off-target) are blind there,
+        # a dead-end. POST /api/robot/stop returns the arm HOME so the retry sees
+        # a clean canonical view. Empty -> derived from api_base_robot.
+        self.declare_parameter('api_url_stop', '')
         # Destinations reuse the table spots recent successful pyramid picks
         # emptied (known reachable + in exo FOV). This many are remembered.
         self.declare_parameter('pick_spot_memory', 6)
@@ -453,6 +461,11 @@ class PlanExecutorNode(Node):
         # verifier phantom (a cup carried over a slot's region during a pick)
         # must not skip a real step (caused the L2_left phantom-skip desync).
         self.declare_parameter('skip_debounce_s', 5.0)
+        # #11 atomicity: after a coarse move succeeds (real-api), the step is NOT
+        # done until pick_node confirms the pick via /action_result. If that
+        # never arrives (pick_node crash/hang), free the executor after this long
+        # so the loop can retry/replan instead of stalling. > a normal pick.
+        self.declare_parameter('pick_timeout_s', 40.0)
 
         llm_out = str(self.get_parameter('llm_output_topic').value)
         move_topic = str(self.get_parameter('move_result_topic').value)
@@ -495,6 +508,10 @@ class PlanExecutorNode(Node):
         action_topic = str(self.get_parameter('action_result_topic').value)
         self._api_url_unstack = str(
             self.get_parameter('api_url_unstack').value)
+        self._api_url_stop = (str(self.get_parameter('api_url_stop').value)
+                              or f'{self._api_base}/api/robot/stop')
+        self._pick_timeout_s = max(1.0, float(
+            self.get_parameter('pick_timeout_s').value))
         dest = list(self.get_parameter('unstack_dest_xy').value or [0.30, -0.15])
         self._unstack_dest_xy = (float(dest[0]), float(dest[1]))
         self._unstack_dest_spacing = float(
@@ -522,6 +539,10 @@ class PlanExecutorNode(Node):
         self._plan: list[dict] = []
         self._step_idx: int = 0
         self._busy: bool = False
+        # #11: after a coarse move succeeds (real-api) we stay busy, NOT advancing
+        # the step, until pick_node confirms the pick via /action_result. Holds
+        # {step, target_slot, at} while awaiting; None otherwise.
+        self._awaiting_pick: dict | None = None
         self._shutting_down: bool = False  # grace pending / shutdown latched
         self._grace_timer: threading.Timer | None = None  # cancellable done grace
         self._last_fallen: tuple[int, float] | None = None  # (count, mono ts)
@@ -550,6 +571,7 @@ class PlanExecutorNode(Node):
             String, action_topic, self._on_action_result_spot, 10)
         self.create_timer(0.5, self._publish_handeye_counts)
         self.create_timer(2.0, self._refresh_pyramid_slots)
+        self.create_timer(1.0, self._pick_timeout_tick)  # #11 awaiting-pick backstop
         self._refresh_pyramid_slots()
 
         self.get_logger().debug(
@@ -830,21 +852,39 @@ class PlanExecutorNode(Node):
         except Exception as exc:  # noqa: BLE001
             outcome = _MoveOutcome('fail', f'executor exception: {exc}')
 
-        # /move_result carries success (with slot, handed off to pick_node) or
-        # failure. On SUCCESS pick_node owns the /action_result completion signal.
-        # On FAILURE at this coarse-move stage (e.g. no graspable cup), pick_node
-        # never runs and never emits /action_result — so GSP would stay frozen on
-        # the dispatched action until its safety timeout. We therefore emit the
-        # failure on /action_result ourselves so GSP unfreezes and routes to
-        # recovery/replan. Advance only on a successful move.
+        # /move_result carries success (handed to pick_node) or failure.
         self._publish_move_result(step, outcome)
-        if outcome.result != 'success' and action == 'pyramid':
-            self._publish_action_fail(step, outcome)
-        with self._state_lock:
-            if outcome.result == 'success':
+
+        if outcome.result != 'success':
+            # Coarse-move stage failed (no graspable cup, HTTP, …): pick_node
+            # never runs. select_cup failed before moving, so the arm is still at
+            # HOME — no recovery needed. Report the fail (GSP unfreezes) and free
+            # the executor WITHOUT advancing (#11: retry, don't skip the slot).
+            if action == 'pyramid':
+                self._publish_action_fail(step, outcome)
+            with self._state_lock:
+                self._busy = False
+            return
+
+        # Coarse move succeeded.
+        if self._dry_run:
+            # No pick_node in dry-run -> the move IS the step; advance now.
+            with self._state_lock:
                 self._reserve_source_track(outcome.source_tid)
                 self._step_idx += 1
-            self._busy = False
+                self._busy = False
+            return
+        # real-api: the step is NOT done until pick_node confirms the pick via
+        # /action_result. Stay busy + DO NOT advance — _on_action_result_spot
+        # resolves it (#11 atomicity: step_idx tracks confirmed picks, not coarse
+        # moves; a move-success/pick-fail must retry the SAME step, not skip it).
+        with self._state_lock:
+            self._reserve_source_track(outcome.source_tid)
+            self._awaiting_pick = {
+                'step': step.get('step'),
+                'target_slot': step.get('target_slot'),
+                'at': time.monotonic()}
+            # _busy stays True until the pick result (or pick_timeout).
 
     def _publish_action_fail(self, step: dict, outcome: _MoveOutcome) -> None:
         """Report a coarse-move-stage pyramid failure on /action_result so GSP
@@ -857,6 +897,9 @@ class PlanExecutorNode(Node):
             'target_slot': step.get('target_slot'),
             'result': 'fail',
             'failure_reason': outcome.reason,
+            # Machine code GSP keys on to decide fallen-recovery vs plain
+            # re-decide (None for ordinary move fails like slot-occupied/HTTP).
+            'error': outcome.error,
         }
         try:
             self._action_pub.publish(String(data=json.dumps(out)))
@@ -942,24 +985,86 @@ class PlanExecutorNode(Node):
             self._last_fallen = (count, time.monotonic())
 
     def _on_action_result_spot(self, msg: String) -> None:
-        """Remember the table spot a successful pyramid pick emptied.
+        """Resolve the awaiting pick from pick_node's /action_result (#11).
 
-        pick_node reports the confirmed pick xy on success; that spot is now
-        empty, reachable, and in the exo FOV — an ideal drop destination for a
-        later unstack. We publish to this topic too, but only pyramid FAIL, so
-        the success+xy filter never captures our own messages."""
+        After a coarse move we stayed busy WITHOUT advancing (_awaiting_pick set).
+        pick_node's pyramid /action_result resolves it:
+          * success -> remember the emptied spot (for unstack drops) + advance the
+            step + free the executor.
+          * fail -> the arm is left over the wrong exo target (dead-end for both
+            cams); return HOME, then re-engage the pump (retry the SAME step from
+            a clean view — step NOT advanced).
+        Our OWN move-stage fail (no _awaiting_pick) and recovery/unstack results
+        (action != pyramid) are ignored here."""
         try:
             obj = json.loads(msg.data)
         except json.JSONDecodeError:
             return
-        if obj.get('action') != 'pyramid' or obj.get('result') != 'success':
-            return
-        x, y = obj.get('x'), obj.get('y')
-        if (not isinstance(x, (int, float)) or isinstance(x, bool)
-                or not isinstance(y, (int, float)) or isinstance(y, bool)):
+        if obj.get('action') != 'pyramid':
             return
         with self._state_lock:
-            self._pick_spots.append((float(x), float(y)))
+            awaiting = self._awaiting_pick
+        if awaiting is None:
+            return  # our own move-stage fail, or a stray — not an awaited pick
+        if obj.get('result') == 'success':
+            x, y = obj.get('x'), obj.get('y')
+            with self._state_lock:
+                if (isinstance(x, (int, float)) and not isinstance(x, bool)
+                        and isinstance(y, (int, float))
+                        and not isinstance(y, bool)):
+                    self._pick_spots.append((float(x), float(y)))
+                self._step_idx += 1            # advance only on a confirmed pick
+                self._awaiting_pick = None
+                self._busy = False
+            self.get_logger().info(
+                f"pick confirmed ({obj.get('target_slot')}) -> step advanced")
+            return
+        # pick failed: HOME first (threaded; blocking HTTP), then re-engage.
+        with self._state_lock:
+            self._awaiting_pick = None    # keep _busy True until HOME completes
+        self.get_logger().warn(
+            f"pick failed ({obj.get('error')}) -> returning HOME then retrying")
+        threading.Thread(
+            target=self._home_then_reengage,
+            args=(obj.get('error'),), daemon=True).start()
+
+    def _home_then_reengage(self, reason) -> None:
+        """Return the arm HOME (so exo settles + hand-eye regains its canonical
+        view), then free the executor and re-pump the SAME step from HOME."""
+        self._return_home(reason)
+        with self._state_lock:
+            self._busy = False
+        self._execute_next()   # re-dispatch current plan step (or LLM's replan)
+
+    def _return_home(self, reason) -> None:
+        """POST /api/robot/stop — interrupts any running skill and returns HOME.
+        Blocking; call from a worker thread."""
+        if self._dry_run or not self._api_url_stop:
+            self.get_logger().info(f'[dry-run/no-url] HOME ({reason})')
+            return
+        self.get_logger().info(f'POST {self._api_url_stop} (HOME after {reason})')
+        res = self._http_post_json(self._api_url_stop, {})
+        if not res.ok:
+            self.get_logger().warn(f'HOME (/stop) failed: {res.detail}')
+
+    def _pick_timeout_tick(self) -> None:
+        """pick_node never reported (crash/hang): free the executor after
+        pick_timeout_s so the loop can recover instead of stalling."""
+        with self._state_lock:
+            aw = self._awaiting_pick
+            if aw is None or (time.monotonic() - aw['at']) < self._pick_timeout_s:
+                return
+            self._awaiting_pick = None
+            step, slot = aw.get('step'), aw.get('target_slot')
+        self.get_logger().warn(
+            f'pick result timed out ({slot}) after {self._pick_timeout_s:.0f}s '
+            '-> HOME + fail (retry/replan)')
+        self._return_home('pick timeout')
+        self._publish_action_fail(
+            {'step': step, 'color': None, 'target_slot': slot},
+            _MoveOutcome('fail', 'pick result timeout', error='pick_timeout'))
+        with self._state_lock:
+            self._busy = False
 
     # ── fallen-cup recovery (LLM interrupt — current plan untouched) ───────
 
@@ -1252,9 +1357,18 @@ class PlanExecutorNode(Node):
                     chosen = he
                     break
             if now >= deadline:
+                # No upright cup of this color is selectable anywhere (exo had
+                # none and the hand-eye fallback found nothing graspable). The
+                # remaining cup(s) are most likely fallen — tag the fail with a
+                # machine code so GSP routes it to the deferred fallen-recovery
+                # path (wait for a fresh hand-eye /fallen_cups sample; recover
+                # only if fallen_count>0, else fall through to a normal
+                # re-decide). Without this code GSP treats it as a plain fail
+                # and the LLM re-issues pyramid forever (infinite replan loop).
                 return _MoveOutcome('fail', (
                     f'no upright {color} cup available '
-                    f'(tracked={tracked}, stacked={stacked})'))
+                    f'(tracked={tracked}, stacked={stacked})'),
+                    error='no_upright_cup')
             waited = True
             time.sleep(0.1)
         tid, (x, y) = chosen
