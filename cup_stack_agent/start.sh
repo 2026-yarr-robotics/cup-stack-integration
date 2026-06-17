@@ -45,7 +45,7 @@ DISTURBANCE_REMOVED_SLOT="${DISTURBANCE_REMOVED_SLOT:-L2_left}"
 # Real-vision integration: the exo view is now real perception, not GT.
 # aggregator_node relays the real world state; digital_twin_stabilizer_node
 # median-filters the real point_cloud_node boxes.
-USER_COMMAND="${USER_COMMAND:-3단 피라미드 쌓아줘}"
+USER_COMMAND="${USER_COMMAND:-3단 피라미드 쌓는데 1단은 빨간색으로 쌓아줘}"
 STABILIZE_METHOD="${STABILIZE_METHOD:-ema}"
 STABILIZE_WINDOW_S="${STABILIZE_WINDOW_S:-1.0}"
 # Hold a track this long after its last fresh detection so a brief boxes
