@@ -8,3 +8,6 @@ logs/
 /install/
 /log/
 
+# presentation deck (kept local, not tracked)
+SpeedStacks_Presentation.pdf
+
