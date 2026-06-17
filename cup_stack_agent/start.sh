@@ -45,7 +45,7 @@ DISTURBANCE_REMOVED_SLOT="${DISTURBANCE_REMOVED_SLOT:-L2_left}"
 # Real-vision integration: the exo view is now real perception, not GT.
 # aggregator_node relays the real world state; digital_twin_stabilizer_node
 # median-filters the real point_cloud_node boxes.
-USER_COMMAND="${USER_COMMAND:-3단 피라미드 쌓는데 1단은 파란색으로 쌓아줘}"
+USER_COMMAND="${USER_COMMAND:-3단 피라미드 쌓아줘}"
 STABILIZE_METHOD="${STABILIZE_METHOD:-ema}"
 STABILIZE_WINDOW_S="${STABILIZE_WINDOW_S:-1.0}"
 # Hold a track this long after its last fresh detection so a brief boxes
@@ -68,9 +68,26 @@ HAND_EYE_PICK_METHOD="${HAND_EYE_PICK_METHOD:-centroid}"
 # 색 tie-break: coarse 타깃 최근접 +4cm 윈도 안에서 step color 우선
 # (pick_node filter_by_color). 후보가 2mm 차이로 갈릴 때 색이 결정.
 PICK_FILTER_BY_COLOR="${PICK_FILTER_BY_COLOR:-true}"
-# base_link 시간 평활/트래킹(CupTracker). outlier 무시(연속 4프레임 재획득)가
-# 이동 직후 정확한 측정을 ~0.7s 거부할 수 있음 — pick_node 의 ignore 0.3s +
-# settle 0.5s 와 아슬아슬하게 겹친다. stale 좌표 픽이 재발하면 false 로.
+# pick_node 가 coarse move 도착 후 hand-eye 를 샘플하기 전 대기 (도착~샘플 ≈ 합).
+# 설계 원칙: "느려도 되지만 절대 일찍(stale) 샘플하지 않는다". hand-eye 카메라가
+# 실측 ~1.8Hz(프레임당 ~0.55s, 로그 중앙값 541ms, 가끔 4s 끊김)로 느리고,
+# CupTracker 는 이동 후 좌표가 튀면 track_reacquire_frames(=4) 연속 outlier 가 모여야
+# 재획득한다 → 재획득 창 ≈ 4×0.55 ≈ 2.2s (첫 검출 0.55s 포함 시 이동 후 ~2.7s).
+#   FROZEN(post_move_box_ignore_sec): 도착 직후 이 시간 동안 hand-eye 입력을 전부
+#     버린다. 이 동안 트래커(별도 노드)는 계속 프레임을 처리하므로, FROZEN 을 재획득
+#     창보다 길게 두면 frozen 종료 시점엔 트래커가 이미 재획득을 끝낸 상태 → pick_node
+#     가 받는 첫 마커가 신선하다. 그래서 1.0→3.0s(≈5.5프레임, 4프레임 재획득+첫검출+
+#     여유). 이 값이 stale 픽 방지의 핵심 — '가장 이른 수용 프레임 = 도착+FROZEN'.
+#   SETTLE(box_settle_sec): 첫 신선한 마커 이후 이만큼 더 모아 스냅샷 안정화(0.5s).
+#   BOX_WAIT(box_wait_sec): 2단계(FROZEN 후) 수집 타임아웃. SETTLE 보다 충분히 커야
+#     하고, 1.8Hz 에서 첫 마커가 한 박자 늦거나 끊겨도 잡도록 2.0s(0→기본1.5 노출).
+#   => 도착~샘플 ≈ 3.0 + ~0.3(첫마커) + 0.5 ≈ 3.8s. 컵당 느려지지만 stale 을 확실히 막음.
+PICK_FROZEN_SEC="${PICK_FROZEN_SEC:-3.0}"
+PICK_SETTLE_SEC="${PICK_SETTLE_SEC:-0.5}"
+PICK_BOX_WAIT_SEC="${PICK_BOX_WAIT_SEC:-2.0}"
+# base_link 시간 평활/트래킹(CupTracker). 위 FROZEN 3.0s 가 ~2.2s 재획득 창을 넘기므로
+# 평활을 켠 채로도 stale 픽을 피한다. 그래도 stale 좌표 픽이 재발하면 false 로
+# (평활 OFF → 재획득 자체가 없어져 FROZEN 을 다시 줄일 수 있음).
 HAND_EYE_SMOOTHING="${HAND_EYE_SMOOTHING:-true}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-logs/${RUN_ID}}"
@@ -385,7 +402,10 @@ if [[ "${DRY_RUN}" == "false" ]]; then
     --ros-args \
     -p api_base:="${ROBOT_API_BASE}" \
     -p api_timeout_sec:="${API_TIMEOUT_S}" \
-    -p filter_by_color:="${PICK_FILTER_BY_COLOR}"
+    -p filter_by_color:="${PICK_FILTER_BY_COLOR}" \
+    -p post_move_box_ignore_sec:="${PICK_FROZEN_SEC}" \
+    -p box_settle_sec:="${PICK_SETTLE_SEC}" \
+    -p box_wait_sec:="${PICK_BOX_WAIT_SEC}"
 else
   echo "[start.sh] dry-run: pick_node NOT launched (no dry-run; would POST the" \
        "real pyramid API). Loop stays open. Use --real-api to close it."

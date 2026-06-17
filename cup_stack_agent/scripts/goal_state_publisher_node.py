@@ -132,7 +132,13 @@ class GoalStatePublisher(Node):
         # step, force a fresh cold-start re-plan from the current world (same
         # recovery as llm_node's HITL fallback, but triggered by the stuck loop
         # instead of an llm failure). 0 disables the watchdog.
-        self.declare_parameter('decision_watchdog_s', 15.0)
+        # This is ALSO the HITL retry interval: when llm_node drops (needs HITL)
+        # it publishes a non-ok /llm_output, which arms this watchdog; the retry
+        # then fires this many seconds later, giving a human time to fix the
+        # scene (e.g. add the missing cup) before the re-plan. 25s (was 15s): a
+        # cold-start call alone runs ~14s, so keep a comfortable margin so the
+        # retry never races a still-working model.
+        self.declare_parameter('decision_watchdog_s', 25.0)
         # Anti-runaway: cap consecutive fallen_recovery dispatches that make no
         # progress (e.g. the orchestrator no-ops because its grasp detector
         # cannot see the cup the gate sees). Reset on pyramid progress / new

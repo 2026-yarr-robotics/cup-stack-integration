@@ -115,4 +115,10 @@ Input:
 {"user_command":"3단 피라미드 쌓는데 1단은 빨간색으로 쌓아줘","current_world_state":{"cups_on_table":{"red":1,"blue":3},"stack":{"L1_left":{"color":"red"},"L1_mid":{"color":"red"},"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":2,"total_slots":6}}
 Output:
 {"reasoning":"L1_left and L1_mid are already filled, so finish only the null slots: L1_right red, then L2/L3 blue.","status":"ok","target":{"base_levels":3,"cup_budget":6,"target_slots":["L1_left","L1_mid","L1_right","L2_left","L2_right","L3_top"],"slot_colors":{"L1_left":"red","L1_mid":"red","L1_right":"red","L2_left":"any","L2_right":"any","L3_top":"any"}},"plan":{"steps":[{"step":1,"action":"pyramid","color":"red","target_slot":"L1_right"},{"step":2,"action":"pyramid","color":"blue","target_slot":"L2_left"},{"step":3,"action":"pyramid","color":"blue","target_slot":"L2_right"},{"step":4,"action":"pyramid","color":"blue","target_slot":"L3_top"}]},"error":null}
+
+Few-shot example 8 (color constraint + CUP SHORTAGE -> trimmed PARTIAL; status stays "ok", NEVER invent a cup, NEVER refuse):
+Input:
+{"user_command":"3단 피라미드 쌓는데 1단은 파란색으로 쌓아줘","current_world_state":{"cups_on_table":{"blue":3,"red":2},"stack":{"L1_left":null,"L1_mid":null,"L1_right":null,"L2_left":null,"L2_right":null,"L3_top":null},"filled_slots":0,"total_slots":6}}
+Output:
+{"reasoning":"Only 5 cups (3 blue, 2 red) for a 6-slot pyramid and the bottom must be blue: use the 3 blue on L1 and the 2 red on L2, then STOP — no cup left for L3_top, so a 5-step partial.","status":"ok","target":{"base_levels":3,"cup_budget":6,"target_slots":["L1_left","L1_mid","L1_right","L2_left","L2_right","L3_top"],"slot_colors":{"L1_left":"blue","L1_mid":"blue","L1_right":"blue","L2_left":"any","L2_right":"any","L3_top":"any"}},"plan":{"steps":[{"step":1,"action":"pyramid","color":"blue","target_slot":"L1_left"},{"step":2,"action":"pyramid","color":"blue","target_slot":"L1_mid"},{"step":3,"action":"pyramid","color":"blue","target_slot":"L1_right"},{"step":4,"action":"pyramid","color":"red","target_slot":"L2_left"},{"step":5,"action":"pyramid","color":"red","target_slot":"L2_right"}]},"error":null}
 ```

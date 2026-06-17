@@ -116,6 +116,14 @@ class LLMNode(Node):
             if parsed.get('decision') == 'fallen_recovery':
                 errors = validate_fallen_recovery(parsed, payload)
             else:
+                # COLD-START SAFETY NET: the model (temp 0) tends to emit a FULL
+                # pyramid even when cups < cup_budget, inventing phantom cups
+                # (e.g. a 4th blue when only 3 exist) → validate rejects
+                # 'steps > available cups' → drop → needs-HITL loop, BUILD 0.
+                # The prompt already says "stop early when cups run out"; enforce
+                # it here so a valid PARTIAL is built instead of nothing.
+                if cold:
+                    self._trim_cold_start_to_inventory(parsed, payload)
                 errors = (validate_cold_start(parsed, payload) if cold
                           else validate_inflight(parsed, payload))
             if errors:
@@ -132,7 +140,75 @@ class LLMNode(Node):
         if not self._hitl_cold_start(payload):
             self.get_logger().error(
                 f'{mode}: unrecoverable, cold-start fallback failed — '
-                'dropping (needs HITL)')
+                'needs HITL (publishing drop-notice so GSP re-arms the timed '
+                'cold-start retry watchdog)')
+            self._publish_hitl_drop(mode)
+
+    def _publish_hitl_drop(self, mode: str) -> None:
+        """Emit a non-ok cold-start /llm_output when planning is unrecoverable.
+
+        Without this, a hard drop publishes nothing — so plan_executor never
+        clears its plan and, critically, GSP's no-progress watchdog never arms
+        (it only arms off a RECEIVED /llm_output that yields no executable step).
+        The timed cold-start retry that lets a human fix the scene (e.g. add the
+        missing cup, then it re-plans) would never fire. This notice carries
+        status != 'ok', so plan_executor's existing cold-start branch clears the
+        plan and GSP arms the watchdog — timed from THIS drop, not the dispatch,
+        so there is no race with the model's planning latency (it has already
+        given up here). Schema mirrors the planner's unsupported/insufficient
+        shape (status, plan=null, error.code) so downstream readers are unchanged.
+        """
+        notice = {
+            'status': 'needs_hitl',
+            'target': None,
+            'plan': None,
+            'error': {
+                'code': 'NEEDS_HITL',
+                'message': (f'{mode} planning unrecoverable after retries + '
+                            'cold-start fallback'),
+            },
+        }
+        self._publish(notice, mode, 0.0)
+
+    def _trim_cold_start_to_inventory(self, parsed: dict, payload: dict) -> None:
+        """Drop over-planned tail steps the table cannot supply (build order).
+
+        Faithful, in-code enforcement of the prompt's "stop early when cups run
+        out": walk steps in order decrementing a per-color copy of
+        cups_on_table; at the first step whose color is exhausted, STOP and drop
+        it + everything after (build order is sequential — you cannot skip a
+        lower slot and keep a higher one). The full target / cup_budget /
+        slot_colors are LEFT UNCHANGED (validator already allows steps < budget,
+        and a constrained slot with no step is valid), so this only ever shortens
+        plan.steps. No-op when every step is suppliable (≥6-cup builds untouched)
+        or for non-ok / planless outputs. If trimming empties the plan, the
+        normal validator rejects it (>=1 step) → existing retry/HITL path.
+        """
+        if not isinstance(parsed, dict) or parsed.get('status') != 'ok':
+            return
+        plan = parsed.get('plan')
+        if not isinstance(plan, dict):
+            return
+        steps = plan.get('steps')
+        if not isinstance(steps, list) or not steps:
+            return
+        cw = (payload or {}).get('current_world_state') or {}
+        raw = cw.get('cups_on_table') or {}
+        remaining = {str(k).lower(): int(v) for k, v in raw.items()
+                     if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        kept = []
+        for s in steps:
+            color = str((s or {}).get('color') or '').lower()
+            if remaining.get(color, 0) > 0:
+                remaining[color] -= 1
+                kept.append(s)
+            else:
+                break  # build order: stop at the first unsuppliable step
+        if len(kept) != len(steps):
+            plan['steps'] = kept
+            self.get_logger().warn(
+                f'cold-start plan trimmed {len(steps)}→{len(kept)} steps to fit '
+                f'available cups (dropped over-planned/phantom tail)')
 
     def _hitl_cold_start(self, payload: dict) -> bool:
         """Re-decide a stuck in-flight step via the cold-start planner on the
@@ -156,6 +232,7 @@ class LLMNode(Node):
             parsed = parse_model_json((result.get('message') or {}).get('content', ''))
         except json.JSONDecodeError:
             return False
+        self._trim_cold_start_to_inventory(parsed, cold)
         errs = validate_cold_start(parsed, cold)
         if errs:
             self.get_logger().error(f'HITL cold-start invalid: {errs}')
