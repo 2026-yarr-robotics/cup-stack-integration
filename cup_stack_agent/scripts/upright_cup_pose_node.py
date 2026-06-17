@@ -1053,7 +1053,13 @@ class UprightCupPoseNode(Node):
             self.last_depth_m = matched_depth
 
         h, w = frame_bgr.shape[:2]
-        debug = frame_bgr.copy()
+        # 디버그 오버레이는 구독자(RViz/rqt)가 /upright_cup/debug_image 를
+        # 실제로 듣고 있을 때만 만든다. 프레임 통째 copy + cv2 드로잉 +
+        # bgr8 인코딩 + DDS publish 는 전부 시각화 전용이고 pick 경로는
+        # 원본 frame_bgr 와 /hand_eye/boxes 만 쓰므로 꺼도 동작 무관 —
+        # 순수 CPU 절감. (exo point_cloud/detection 노드의 구독자 게이팅과 동일.)
+        want_debug = self.debug_pub.get_subscription_count() > 0
+        debug = frame_bgr.copy() if want_debug else None
         start = time.time()
 
         try:
@@ -1145,30 +1151,34 @@ class UprightCupPoseNode(Node):
             published = cups
         self.publish_boxes(published)
 
-        # ── debug 시각화 ──
-        for det in targets:
-            cv2.drawContours(debug, [det["contour"]], -1, (0, 200, 255), 1)
-            # 검출된 원(내접원/hough) — 초록 테두리
-            if det.get("pick_radius"):
+        # ── debug 시각화 (구독자 있을 때만 그린다) ──
+        if want_debug:
+            for det in targets:
+                cv2.drawContours(debug, [det["contour"]], -1, (0, 200, 255), 1)
+                # 검출된 원(내접원/hough) — 초록 테두리
+                if det.get("pick_radius"):
+                    c = det["center"]
+                    cv2.circle(debug, (int(c[0]), int(c[1])),
+                               int(det["pick_radius"]), (0, 255, 0), 2)
+                # 기존 무게중심(회색) vs 최종 pick point(빨강) 비교
+                ctr = det.get("centroid")
+                if ctr is not None:
+                    cv2.circle(debug, (int(ctr[0]), int(ctr[1])), 3, (160, 160, 160), -1)
                 c = det["center"]
-                cv2.circle(debug, (int(c[0]), int(c[1])),
-                           int(det["pick_radius"]), (0, 255, 0), 2)
-            # 기존 무게중심(회색) vs 최종 pick point(빨강) 비교
-            ctr = det.get("centroid")
-            if ctr is not None:
-                cv2.circle(debug, (int(ctr[0]), int(ctr[1])), 3, (160, 160, 160), -1)
-            c = det["center"]
-            cv2.circle(debug, (int(c[0]), int(c[1])), 4, (0, 0, 255), -1)
+                cv2.circle(debug, (int(c[0]), int(c[1])), 4, (0, 0, 255), -1)
 
-        # ── fallen 으로 카운트된 검출 시각화 (진단용) ──
-        # /fallen_cups 에 들어가는 detection (recovery_classes) 을 빨강 contour +
-        # bounding box + 라벨(클래스/conf/면적)로 표시한다. HOME 에서 fallen 이
-        # 0 이 아닐 때 어떤 mask 가 fallen-cup/mouth-up-cup 으로 오분류되는지
-        # 디버그 이미지에서 바로 확인하기 위함. (targets 와 다른 색으로 구분)
+        # ── fallen 으로 카운트된 검출 집계 (그리기는 want_debug 일 때만) ──
+        # fallen_breakdown 은 아래 로그 라인에서도 쓰므로 항상 집계하고, contour/
+        # box/라벨 그리기만 가드한다. /fallen_cups 에 들어가는 detection
+        # (recovery_classes) 을 빨강 contour + bounding box + 라벨(클래스/conf/면적)
+        # 로 표시한다. HOME 에서 fallen 이 0 이 아닐 때 어떤 mask 가 fallen-cup/
+        # mouth-up-cup 으로 오분류되는지 디버그 이미지에서 바로 확인하기 위함.
         fallen_breakdown = {}
         for det in fallen_dets:
             cls_name = det.get("cls_name") or "?"
             fallen_breakdown[cls_name] = fallen_breakdown.get(cls_name, 0) + 1
+            if not want_debug:
+                continue
             cnt = det["contour"]
             cv2.drawContours(debug, [cnt], -1, (0, 0, 255), 2)
             x, y, bw, bh = cv2.boundingRect(cnt)
@@ -1187,13 +1197,14 @@ class UprightCupPoseNode(Node):
         pend_str = (
             f" cand={self._fallen_candidate}x{self._fallen_streak}/{self.fallen_confirm_frames}"
             if self._fallen_streak > 0 else "")
-        cv2.putText(
-            debug,
-            f"upright cups={len(targets)} published={len(published)} "
-            f"fallen={fallen_n} raw={raw_fallen_n}{breakdown_str}{pend_str} "
-            f"pick={self.pick_point_method} smooth={self.enable_temporal_smoothing}",
-            (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        self.publish_debug(debug, msg.header)
+        if want_debug:
+            cv2.putText(
+                debug,
+                f"upright cups={len(targets)} published={len(published)} "
+                f"fallen={fallen_n} raw={raw_fallen_n}{breakdown_str}{pend_str} "
+                f"pick={self.pick_point_method} smooth={self.enable_temporal_smoothing}",
+                (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            self.publish_debug(debug, msg.header)
 
         elapsed = (time.time() - start) * 1000.0
         self.get_logger().info(
